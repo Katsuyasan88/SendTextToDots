@@ -30,6 +30,7 @@
 - 4用途の固定秘密（署名JWKS・cookie鍵・識別子HMAC鍵・digest鍵）はSecret Managerの数値版を起動時に1回だけ読み、用途間で流用しません。
 - 鍵・秘密・tokenの値をログ・応答・例外へ出しません。起動失敗の記録は固定のstage/codeと値を含まない整数maskだけです。
 - 配置設定は1 moduleに固定し、未設定・不整合ならSDK生成・資格・DB・外部HTTPの前に拒否します。資格・宛先・TLS・proxy・emulatorを変え得る環境変数があれば起動しません（[CONFIGURATION.md](CONFIGURATION.md)）。
+- 送信画面は利用者のパソコンで動きます（[LOCAL_CONSOLE.md](LOCAL_CONSOLE.md)）。helperは127.0.0.1だけで待ち受け、Host/Originと起動ごとのnonceを検査し、固定5 routeだけを固定のAPI/MCP originへ利用者のBearer tokenつきで中継し、cookie・nonceを上流へ送らず、token・本文を保持しません。Cloud Runは送信画面を配信せず、CORS・権限は不変。Firebaseの読み込みは画面での明示ログイン時だけです。
 - 表示言語cookie `sttd_language`（`en` / `ja`）は画面で言語を選んだ時に置く表示専用のsession cookieで、認証・認可・ownerの判断に使わず、token・個人情報を含みません。
 
 <a id="mcp-oauth"></a>

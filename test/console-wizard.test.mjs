@@ -1,0 +1,502 @@
+// ローカル送信画面の実CONSOLE_SCRIPTを合成DOM/SDK/fetch/clipboardで実行し、5段階wizardの意味のある挙動を確かめる（browser・network・実SDK・実Dots 0）。
+//   - W1 初期表示: 通信0・SDK読込0、手順1だけ有効、未解放stepのクリック/handlerは何もしない。言語切替・固定文面コピーも上流0。
+//   - W2 ログイン: 明示操作でだけSDK読込/popup、成功で2が有効。読込失敗/popup拒否/失敗は1のまま。古い世代の結果は後続を解放しない。再ログインで2以降を戻す。
+//   - W3 接続確認: 手動1回のGET、subscribedで3へ、非subscribedは英日の次の案内で3以降を戻す。確認中は3以降を封鎖。subscribed継続なら進捗保持。token失敗/401は1へ。
+//   - W4 テスト用プロンプト: コピー（または手動確認）＋「貼り付けて次へ」で4を解放。再適用は4/5を戻す。前stepの再表示は証跡を消さない。
+//   - W5 送信: 空/placeholder、「送信」、5項目のPOST（nonce/Bearer）、二重クリック1件、通信前拒否、deliveredだけでは進まず本人の一致確認で5へ。失敗/中止/未送信は確認不可、不明は確認可。
+//   - W6 運用用プロンプト: コピー＋「貼り付けて完了」で完了文面。完了後に4へ戻って通常送信。
+//   - W7 解除: 確認→1回POST→2以降を戻して再確認。
+import assert from 'node:assert/strict';
+import { after, test } from 'node:test';
+
+import { consoleAsset, LOCAL_NONCE_HEADER } from '../dist/connect/console.js';
+import { MESSAGES } from '../dist/connect/i18n.js';
+import { loadDeploymentConfig } from '../dist/config/validate.js';
+import { gate, runConsole, settle, syntheticSdk } from './fixtures/console-browser.mjs';
+
+const DEPLOYMENT = loadDeploymentConfig();
+const WEB = { apiKey: 'synthetic-web-api-key', authDomain: DEPLOYMENT.web.authDomain, projectId: DEPLOYMENT.web.projectId };
+const NONCE = 'a'.repeat(64);
+const JA = (key) => MESSAGES.ja[key];
+const EN = (key) => MESSAGES.en[key];
+const FIELDS = ['schemaVersion', 'commandId', 'text', 'createdAt', 'expiresAt'];
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const results = {};
+let unhandled = 0;
+process.on('unhandledRejection', () => {
+  unhandled += 1;
+});
+after(() => {
+  const timers = process.getActiveResourcesInfo().filter((name) => name === 'Timeout').length;
+  process.stdout.write(`# CONSOLE_WIZARD_COUNTS ${JSON.stringify({ unhandled, timers, results })}\n`);
+  assert.deepEqual([unhandled, timers], [0, 0]);
+});
+
+const html = (language) => consoleAsset('/console', WEB, { language, nonce: NONCE, secure: false }).body;
+
+/** 合成helper: 接続状態と配送結果を返す。holdでPOSTを保留できる。 */
+function helper(initialState = 'subscribed') {
+  const state = { connection: initialState, mode: 'deliver', holds: [], disconnects: 0 };
+  const onFetch = async (entry) => {
+    assert.equal(entry.headers[LOCAL_NONCE_HEADER], NONCE, 'every relayed request carries the local nonce');
+    assert.match(entry.headers.Authorization ?? '', /^Bearer synthetic-id-token$/, 'every relayed request carries the Bearer token');
+    assert.deepEqual([entry.credentials, entry.redirect, entry.cache], ['omit', 'error', 'no-store']);
+    if (entry.url === '/v1/web/connection') {
+      if (state.mode === 'webFail') return { status: 503, json: { error: { code: 'temporarily_unavailable', retryable: true } } };
+      if (state.mode === 'web401') return { status: 401, json: { error: { code: 'authentication_required', retryable: false } } };
+      return { status: 200, json: { state: state.connection } };
+    }
+    if (entry.url === '/v1/web/disconnect') {
+      state.disconnects += 1;
+      state.connection = 'unlinked';
+      return { status: 200, json: { state: 'unlinked' } };
+    }
+    if (state.mode === 'hold') {
+      const hold = gate();
+      state.holds.push({ entry, hold });
+      return hold.promise;
+    }
+    if (state.mode === 'fail') throw new TypeError('synthetic network failure');
+    if (state.mode === 'reject') return { status: 409, json: { error: { code: 'subscription_required', retryable: false } } };
+    const commandId = entry.method === 'POST' && entry.url === '/v2/commands' ? JSON.parse(entry.body).commandId : entry.url.split('/')[3];
+    return { status: 200, json: { commandId, state: entry.url.endsWith('/cancel') ? 'cancelled' : 'delivered' } };
+  };
+  return { state, onFetch };
+}
+
+function clipboardStub() {
+  const clipboard = { writes: [], mode: 'ok' };
+  const navigator = {
+    clipboard: {
+      writeText: (value) => {
+        clipboard.writes.push(value);
+        return clipboard.mode === 'ok' ? Promise.resolve() : Promise.reject(new Error('synthetic NotAllowedError'));
+      },
+    },
+  };
+  return { clipboard, navigator };
+}
+
+/** 手順1→2→3を済ませる（subscribed）。 */
+async function reachStep3(ui, sdk) {
+  assert.equal(ui.el('sttd-login').click(), true);
+  await settle();
+  assert.equal(ui.stepState(2), 'current');
+  assert.equal(ui.el('sttd-refresh').click(), true);
+  await settle();
+  assert.equal(ui.stepState(3), 'current');
+}
+
+test('W1 initial page: nothing is fetched and the SDK is not loaded; only step 1 is usable; locked steps ignore clicks and handlers; language switch and copies stay local', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk({ restoredUser: true });
+  const { clipboard, navigator } = clipboardStub();
+  const { onFetch } = helper();
+  const ui = await runConsole({ html: html('ja'), onFetch, sdk, navigator });
+  const { el } = ui;
+  assert.deepEqual([ui.fetches.length, sdk.calls.loads, sdk.calls.popups, sdk.calls.tokens], [0, 0, 0, 0], 'no upstream and no SDK on load, even with a restored session');
+  assert.deepEqual([1, 2, 3, 4, 5].map(ui.stepState), ['current', 'locked', 'locked', 'locked', 'locked']);
+  assert.equal(el('sttd-panel-1').hidden, false);
+  for (const n of [2, 3, 4, 5]) {
+    assert.equal(el('sttd-panel-' + n).hidden, true);
+    assert.equal(el(`sttd-step-${n}-head`).click(), false, `step ${n} head disabled`);
+    el(`sttd-step-${n}-head`).onclick();
+    assert.equal(el('sttd-panel-' + n).hidden, true, `step ${n} does not open through the handler either`);
+  }
+  // 未解放のhandlerを直接呼んでも通信しない。
+  el('sttd-refresh').onclick();
+  el('sttd-send').onclick();
+  el('sttd-copy-test').onclick();
+  el('sttd-done-test').onclick();
+  el('sttd-verify-send').onclick();
+  el('sttd-copy-operation').onclick();
+  el('sttd-done-operation').onclick();
+  await settle();
+  assert.deepEqual([ui.fetches.length, sdk.calls.loads, clipboard.writes.length], [0, 0, 0]);
+  assert.equal(el('sttd-text').value, '', 'empty input');
+  assert.equal(el('sttd-text').placeholder, JA('console.textPlaceholder'));
+  assert.equal(el('sttd-send').textContent, '送信');
+  assert.equal(el('sttd-text').disabled, true);
+  // 言語切替はlocal（cookie同期書込みだけ）。
+  assert.equal(el('sttd-lang-en').click(), true);
+  await settle();
+  assert.equal(ui.document.documentElement.lang, 'en');
+  assert.equal(el('sttd-send').textContent, 'Send');
+  assert.deepEqual(ui.cookies.writes, ['sttd_language=en; Path=/; SameSite=Lax'], 'http localhost: no Secure attribute');
+  assert.deepEqual([ui.fetches.length, sdk.calls.loads], [0, 0]);
+  results.W1 = { fetches: ui.fetches.length, sdkLoads: sdk.calls.loads };
+});
+
+test('W2 sign-in: the explicit button loads the SDK once and opens the popup; a restored session continues without a popup; load failure / blocked popup / failure keep step 1; a stale generation never unlocks; signing in again resets steps 2 to 5', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk();
+  const { onFetch } = helper();
+  const ui = await runConsole({ html: html('en'), onFetch, sdk });
+  const { el } = ui;
+  // 読込失敗 → 1のまま。
+  sdk.calls.loadMode = 'fail';
+  assert.equal(el('sttd-login').click(), true);
+  await settle();
+  assert.deepEqual([sdk.calls.loads, sdk.calls.popups, ui.stepState(2)], [1, 0, 'locked']);
+  assert.equal(el('sttd-account-text').textContent, EN('wizard.loginLoadFailed'));
+  // popup拒否 → 再クリック案内、1のまま。
+  sdk.calls.loadMode = 'ok';
+  sdk.calls.popupMode = 'blocked';
+  el('sttd-login').click();
+  await settle();
+  assert.deepEqual([sdk.calls.loads, sdk.calls.popups, ui.stepState(2)], [2, 1, 'locked']);
+  assert.equal(el('sttd-account-text').textContent, EN('wizard.loginPopupBlocked'));
+  // 失敗 → 1のまま。
+  sdk.calls.popupMode = 'fail';
+  el('sttd-login').click();
+  await settle();
+  assert.deepEqual([sdk.calls.loads, sdk.calls.popups, ui.stepState(2)], [2, 2, 'locked'], 'the SDK is loaded once; later attempts reuse it');
+  assert.equal(el('sttd-account-text').textContent, EN('common.loginFailed'));
+  // 成功 → 2がcurrent、1はdone。上流への通信は無い。
+  sdk.calls.popupMode = 'ok';
+  el('sttd-login').click();
+  await settle();
+  assert.deepEqual([ui.stepState(1), ui.stepState(2), ui.stepState(3)], ['done', 'current', 'locked']);
+  assert.deepEqual(sdk.calls.providers, ['apple.com', 'apple.com', 'apple.com']);
+  assert.equal(ui.fetches.length, 0, 'signing in talks to Firebase only, not to the service');
+  assert.equal(el('sttd-login').hidden, true);
+  assert.equal(el('sttd-switch').hidden, false);
+  // 進めてから別accountでやり直す → 2以降を戻し、古い世代の結果では解放しない。
+  el('sttd-refresh').click();
+  await settle();
+  assert.equal(ui.stepState(3), 'current');
+  sdk.calls.popupMode = 'fail';
+  assert.equal(el('sttd-switch').click(), true);
+  await settle();
+  assert.deepEqual([ui.stepState(1), ui.stepState(2), ui.stepState(3)], ['current', 'locked', 'locked'], 'retrying resets steps 2+');
+  assert.equal(el('sttd-wizard-note').textContent, EN('wizard.loginReset'));
+  assert.equal(sdk.calls.signOuts, 1);
+  // 復元済みsessionがある別のpage: クリック後にpopupなしで続行。
+  const sdk2 = syntheticSdk({ restoredUser: true });
+  const ui2 = await runConsole({ html: html('en'), onFetch, sdk: sdk2 });
+  assert.equal(ui2.el('sttd-login').click(), true);
+  await settle();
+  assert.deepEqual([sdk2.calls.loads, sdk2.calls.popups, ui2.stepState(2)], [1, 0, 'current'], 'restored session: no popup, but only after the explicit click');
+  results.W2 = { loads: sdk.calls.loads, popups: sdk.calls.popups };
+});
+
+test('W3 connection check: one manual GET; subscribed advances to step 3; each other state shows its next action and resets steps 3+; the check locks steps 3+ meanwhile; a repeated subscribed keeps progress; a token failure or 401 returns to step 1', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk();
+  const { state, onFetch } = helper('unlinked');
+  const ui = await runConsole({ html: html('ja'), onFetch, sdk });
+  const { el } = ui;
+  el('sttd-login').click();
+  await settle();
+  assert.equal(ui.web('/v1/web/connection').length, 0, 'no automatic check after sign-in');
+  for (const [connection, key] of [['unlinked', 'wizard.next.unlinked'], ['linked', 'wizard.next.linked'], ['expired', 'wizard.next.expired'], ['change_pending', 'wizard.next.change_pending']]) {
+    state.connection = connection;
+    assert.equal(el('sttd-refresh').click(), true);
+    await settle();
+    assert.equal(el('sttd-state-guide').textContent, JA(key), connection);
+    assert.deepEqual([ui.stepState(2), ui.stepState(3)], ['current', 'locked'], connection);
+  }
+  assert.equal(ui.web('/v1/web/connection').length, 4, 'one GET per click, no polling');
+  state.connection = 'subscribed';
+  el('sttd-refresh').click();
+  await settle();
+  assert.deepEqual([ui.stepState(2), ui.stepState(3)], ['done', 'current']);
+  assert.equal(el('sttd-state-guide').textContent, JA('wizard.next.subscribed'));
+  // clipboardの無いpage: 手動確認で3を完了できる。
+  el('sttd-copy-test').click();
+  await settle();
+  assert.equal(el('sttd-manual-test').hidden, false, 'no clipboard API: manual confirmation offered');
+  el('sttd-manual-test').click();
+  el('sttd-done-test').click();
+  await settle();
+  assert.deepEqual([ui.stepState(3), ui.stepState(4)], ['done', 'current']);
+  // 3を済ませてから再確認（subscribed継続）: 進捗保持。確認中は3以降を封鎖。保留中のGETを合成するため接続応答を遅らせる。
+  const held = gate();
+  const normal = onFetch;
+  let holdNext = true;
+  const original = state.connection;
+  state.connection = 'subscribed';
+  const slowOnFetch = async (entry) => {
+    if (holdNext && entry.url === '/v1/web/connection') {
+      holdNext = false;
+      await held.promise;
+    }
+    return normal(entry);
+  };
+  // 新しいpageで保留動作を観測する（fetch関数の差し替え）。
+  const sdkB = syntheticSdk();
+  const uiB = await runConsole({ html: html('ja'), onFetch: slowOnFetch, sdk: sdkB });
+  uiB.el('sttd-login').click();
+  await settle();
+  holdNext = false;
+  uiB.el('sttd-refresh').click();
+  await settle();
+  assert.equal(uiB.stepState(3), 'current');
+  uiB.el('sttd-copy-test').click();
+  uiB.el('sttd-manual-test').click();
+  uiB.el('sttd-done-test').click();
+  await settle();
+  assert.equal(uiB.stepState(4), 'current');
+  holdNext = true;
+  assert.equal(uiB.el('sttd-step-2-head').click(), true, 'a done step can be re-selected');
+  assert.equal(uiB.stepState(3), 'done', 're-selecting does not erase the evidence');
+  uiB.el('sttd-refresh').click();
+  await settle();
+  assert.equal(uiB.el('sttd-state-text').textContent, JA('wizard.checking'));
+  assert.deepEqual([uiB.el('sttd-step-3-head').disabled, uiB.el('sttd-step-4-head').disabled], [true, true], 'steps 3+ locked while checking');
+  held.release();
+  await settle();
+  assert.deepEqual([uiB.stepState(2), uiB.stepState(3), uiB.stepState(4)], ['current', 'done', 'ready'], 'subscribed again: progress kept');
+  // 非subscribedへ変化 → 3以降を戻し案内。
+  state.connection = 'expired';
+  uiB.el('sttd-refresh').click();
+  await settle();
+  assert.deepEqual([uiB.stepState(3), uiB.stepState(4)], ['locked', 'locked']);
+  assert.equal(uiB.el('sttd-wizard-note').textContent, JA('wizard.stateReset'));
+  // 確認失敗（503）も3以降を戻す。
+  state.connection = 'subscribed';
+  uiB.el('sttd-refresh').click();
+  await settle();
+  state.mode = 'webFail';
+  uiB.el('sttd-refresh').click();
+  await settle();
+  assert.equal(uiB.el('sttd-state-guide').textContent, JA('wizard.next.unavailable'));
+  assert.equal(uiB.stepState(3), 'locked');
+  // 401 → 1へ。
+  state.mode = 'web401';
+  uiB.el('sttd-refresh').click();
+  await settle();
+  assert.deepEqual([uiB.stepState(1), uiB.stepState(2)], ['current', 'locked']);
+  assert.equal(uiB.el('sttd-account-text').textContent, JA('common.loginRefresh'));
+  // token取得失敗 → 1へ（HTTPは出ない）。
+  state.mode = 'deliver';
+  sdkB.calls.popupMode = 'ok';
+  uiB.el('sttd-login').click();
+  await settle();
+  const before = uiB.web('/v1/web/connection').length;
+  sdkB.calls.tokenMode = 'fail';
+  uiB.el('sttd-refresh').click();
+  await settle();
+  assert.equal(uiB.web('/v1/web/connection').length, before, 'no request without a token');
+  assert.equal(uiB.stepState(1), 'current');
+  state.connection = original;
+  results.W3 = { checks: ui.web('/v1/web/connection').length + uiB.web('/v1/web/connection').length };
+});
+
+test('W4 test instructions: copying (or a manual confirmation) plus "pasted, next" unlocks step 4; copy failure shows the manual fallback; a re-applied test resets steps 4 and 5 but viewing a done step does not', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk();
+  const { clipboard, navigator } = clipboardStub();
+  const { onFetch } = helper();
+  const ui = await runConsole({ html: html('en'), onFetch, sdk, navigator });
+  const { el } = ui;
+  await reachStep3(ui, sdk);
+  assert.equal(el('sttd-done-test').disabled, true, 'next requires a copy first');
+  el('sttd-done-test').onclick();
+  assert.equal(el('sttd-copy-result-test').textContent, EN('wizard.copyRequired'));
+  assert.equal(ui.stepState(4), 'locked');
+  // 失敗 → 手動確認で進める。
+  clipboard.mode = 'reject';
+  assert.equal(el('sttd-copy-test').click(), true);
+  await settle();
+  assert.equal(el('sttd-copy-result-test').textContent, EN('guide.copyFailed'));
+  assert.equal(el('sttd-manual-test').hidden, false);
+  assert.equal(el('sttd-done-test').disabled, true);
+  clipboard.mode = 'ok';
+  el('sttd-copy-test').click();
+  await settle();
+  assert.deepEqual(clipboard.writes, [EN('guide.testText'), EN('guide.testText')]);
+  assert.equal(el('sttd-copy-result-test').textContent, EN('guide.copied'));
+  assert.equal(el('sttd-done-test').disabled, false);
+  assert.equal(el('sttd-done-test').click(), true);
+  await settle();
+  assert.deepEqual([ui.stepState(3), ui.stepState(4), ui.stepState(5)], ['done', 'current', 'locked']);
+  assert.equal(ui.fetches.filter((entry) => entry.url !== '/v1/web/connection').length, 0, 'copying and confirming send nothing');
+  // 4で送信して確認、5まで。
+  el('sttd-text').value = 'hello';
+  el('sttd-send').click();
+  await settle();
+  el('sttd-verify-send').click();
+  await settle();
+  assert.deepEqual([ui.stepState(4), ui.stepState(5)], ['done', 'current']);
+  // 3を見直すだけでは何も消えない。
+  assert.equal(el('sttd-step-3-head').click(), true);
+  assert.deepEqual([ui.stepState(3), ui.stepState(4), ui.stepState(5)], ['current', 'done', 'ready']);
+  // 再適用（コピー＋次へ）→ 4/5を戻す。
+  el('sttd-copy-test').click();
+  await settle();
+  el('sttd-done-test').click();
+  await settle();
+  assert.deepEqual([ui.stepState(3), ui.stepState(4), ui.stepState(5)], ['done', 'current', 'locked']);
+  assert.equal(el('sttd-wizard-note').textContent, EN('wizard.testReapplied'));
+  assert.equal(el('sttd-text').value, '', 'the previous text is cleared with the redo');
+  results.W4 = { clipboardWrites: clipboard.writes.length };
+});
+
+test('W5 send: empty field with placeholder, "送信", 5-field POST with nonce and Bearer, one POST per click, pre-flight rejections, delivered alone does not advance; the user confirmation does; failure/cancel/not-sent cannot be confirmed; unknown can', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk();
+  const { clipboard, navigator } = clipboardStub();
+  const { state, onFetch } = helper();
+  const ui = await runConsole({ html: html('ja'), onFetch, sdk, navigator });
+  const { el } = ui;
+  await reachStep3(ui, sdk);
+  el('sttd-copy-test').click();
+  await settle();
+  el('sttd-done-test').click();
+  await settle();
+  assert.equal(ui.stepState(4), 'current');
+  assert.deepEqual([el('sttd-text').value, el('sttd-text').disabled, el('sttd-send').disabled, el('sttd-send').textContent], ['', false, false, '送信']);
+  assert.equal(el('sttd-verify-send').disabled, true, 'nothing sent yet');
+  // 通信前拒否。
+  for (const text of ['', ' \n\t　 ', 'abc\ud800', 'a'.repeat(4097)]) {
+    el('sttd-text').value = text;
+    el('sttd-send').click();
+    await settle();
+    assert.equal(ui.api().length, 0);
+    assert.equal(el('sttd-result').textContent, JA('console.inputInvalid'));
+    assert.equal(el('sttd-verify-send').disabled, true);
+  }
+  // 保留中: 二重クリックで1件、verify不可、中止可。
+  state.mode = 'hold';
+  const textA = `  こんにちは🌏\n2行目 </textarea><script>x</script>  `;
+  el('sttd-text').value = textA;
+  assert.equal(el('sttd-send').click(), true);
+  await settle();
+  assert.equal(el('sttd-send').click(), false);
+  el('sttd-send').onclick();
+  await settle();
+  assert.equal(state.holds.length, 1, 'one POST');
+  const post = state.holds[0].entry;
+  assert.deepEqual([post.url, post.method], ['/v2/commands', 'POST']);
+  assert.deepEqual(Object.keys(post.headers).sort(), ['Authorization', 'Content-Type', 'Idempotency-Key', LOCAL_NONCE_HEADER].sort());
+  const payload = JSON.parse(post.body);
+  assert.deepEqual(Object.keys(payload), FIELDS);
+  assert.deepEqual([payload.schemaVersion, payload.text, post.headers['Idempotency-Key'] === payload.commandId], [2, textA, true]);
+  assert.match(payload.commandId, UUID);
+  assert.equal(Date.parse(payload.expiresAt) - Date.parse(payload.createdAt), 60_000);
+  assert.equal(el('sttd-verify-send').disabled, true, 'in flight: cannot confirm');
+  assert.equal(el('sttd-step-1-head').disabled, false, 'done steps stay viewable while sending');
+  state.holds.shift().hold.release({ status: 200, json: { commandId: payload.commandId, state: 'delivered' } });
+  await settle();
+  assert.equal(el('sttd-result').textContent, JA('console.state.delivered'));
+  assert.deepEqual([ui.stepState(4), ui.stepState(5)], ['current', 'locked'], 'delivered alone does not advance');
+  assert.equal(el('sttd-verify-send').disabled, false);
+  // 失敗した送信は確認不可。
+  state.mode = 'deliver';
+  el('sttd-new').click();
+  await settle();
+  state.mode = 'reject';
+  el('sttd-text').value = 'again';
+  el('sttd-send').click();
+  await settle();
+  assert.equal(el('sttd-result').textContent, JA('console.error.409'));
+  assert.equal(el('sttd-verify-send').disabled, true);
+  el('sttd-verify-send').onclick();
+  assert.equal(ui.stepState(5), 'locked');
+  // 中止も確認不可。
+  el('sttd-new').click();
+  await settle();
+  state.mode = 'hold';
+  el('sttd-text').value = 'cancel me';
+  el('sttd-send').click();
+  await settle();
+  state.mode = 'deliver';
+  el('sttd-cancel').click();
+  await settle();
+  const pending = state.holds.shift();
+  pending.hold.release({ status: 200, json: { commandId: JSON.parse(pending.entry.body).commandId, state: 'cancelled' } });
+  await settle();
+  assert.equal(el('sttd-result').textContent, JA('console.state.cancelled'));
+  assert.equal(el('sttd-verify-send').disabled, true);
+  // 結果不明は本人確認で進める（APIの結果は書き換えない）。
+  el('sttd-new').click();
+  await settle();
+  state.mode = 'fail';
+  el('sttd-text').value = 'unknown';
+  el('sttd-send').click();
+  await settle();
+  assert.equal(el('sttd-result').textContent, JA('console.unknown'));
+  assert.equal(el('sttd-verify-send').disabled, false);
+  assert.equal(el('sttd-verify-send').click(), true);
+  await settle();
+  assert.deepEqual([ui.stepState(4), ui.stepState(5)], ['done', 'current']);
+  assert.equal(el('sttd-result').textContent, JA('console.unknown'), 'the API result is not rewritten to success');
+  assert.equal(ui.api().filter((entry) => entry.method === 'POST' && entry.url === '/v2/commands').length, 4);
+  results.W5 = { posts: ui.api().length, clipboardWrites: clipboard.writes.length };
+});
+
+test('W6 operational instructions and completion: copy + "pasted, finish" shows the completion text; afterwards step 4 can be re-selected for ordinary sends without re-copying; the completion text is the user\'s confirmation, not a server verification', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk();
+  const { clipboard, navigator } = clipboardStub();
+  const { onFetch } = helper();
+  const ui = await runConsole({ html: html('en'), onFetch, sdk, navigator });
+  const { el } = ui;
+  await reachStep3(ui, sdk);
+  el('sttd-copy-test').click();
+  await settle();
+  el('sttd-done-test').click();
+  await settle();
+  el('sttd-text').value = 'test one';
+  el('sttd-send').click();
+  await settle();
+  el('sttd-verify-send').click();
+  await settle();
+  assert.equal(ui.stepState(5), 'current');
+  assert.equal(el('sttd-complete').hidden, true);
+  assert.equal(el('sttd-done-operation').disabled, true);
+  el('sttd-copy-operation').click();
+  await settle();
+  assert.equal(clipboard.writes.at(-1), EN('guide.operationText'));
+  assert.equal(el('sttd-done-operation').click(), true);
+  await settle();
+  assert.deepEqual([1, 2, 3, 4, 5].map(ui.stepState), ['done', 'done', 'done', 'done', 'current']);
+  assert.equal(el('sttd-complete').hidden, false);
+  assert.equal(el('sttd-complete').textContent, EN('wizard.complete'));
+  // 完了後の通常送信: 4へ戻り、再コピー不要で送れる。
+  assert.equal(el('sttd-step-4-head').click(), true);
+  assert.equal(el('sttd-panel-4').hidden, false);
+  el('sttd-new').click();
+  await settle();
+  el('sttd-text').value = 'second message';
+  assert.equal(el('sttd-send').click(), true);
+  await settle();
+  assert.equal(el('sttd-result').textContent, EN('console.state.delivered'));
+  assert.equal(ui.api().filter((entry) => entry.method === 'POST' && entry.url === '/v2/commands').length, 2);
+  assert.equal(clipboard.writes.length, 2, 'no re-copy demanded for ordinary sends');
+  assert.deepEqual([1, 2, 3, 5].map(ui.stepState), ['done', 'done', 'done', 'done']);
+  // 言語切替は進捗も入力も消さない。
+  el('sttd-new').click();
+  await settle();
+  el('sttd-text').value = 'kept';
+  el('sttd-lang-ja').click();
+  await settle();
+  assert.deepEqual([el('sttd-text').value, ui.stepState(5), el('sttd-complete').textContent], ['kept', 'done', JA('wizard.complete')]);
+  results.W6 = { posts: ui.api().length };
+});
+
+test('W7 disconnect from step 2: confirm first, one POST, steps 2+ reset and the state re-checked; nothing sent on cancel', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk();
+  const { navigator } = clipboardStub();
+  const { state, onFetch } = helper();
+  const ui = await runConsole({ html: html('ja'), onFetch, sdk, navigator });
+  const { el } = ui;
+  await reachStep3(ui, sdk);
+  el('sttd-copy-test').click();
+  await settle();
+  el('sttd-done-test').click();
+  await settle();
+  assert.equal(el('sttd-step-2-head').click(), true);
+  assert.equal(el('sttd-disconnect').hidden, false);
+  el('sttd-disconnect').click();
+  await settle();
+  assert.equal(el('sttd-disconnect-confirm').hidden, false);
+  el('sttd-disconnect-no').click();
+  await settle();
+  assert.deepEqual([state.disconnects, ui.stepState(3), ui.stepState(4)], [0, 'done', 'ready']);
+  el('sttd-disconnect').click();
+  await settle();
+  assert.equal(el('sttd-disconnect-yes').click(), true);
+  await settle();
+  assert.equal(state.disconnects, 1);
+  assert.equal(el('sttd-disconnect-result').textContent, JA('common.disconnectDone'));
+  assert.deepEqual([ui.stepState(2), ui.stepState(3), ui.stepState(4)], ['current', 'locked', 'locked']);
+  assert.equal(el('sttd-state-guide').textContent, JA('wizard.next.unlinked'), 're-checked after the disconnect');
+  assert.equal(el('sttd-wizard-note').textContent, JA('wizard.stateReset'));
+  results.W7 = { disconnects: state.disconnects };
+});

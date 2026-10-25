@@ -11,7 +11,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node scripts/run-tests.mjs",
-    "package": "node scripts/package-artifacts.mjs package"
+    "package": "node scripts/package-artifacts.mjs package",
+    "console": "node dist/console/local-server.js"
   },
   "dependencies": {
     "@google-cloud/firestore": "8.3.0",

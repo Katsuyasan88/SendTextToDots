@@ -1,4 +1,4 @@
-// MCP/OAuth/送信画面のKMS接続server。startDevelopmentKmsConnectServerが、接続状態/解除API（/v1/web/*）・provider interaction（＋その固定script）
+// MCP/OAuthのKMS接続server。startDevelopmentKmsConnectServerが、接続状態/解除API（/v1/web/*。ローカル送信画面のhelperが中継する）・provider interaction（＋その固定script）
 // （login/consent/deny）・/console（固定API originの操作画面）・MCP・protected resource metadata・OAuth/.well-knownを、要求ごとのcontext・
 // KMS port・AS resolver・MCP入口・購読登録runtime・購読viewの上で内部に組み立て、固定のhttps publicOrigin（issuer）で0.0.0.0の指定portに
 // 待ち受ける。OAuth profileはconnect-kms-development。任意のresolver・store・proof・validatorの注入口は無い。
@@ -52,8 +52,6 @@ import type { KmsDecryptRequest, KmsDecryptResponse, KmsEncryptRequest, KmsEncry
 import { createHmacHasher, OPAQUE_VALUE_PATTERN } from '../secrets.js';
 import { createKmsSubscriptionPolicy, requireKmsMarker, type KmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
 import { AUTH_STORAGE_ROOT, KMS_SUBSCRIPTION_CONFIG_DOC } from '../storage/firestore/kms-subscription-format.js';
-import { tryLoadDeploymentConfig } from '../config/validate.js';
-import { consoleAsset, CONSOLE_PATH, CONSOLE_SCRIPT_PATH, CONSOLE_STYLE_PATH } from './console.js';
 import { ConnectStorage, isConnectNamespace } from './firestore.js';
 import { isLanguage, LANGUAGE_QUERY, languageCookie, selectLanguage, type Language } from './i18n.js';
 import { createConnectKmsSealingPort } from './kms-port.js';
@@ -594,9 +592,6 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
   };
   const issuer = config.publicOrigin;
   const issuerUrl = new URL(issuer);
-  /** /consoleへ渡すAPI origin（配置設定が有効で、issuerが設定のMCP originの時だけ。他はnullで/consoleを配信しない）。 */
-  const deployment = tryLoadDeploymentConfig();
-  const consoleApiOriginFor: string | null = deployment !== null && config.publicOrigin === deployment.connect.publicOrigin ? deployment.api.publicOrigin : null;
   const resource = resourceFor(issuer);
   const kmsConfig = () => ({
     environment: policy.environment,
@@ -997,18 +992,8 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         if (method !== allowed) throw apiErrors.methodNotAllowed();
       };
 
-      // issuerが固定MCP originの時だけ/consoleと固定assetを配信する（API originは固定値だけ。他のoriginでは未知path）。
-      // 本文の中継・新しいAPIは無い。HTMLだけ表示言語（`?lang=`・cookie・Accept-Language）で描く。
-      if (consoleApiOriginFor !== null && (path === CONSOLE_PATH || path === CONSOLE_SCRIPT_PATH || path === CONSOLE_STYLE_PATH)) {
-        only('GET');
-        await guarded(() => assertNoBody(req));
-        const { language, headers } = path === CONSOLE_PATH ? pageLanguage(req, url) : { language: undefined, headers: {} };
-        const asset = consoleAsset(path, web, consoleApiOriginFor, language)!;
-        send(res, 200, asset.type, asset.body, { ...asset.headers, ...headers });
-        return path === CONSOLE_PATH ? 'console.page' : path === CONSOLE_SCRIPT_PATH ? 'console.script' : 'console.style';
-      }
-
-      // 旧接続画面（/connect・/connect/app.js）は無い。redirect・互換pageを置かず、下の未知pathと同じ固定404へ落ちる。
+      // 送信画面（/console・/console/app.js・/console/app.css）はローカル配信helper（src/console/local-server.ts）が出す。このserverは配信せず、
+      // 旧接続画面（/connect・/connect/app.js）と同様に下の未知pathと同じ固定404へ落ちる（redirect・互換page無し）。HTMLはinteractionだけ。
       switch (path) {
         case INTERACTION_SCRIPT_PATH:
           only('GET');

@@ -32,7 +32,8 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 | 部分 | 実行先 | 役割 |
 | --- | --- | --- |
 | 送信API | Cloud Functions 第2世代（`sendtexttodotsapi`） | 認証済み本文の受付、署名付き配送1回、状態照会、中止 |
-| MCP/OAuth・送信画面 | Cloud Run（`dist/deployment/connect.js`） | OAuth認可、`/mcp`でのEvents購読、送信画面`/console`（Appleログイン・接続状態・接続解除・1件送信）。別の接続画面はない |
+| MCP/OAuth | Cloud Run（`dist/deployment/connect.js`） | OAuth認可（interaction画面）と`/mcp`でのEvents購読。送信画面は配信しない |
+| ローカル送信画面 | 自分のパソコン（`npm run console`、`dist/console/local-server.js`） | `http://localhost:8765/console`。5段階のセットアップ（Appleログイン・接続確認・テスト用指示文・送信・運用用指示文）と通常送信。押した操作だけを固定のAPI/MCP originへBearer tokenつきで中継する。[LOCAL_CONSOLE](docs/LOCAL_CONSOLE.md) |
 | 保存 | Firestore | 利用者の接続、OAuth認可、KMS封緘した購読、本文を含まないcommand状態 |
 | 鍵 | Cloud KMS・Secret Manager | 封緘鍵と、署名・cookie・識別子・digest用に分離した秘密 |
 
@@ -54,8 +55,8 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 3. [導入手順](docs/INSTALL.md)に従い、service URLを決定し、Cloud資源・service account・runtime権限（`firebaseauth.users.get`を含む）・秘密・KMS購読markerを用意。[CONFIGURATION](docs/CONFIGURATION.md)を参照し、唯一の配置設定`src/config/deployment.ts`を編集します。
 4. `npm run build`後、`npm run package`でAPI ZIPとMCP Cloud Build source archiveをoffline作成。包装だけでは配置されません。同じ内容での再包装は`output_exists`で停止します。既存archiveの確認方法は[INSTALL](docs/INSTALL.md)を参照してください。
 5. [INSTALL](docs/INSTALL.md)のarchive配置例・origin/IAM確認に従い、APIをCloud Functions 第2世代、MCP/OAuthをDockerfile → Cloud Build → Cloud Runの順で配置します。Cloud資源作成・配置・停止のtoolは同梱されません。導入者のCloud権限が必要で、第三者projectでの手順全体の実行検証は未完了です。
-6. 配置したMCP originの`/console`でAppleログイン（画面はEnglish/日本語を選べます）。Dots/ChatGPT側からMCP serverへOAuth接続し、`text.submitted`を購読すると画面が「受信中」になります。
-7. 同じ`/console`の空欄に本文を入力し、1件送って受信側で確認します。購読後は下のAPI例でも送信できます。同じ画面の「接続を解除」は確認の後に認可と購読を失効させます。
+6. `console.config.example.json`を`console.local.json`へコピーし、API/MCPのoriginとFirebase Webの公開設定を入れて`npm run console -- --config console.local.json`を実行、`http://localhost:8765/console`を開きます（English/日本語）。ボタンを押すまで読み込みも送信もしません。5段階に沿って、Appleログイン → 接続確認（Dots/ChatGPTからOAuth接続し`text.submitted`を購読して「受信中」にする）→ テスト用指示文をDotsへ貼る → 1件送ってDotsで一致を確認 → 運用用指示文を貼る、の順に進めます。[LOCAL_CONSOLE](docs/LOCAL_CONSOLE.md)。
+7. セットアップ後は同じ画面の手順4で通常の送信を行うか、下のAPI例を使います。手順2の「接続を解除」は確認の後に認可と購読を失効させます。
 
 [Dotsの受信テストと応答設定](docs/DOTS_GUIDE.md)に、受信先Dotsへ貼る指示文を用意しています。本文一致の配送確認を行った後、短文は引用・長文は要約・秘密情報は省く通常の応答へ切り替えられます。送信画面の案内でも、選択中の言語で両方の文面を表示・コピーできます。
 

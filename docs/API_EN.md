@@ -59,11 +59,10 @@ The send screen `/console` (served on the MCP origin) sends the text the user ty
 
 ## 3. Send screen and connection state
 
-The send screen is the only web entry. There is no separate connection page; `/connect` and `/connect/app.js` are not served (404 like any unknown path).
+The send screen is served by the local helper on your computer ([LOCAL_CONSOLE_EN.md](LOCAL_CONSOLE_EN.md)), not by Cloud Run. The MCP service serves only the OAuth interaction pages; `/console`, `/connect` and their assets are 404 there like any unknown path. The helper relays the pressed actions to the routes below with your Bearer token.
 
 | Endpoint | Content |
 | --- | --- |
-| `GET /console` | Send screen (Apple sign-in, state, disconnect, one send, cancel, same-ID lookup). Served only when the deployment configuration provides the API origin |
 | `GET /v1/web/connection` | Bearer Firebase ID token. `{state}` |
 | `POST /v1/web/disconnect` | Revokes the same owner's Grant and subscription. `{state}` |
 | `/interaction/{uid}`, `…/login`, `…/consent`, `…/deny`, `/interaction/app.js` | OAuth authorization interaction (same origin, CSRF, explicit consent every time) and its fixed script |

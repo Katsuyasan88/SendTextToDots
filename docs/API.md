@@ -59,11 +59,10 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 
 ## 3. 送信画面と接続状態
 
-Webの入口は送信画面だけです。別の接続画面はなく、`/connect`・`/connect/app.js`は配信しません（未知pathと同じ404）。
+送信画面はCloud Runではなく、自分のパソコンで動くローカルhelperが配信します（[LOCAL_CONSOLE.md](LOCAL_CONSOLE.md)）。MCP serviceはOAuth interaction画面だけを配信し、`/console`・`/connect`とそのassetは未知pathと同じ404です。helperは押した操作だけを下のrouteへBearer tokenつきで中継します。
 
 | endpoint | 内容 |
 | --- | --- |
-| `GET /console` | 送信画面（Appleログイン・状態・接続解除・1件送信・中止・同ID確認）。配置設定がAPI originを与える構成だけで配信 |
 | `GET /v1/web/connection` | Bearer Firebase ID token。`{state}` |
 | `POST /v1/web/disconnect` | 同ownerのGrant/購読を失効。`{state}` |
 | `/interaction/{uid}`・`…/login`・`…/consent`・`…/deny`・`/interaction/app.js` | OAuth認可のinteraction（同origin・CSRF・毎回の明示同意）とその固定script |

@@ -128,7 +128,7 @@ test('OAuth interaction/送信画面: id/dataはsttd-、scriptのdatasetはsttdC
   const deployment = loadDeploymentConfig();
   const web = { apiKey: 'synthetic-web-api-key', authDomain: deployment.web.authDomain, projectId: deployment.web.projectId };
   const interactionHtml = [renderInteractionLogin(web, 'uid-1', 'client', 'csrf-1'), renderInteractionConsent(web, 'uid-1', 'client', 'csrf-1')].join('\n');
-  const consoleHtml = consoleAsset('/console', web, deployment.api.publicOrigin).body;
+  const consoleHtml = consoleAsset('/console', web, { nonce: 'c'.repeat(64), secure: false }).body;
   const camel = (name) => name.replace(/-([a-z])/g, (_, char) => char.toUpperCase());
 
   for (const [html, script] of [[interactionHtml, INTERACTION_SCRIPT], [consoleHtml, CONSOLE_SCRIPT]]) {

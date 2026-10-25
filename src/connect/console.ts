@@ -1,36 +1,41 @@
-// 本人用のブラウザ送信画面（/console）。Appleログイン（既存Firebase Web SDK 13.0.0・Apple providerのみ・追加scopeなし）・
-// 接続/購読状態（同originの既存 /v1/web/connection）・接続解除（同originの既存 POST /v1/web/disconnect。確認してから1回だけ）・
-// 利用者が入力した本文の送信・中止・本人のクリックによる同じIDの結果確認。表示はen/ja（connect/i18n.ts）。
-//   - 本文欄は空で始まり、例文・定型文・方向の選択・固定taskは無い。入力値をtrim・正規化せずそのままv2の5項目で送る。
-//   - 指示・中止・結果確認は、固定Functions originへbrowserから直接送る（MCPは本文を中継しない）。tokenはAuthorizationだけ、credentials:omit。
-//   - 本文はRAM/DOMだけ（localStorage・sessionStorage・IndexedDB・URL・ログへ保存0。Firebase SDK自身の認証session保存とは別）。
-//   - 空・空白だけ・対にならないsurrogate・4096 UTF-8 byte超は通信前に拒否する（maxlengthは補助で、byte検査の代わりにしない）。
-//   - 送信POSTは最大25秒（元期限内）、二重クリックでPOSTを増やさない。送信中は本文・account切替・解除・言語切替を封鎖し中止だけ。
-//     終端後は「新しい送信」を明示に押すまで再送しない。自動POST再送・定期poll 0。中止は同commandIdへ最大5秒。
-//   - 表示はHTTP statusではなくstate。deliveredは送信先の受領で、同じDotの反応は自動確認しない。未確定は成功扱いしない。
-//   - 解除は本人の確認（はい）の後に1回だけPOSTし、処理中は送信・切替・再確認と排他。確認の取消・失敗・期限切れでは成功を装わず、
-//     終了後は接続状態を再確認し、本人が「状態を再確認」を押すまで送信を封鎖する。
-//   - 言語はサーバーが選んだ初期言語（HTMLのlang・本文）で始まり、English/日本語の明示選択は画面内で文言を差し替え、表示専用のsession cookie
-//     `sttd_language`をbrowserで同期に設定する（固定en/ja・サーバーと同じ固定属性。応答順序に依存せず最後の選択が残る。他cookieは読まない。
-//     navigation・form送信・ログイン・解除・送信・追加HTTPを起こさない）。送信中・処理中は切替を受けない。`?lang=`のGETリンクはJSなし時のfallback。
-//   - 接続欄の下に受信Dotsの設定案内（テスト用指示文→送信テスト→運用用指示文）を置く。指示文は辞書の固定文（docs/DOTS_GUIDE*.mdのcode blockと同文）で、
-//     表示（手動コピー可）と、本人のクリックでnavigator.clipboard.writeTextへ固定文だけを書くボタン。clipboardの読取り・permission要求・利用者本文/token/設定値の
-//     書込みは無く、未対応/失敗では成功を装わず手動コピーを案内する。コピーでHTTP/ログイン/同意/購読/解除/送信を始めず、本文欄のpresetにもしない。
-//     段階の完了（Dots側の本文一致・運用切替）は利用者がDotsで確認し、画面は自動判定・保存しない。
-//   - HTML・JS・CSSは固定文字列で、inline script/style・実filesystem読取り・新framework・新依存は無い。動的な値はdata属性へescape、表示はtextContent。
-//   - apiOriginとweb configは信頼する呼出元（connect/kms-server.ts）だけが渡す。利用者・argv・envから任意originを選ばせない。
-// 各要求の元期限（POST 25秒・中止5秒・同ID確認10秒）に認証取得を含め、期限後のtokenで通信を始めない。
-//   backendのdelivery_unknownでも本人クリックの同ID確認を残す。認証切替・接続再確認・解除は排他し、確認済みの現在状態まで送信を封鎖する。
-//   httpsのAPI originはDNS hostだけ（IP literal拒否）。
+// ローカル送信画面（http://localhost:<port>/console）。配信・中継はsrc/console/local-server.ts、このfileはHTML/CSS/固定browser scriptだけ。
+//   - 表示・再読込み・言語切替・固定プロンプトの表示/コピーでは、Cloud Run/本番API/認証SDKへ通信しない。Firebase Web SDK 13.0.0は手順1の明示
+//     ログイン操作で初めてimport()し、復元済みsessionの確認・ID token取得・接続状態の確認もその後にだけ行う。popupは明示操作だけ。
+//   - 認証後の操作（接続確認・解除・送信・中止・同ID確認）は同origin（localhost helper）の限定pathへ、Authorization: Bearer と起動ごとのlocal nonce
+//     （X-Sttd-Local-Nonce）を付けて送る。helperが固定のMCP/API originへ中継する。本文はRAM/DOMだけ、保存0。
+//   - 5段階wizard: 1 ログイン → 2 接続確認（手動1回） → 3 テスト用Dotsプロンプト（コピー＋本人の「貼り付けて次へ」） → 4 送信（単回POST・同ID・取消。
+//     本人の「Dotsで本文一致を確認して次へ」） → 5 運用用Dotsプロンプト（コピー＋「貼り付けて完了」）。初期は1だけ有効。完了済みの前stepは薄く
+//     表示して再選択でき、再表示だけでは証跡を消さない。再ログイン開始時は2以降、受信を確認できない時は3以降、テスト設定の再適用は4/5を戻す。
+//     未解放のstepはクリックしても進めず通信しない。古いasync結果（世代が違うログイン/確認）で後続を解放しない。完了後は4で通常送信を繰り返せる。
+//   - HTTP受領（delivered）だけでwizardを進めない。4の完了は利用者がDotsで一致を確認した明示操作。不明（delivery_unknown/結果不明）はAPI結果を
+//     成功へ書き換えず、利用者の確認だけで進める。進行中（in-flight・中止確認中・同ID確認中）は完了不可。
+//   - 本文欄は空で始まりplaceholderに非機密の例文、主buttonはja「送信」/en「Send」。空・空白だけ・対にならないsurrogate・4096 UTF-8 byte超は通信前に拒否。
+//     送信POSTは最大25秒（元期限内）、二重クリックでPOSTを増やさない。終端後は「新しい送信」まで再送しない。自動再送・定期poll 0。
+//   - 言語はサーバーが選んだ初期言語で始まり、明示選択は画面内で差し替え、表示専用cookie sttd_language をbrowserで同期に設定する（属性はhelperが
+//     scheme に応じて渡す。http localhostではSecureなし）。言語切替で入力・進捗を消さない。コピー処理中の排他/失敗fallback/旧成功表示クリアを維持。
+//   - HTML・JS・CSSは固定文字列で、inline script/style・新framework・新依存は無い。動的な値はdata属性へescape、表示はtextContent。
+//     nonce・web configは信頼する呼出元（local-server.ts）だけが渡す。
 
-import { DEFAULT_LANGUAGE, isLanguage, LANGUAGE_COOKIE, languageCookieAttributes, languageHref, messagesJson, text, type Language, type MessageKey } from './i18n.js';
+import {
+  DEFAULT_LANGUAGE,
+  isLanguage,
+  LANGUAGE_COOKIE,
+  languageCookieAttributes,
+  languageHref,
+  messagesJson,
+  text,
+  type Language,
+  type MessageKey,
+} from './i18n.js';
 import { FIREBASE_POPUP_SCRIPT_ORIGIN, FIREBASE_WEB_SDK_VERSION, type FirebaseWebConfig } from './pages.js';
 
 export const CONSOLE_PATH = '/console';
 export const CONSOLE_SCRIPT_PATH = '/console/app.js';
 export const CONSOLE_STYLE_PATH = '/console/app.css';
-/** 既存の接続画面と同じ公式CDNの固定版。 */
+/** 既存のinteraction画面と同じ公式CDNの固定版（明示ログイン時にimport()する）。 */
 export const CONSOLE_SDK_BASE = `https://www.gstatic.com/firebasejs/${FIREBASE_WEB_SDK_VERSION}/`;
+/** helperへの中継要求に必須のlocal nonce header（起動ごとの乱数。Cloudへは転送しない）。 */
+export const LOCAL_NONCE_HEADER = 'X-Sttd-Local-Nonce';
 
 /** 渡された設定の不正（固定message・値を持たない）。 */
 export class ConsoleConfigError extends Error {
@@ -44,25 +49,6 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
 }
 
-/**
- * API originの検査。`https://<DNS-host>`（port・path・query・userinfoなし）か、local fixtureの`http://127.0.0.1:<port>`だけ。
- * 正規形でない値・他のloopback表記・任意scheme・CSP区切りになり得る文字は拒否する。
- */
-export function consoleApiOrigin(value: unknown): string {
-  if (typeof value !== 'string' || !/^[a-z0-9.:/-]+$/.test(value)) throw new ConsoleConfigError();
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new ConsoleConfigError();
-  }
-  // httpsはDNS hostだけ（IPv4 literalを拒否。IPv6 literalは上の文字検査で拒否済み）。
-  const https = url.protocol === 'https:' && url.port === '' && /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(url.hostname) && !/^[0-9.]+$/.test(url.hostname);
-  const loopback = url.protocol === 'http:' && url.hostname === '127.0.0.1' && url.port !== '';
-  if (!(https || loopback) || url.origin !== value) throw new ConsoleConfigError();
-  return value;
-}
-
 function checkWeb(web: FirebaseWebConfig): void {
   for (const key of ['apiKey', 'authDomain', 'projectId'] as const) {
     if (typeof web?.[key] !== 'string' || web[key].length === 0) throw new ConsoleConfigError();
@@ -70,18 +56,32 @@ function checkWeb(web: FirebaseWebConfig): void {
   if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(web.authDomain)) throw new ConsoleConfigError();
 }
 
+/** 起動ごとのlocal nonce（hex 32〜128字）。 */
+export function checkLocalNonce(value: unknown): string {
+  if (typeof value !== 'string' || !/^[a-f0-9]{32,128}$/.test(value)) throw new ConsoleConfigError();
+  return value;
+}
+
+/** 画面の描画option。 */
+export interface ConsolePageOptions {
+  readonly language?: Language | undefined;
+  /** 起動ごとのlocal nonce。 */
+  readonly nonce: string;
+  /** 画面がhttpsで配信されるか（表示言語cookieのSecure属性）。localhostのhttpではfalse。 */
+  readonly secure: boolean;
+}
+
 /**
- * /consoleの画面用header。既存の接続画面の固定Firebase SDK/script/iframe許可を再利用し、同originのCSSと固定API originのconnect-srcだけを
- * 加える（unsafe-inline・unsafe-eval・任意httpsなし）。既存OAuth画面のCSP（pageSecurityHeaders）は変えない。
+ * ローカル送信画面のheader。script-srcは同originとFirebase固定SDK/popup、connect-srcは同origin（helper）とFirebase認証endpointだけ。
+ * 本番APIのoriginはbrowserから直接呼ばないのでCSPに無い。
  */
-export function consoleSecurityHeaders(web: FirebaseWebConfig, apiOrigin: string): Record<string, string> {
+export function consoleSecurityHeaders(web: FirebaseWebConfig): Record<string, string> {
   checkWeb(web);
-  const api = consoleApiOrigin(apiOrigin);
   return {
     'Content-Security-Policy': [
       "default-src 'none'",
       `script-src 'self' ${CONSOLE_SDK_BASE} ${FIREBASE_POPUP_SCRIPT_ORIGIN}`,
-      `connect-src 'self' https://identitytoolkit.googleapis.com https://securetoken.googleapis.com ${api}`,
+      "connect-src 'self' https://identitytoolkit.googleapis.com https://securetoken.googleapis.com",
       `frame-src https://${web.authDomain}`,
       "style-src 'self'",
       "img-src 'none'",
@@ -94,26 +94,36 @@ export function consoleSecurityHeaders(web: FirebaseWebConfig, apiOrigin: string
   };
 }
 
-/**
- * /consoleのHTML（1画面）。値はdata属性へescapeして渡す。文言は選択言語の辞書から入れ、scriptが同じキーで差し替える。
- * 表示言語cookieの固定属性（issuerはhttpsなのでSecureつき）もdata属性で渡し、scriptはサーバーのSet-Cookieと同じ形で同期に設定する。
- */
-export function renderConsolePage(web: FirebaseWebConfig, apiOrigin: string, language: Language = DEFAULT_LANGUAGE): string {
+/** /consoleのHTML（5段階wizard、1画面）。値はdata属性へescapeして渡す。文言は選択言語の辞書から入れ、scriptが同じキーで差し替える。 */
+export function renderConsolePage(web: FirebaseWebConfig, options: ConsolePageOptions): string {
   checkWeb(web);
-  const api = consoleApiOrigin(apiOrigin);
-  const lang: Language = isLanguage(language) ? language : DEFAULT_LANGUAGE;
+  const nonce = checkLocalNonce(options?.nonce);
+  const lang: Language = isLanguage(options.language) ? options.language : DEFAULT_LANGUAGE;
   const t = (key: MessageKey) => escapeHtml(text(lang, key));
-  /** 固定キーの文言をtextContentとして持つ要素（scriptの言語切替が同じキーで差し替える）。 */
   const i18n = (key: MessageKey) => ` data-sttd-i18n="${key}"`;
   const data = Object.entries({
     'sttd-firebase': JSON.stringify({ apiKey: web.apiKey, authDomain: web.authDomain, projectId: web.projectId }),
-    'sttd-api-origin': api,
     'sttd-language': lang,
-    'sttd-cookie-attributes': languageCookieAttributes(true),
+    'sttd-cookie-attributes': languageCookieAttributes(options.secure === true),
+    'sttd-local-nonce': nonce,
   })
     .map(([name, value]) => ` data-${name}="${escapeHtml(value)}"`)
     .join('');
   const current = (candidate: Language) => (candidate === lang ? ' aria-current="true"' : '');
+  const stepHead = (n: number, key: MessageKey) =>
+    `<li class="sttd-step" id="sttd-step-${n}" data-sttd-state="${n === 1 ? 'current' : 'locked'}"><button type="button" id="sttd-step-${n}-head" class="sttd-step-head" aria-controls="sttd-panel-${n}"${n === 1 ? '' : ' disabled'}${i18n(key)}>${t(key)}</button> <span id="sttd-step-${n}-badge" class="sttd-badge"${i18n(n === 1 ? 'wizard.badgeCurrent' : 'wizard.badgeLocked')}>${t(n === 1 ? 'wizard.badgeCurrent' : 'wizard.badgeLocked')}</span></li>`;
+  const instructions = (kind: 'test' | 'operation', showKey: MessageKey, textKey: MessageKey, copyKey: MessageKey, doneKey: MessageKey) => `<div class="sttd-instruction-block">
+<details id="sttd-guide-${kind}" class="sttd-instructions-details">
+<summary id="sttd-guide-${kind}-summary"${i18n(showKey)}>${t(showKey)}</summary>
+<pre id="sttd-guide-${kind}-text" class="sttd-instructions" tabindex="0"${i18n(textKey)}>${t(textKey)}</pre>
+</details>
+<div class="sttd-actions">
+<button type="button" id="sttd-copy-${kind}"${i18n(copyKey)}>${t(copyKey)}</button>
+<button type="button" id="sttd-manual-${kind}" hidden${i18n('wizard.manualCopied')}>${t('wizard.manualCopied')}</button>
+</div>
+<p id="sttd-copy-result-${kind}" role="status"></p>
+<button type="button" id="sttd-done-${kind}" disabled${i18n(doneKey)}>${t(doneKey)}</button>
+</div>`;
   return `<!DOCTYPE html>
 <html lang="${lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${t('console.title')}</title>
 <link rel="stylesheet" href="${CONSOLE_STYLE_PATH}">
@@ -126,19 +136,30 @@ export function renderConsolePage(web: FirebaseWebConfig, apiOrigin: string, lan
 <a id="sttd-lang-ja" href="${languageHref(CONSOLE_PATH, 'ja')}" hreflang="ja" lang="ja"${current('ja')}>${t('common.languageJapanese')}</a>
 </nav>
 <h1 id="sttd-heading"${i18n('console.heading')}>${t('console.heading')}</h1>
-<p id="sttd-intro"${i18n('console.intro')}>${t('console.intro')}</p>
-<section id="sttd-account" aria-labelledby="sttd-account-title">
-<h2 id="sttd-account-title"${i18n('console.account')}>${t('console.account')}</h2>
-<p id="sttd-account-text" role="status">${t('console.accountChecking')}</p>
-<button type="button" id="sttd-login" hidden${i18n('common.appleLogin')}>${t('common.appleLogin')}</button>
-<button type="button" id="sttd-switch" hidden${i18n('common.switchAccount')}>${t('common.switchAccount')}</button>
-</section>
-<section id="sttd-connection" aria-labelledby="sttd-connection-title">
-<h2 id="sttd-connection-title"${i18n('console.connection')}>${t('console.connection')}</h2>
-<p id="sttd-state-text" role="status">${t('console.connectionSignedOut')}</p>
-<p id="sttd-start-guide" hidden${i18n('common.startGuide')}>${t('common.startGuide')}</p>
+<p id="sttd-intro"${i18n('wizard.intro')}>${t('wizard.intro')}</p>
+<h2 id="sttd-wizard-title"${i18n('wizard.title')}>${t('wizard.title')}</h2>
+<ol id="sttd-steps" class="sttd-steps">
+${stepHead(1, 'wizard.step1')}
+${stepHead(2, 'wizard.step2')}
+${stepHead(3, 'wizard.step3')}
+${stepHead(4, 'wizard.step4')}
+${stepHead(5, 'wizard.step5')}
+</ol>
+<p id="sttd-wizard-note" role="status"></p>
+<section id="sttd-panel-1" class="sttd-panel" aria-labelledby="sttd-step-1-head">
+<p id="sttd-login-intro"${i18n('wizard.loginIntro')}>${t('wizard.loginIntro')}</p>
+<p id="sttd-account-text" role="status">${t('console.accountSignedOut')}</p>
 <div class="sttd-actions">
-<button type="button" id="sttd-refresh" hidden${i18n('console.refresh')}>${t('console.refresh')}</button>
+<button type="button" id="sttd-login"${i18n('common.appleLogin')}>${t('common.appleLogin')}</button>
+<button type="button" id="sttd-switch" hidden${i18n('common.switchAccount')}>${t('common.switchAccount')}</button>
+</div>
+</section>
+<section id="sttd-panel-2" class="sttd-panel" aria-labelledby="sttd-step-2-head" hidden>
+<p id="sttd-state-intro"${i18n('wizard.stateIntro')}>${t('wizard.stateIntro')}</p>
+<p id="sttd-state-text" role="status"></p>
+<p id="sttd-state-guide"></p>
+<div class="sttd-actions">
+<button type="button" id="sttd-refresh"${i18n('wizard.checkState')}>${t('wizard.checkState')}</button>
 <button type="button" id="sttd-disconnect" hidden${i18n('common.disconnect')}>${t('common.disconnect')}</button>
 </div>
 <div id="sttd-disconnect-confirm" role="group" aria-labelledby="sttd-disconnect-question" hidden>
@@ -148,32 +169,13 @@ export function renderConsolePage(web: FirebaseWebConfig, apiOrigin: string, lan
 </div>
 <p id="sttd-disconnect-result" role="status"></p>
 </section>
-<section id="sttd-guide" aria-labelledby="sttd-guide-title">
-<h2 id="sttd-guide-title"${i18n('guide.title')}>${t('guide.title')}</h2>
+<section id="sttd-panel-3" class="sttd-panel" aria-labelledby="sttd-step-3-head" hidden>
 <p id="sttd-guide-intro"${i18n('guide.intro')}>${t('guide.intro')}</p>
-<ol class="sttd-steps">
-<li id="sttd-guide-step1"${i18n('guide.step1')}>${t('guide.step1')}</li>
-<li id="sttd-guide-step2"${i18n('guide.step2')}>${t('guide.step2')}</li>
-<li id="sttd-guide-step3"${i18n('guide.step3')}>${t('guide.step3')}</li>
-</ol>
-<div class="sttd-instruction-block">
-<details id="sttd-guide-test" class="sttd-instructions-details">
-<summary id="sttd-guide-test-summary"${i18n('guide.showTest')}>${t('guide.showTest')}</summary>
-<pre id="sttd-guide-test-text" class="sttd-instructions" tabindex="0"${i18n('guide.testText')}>${t('guide.testText')}</pre>
-</details>
-<button type="button" id="sttd-copy-test"${i18n('guide.copyTest')}>${t('guide.copyTest')}</button>
-</div>
-<div class="sttd-instruction-block">
-<details id="sttd-guide-operation" class="sttd-instructions-details">
-<summary id="sttd-guide-operation-summary"${i18n('guide.showOperation')}>${t('guide.showOperation')}</summary>
-<pre id="sttd-guide-operation-text" class="sttd-instructions" tabindex="0"${i18n('guide.operationText')}>${t('guide.operationText')}</pre>
-</details>
-<button type="button" id="sttd-copy-operation"${i18n('guide.copyOperation')}>${t('guide.copyOperation')}</button>
-</div>
-<p id="sttd-copy-result" role="status"></p>
+<p id="sttd-guide-step1"${i18n('guide.step1')}>${t('guide.step1')}</p>
+${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wizard.pastedTestNext')}
 </section>
-<section id="sttd-send-section" aria-labelledby="sttd-send-title">
-<h2 id="sttd-send-title"${i18n('console.send')}>${t('console.send')}</h2>
+<section id="sttd-panel-4" class="sttd-panel" aria-labelledby="sttd-step-4-head" hidden>
+<p id="sttd-send-intro"${i18n('wizard.sendIntro')}>${t('wizard.sendIntro')}</p>
 <label id="sttd-text-label" for="sttd-text"${i18n('console.textLabel')}>${t('console.textLabel')}</label>
 <textarea id="sttd-text" rows="4" maxlength="4096" placeholder="${t('console.textPlaceholder')}" disabled></textarea>
 <div class="sttd-actions">
@@ -184,6 +186,13 @@ export function renderConsolePage(web: FirebaseWebConfig, apiOrigin: string, lan
 </div>
 <p id="sttd-result" role="status"></p>
 <p id="sttd-note" class="sttd-note"${i18n('console.note')}>${t('console.note')}</p>
+<button type="button" id="sttd-verify-send" disabled${i18n('wizard.sendVerified')}>${t('wizard.sendVerified')}</button>
+<p id="sttd-verify-hint" class="sttd-note"${i18n('wizard.sendNotVerifiable')}>${t('wizard.sendNotVerifiable')}</p>
+</section>
+<section id="sttd-panel-5" class="sttd-panel" aria-labelledby="sttd-step-5-head" hidden>
+<p id="sttd-guide-step3"${i18n('guide.step3')}>${t('guide.step3')}</p>
+${instructions('operation', 'guide.showOperation', 'guide.operationText', 'guide.copyOperation', 'wizard.pastedOperationFinish')}
+<p id="sttd-complete" class="sttd-complete" role="status" hidden${i18n('wizard.complete')}>${t('wizard.complete')}</p>
 </section>
 </main>
 </body></html>`;
@@ -207,31 +216,39 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-language a { color: #1f5fbf; padding: 0.5rem 0.25rem; }
 .sttd-language a[aria-current="true"] { font-weight: 700; text-decoration: none; color: #1d1f23; }
 .sttd-language a[aria-disabled="true"] { color: #5b616b; pointer-events: none; }
-.sttd-actions { display: flex; flex-wrap: wrap; }
-.sttd-steps { padding-left: 1.25rem; margin: 0.5rem 0; }
-.sttd-steps li { margin: 0.25rem 0; }
+.sttd-steps { list-style: none; padding: 0; margin: 0 0 0.75rem; display: flex; flex-direction: column; gap: 0.25rem; }
+.sttd-step { display: flex; align-items: center; gap: 0.5rem; }
+.sttd-step-head { flex: 1; text-align: left; margin: 0; background: #fff; color: #1d1f23; border-color: #b8bdc6; }
+.sttd-step[data-sttd-state="current"] .sttd-step-head { border-color: #1f5fbf; border-width: 2px; font-weight: 700; }
+.sttd-step[data-sttd-state="done"] .sttd-step-head { color: #4a5059; background: #f5f6f8; }
+.sttd-step[data-sttd-state="locked"] .sttd-step-head { color: #8a9099; background: #eceef1; border-color: #d9dce1; }
+.sttd-badge { font-size: 0.8rem; color: #4a5059; min-width: 3.5rem; }
 .sttd-instruction-block { margin-top: 0.75rem; }
 .sttd-instructions-details summary { cursor: pointer; font-weight: 600; min-height: 44px; display: flex; align-items: center; }
 .sttd-instructions { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; background: #f5f6f8; border: 1px solid #d9dce1; border-radius: 6px; padding: 0.75rem; margin: 0; }
-#sttd-result, #sttd-disconnect-result { font-weight: 600; min-height: 1.5em; overflow-wrap: anywhere; }
+.sttd-actions { display: flex; flex-wrap: wrap; }
+#sttd-result, #sttd-disconnect-result, #sttd-wizard-note { font-weight: 600; min-height: 1.5em; overflow-wrap: anywhere; }
 .sttd-note { font-size: 0.85rem; color: #4a5059; }
+.sttd-complete { font-weight: 700; border: 2px solid #1f5fbf; border-radius: 8px; padding: 0.75rem; }
 [hidden] { display: none !important; }
 `;
 
 /**
- * 画面のscript（固定asset）。状態の表示・単回送信・中止・本人のクリックでの同ID確認・確認後の接続解除・言語の切替だけ。
- * 自動popup・自動再送・定期pollは無い。文言は埋め込んだ固定辞書（connect/i18n.ts）からキーで引く。
+ * 画面のscript（固定asset）。5段階wizardの状態・単回送信・中止・同ID確認・確認後の解除・固定プロンプトのコピー・言語切替。
+ * Firebase SDKは手順1の明示操作でだけimport()する。文言は埋め込んだ固定辞書（connect/i18n.ts）からキーで引く。
  */
-export const CONSOLE_SCRIPT = `import { initializeApp } from '${CONSOLE_SDK_BASE}firebase-app.js';
-import { getAuth, OAuthProvider, signInWithPopup, signOut } from '${CONSOLE_SDK_BASE}firebase-auth.js';
-
-const body = document.body;
-const API = body.dataset.sttdApiOrigin;
-const auth = getAuth(initializeApp(JSON.parse(body.dataset.sttdFirebase)));
+export const CONSOLE_SCRIPT = `const body = document.body;
+const SDK_BASE = '${CONSOLE_SDK_BASE}';
+const FIREBASE = JSON.parse(body.dataset.sttdFirebase);
+const NONCE = body.dataset.sttdLocalNonce;
+const NONCE_HEADER = '${LOCAL_NONCE_HEADER}';
 const TEXT = ${messagesJson()};
+const LANGUAGE_COOKIE = '${LANGUAGE_COOKIE}';
+const COOKIE_ATTRIBUTES = body.dataset.sttdCookieAttributes;
 const POST_MS = 25000;
 const CANCEL_MS = 5000;
 const CHECK_MS = 10000;
+const CONNECTION_MS = 10000;
 const DISCONNECT_MS = 10000;
 const LIFETIME_MS = 60000;
 const MAX_TEXT_BYTES = 4096;
@@ -240,30 +257,38 @@ const CONNECTION_STATES = ['unlinked', 'linked', 'subscribed', 'expired', 'chang
 const ERROR_STATUSES = [400, 401, 403, 409, 422, 429];
 const TERMINAL = ['delivered', 'failed', 'cancelled', 'expired', 'delivery_unknown'];
 const RANK = { in_flight: 1, delivery_unknown: 2, failed: 3, expired: 3, cancelled: 3, delivered: 4 };
-
-const LANGUAGE_COOKIE = '${LANGUAGE_COOKIE}';
-const COOKIE_ATTRIBUTES = body.dataset.sttdCookieAttributes;
+const STEPS = [1, 2, 3, 4, 5];
+/** Firebase SDKの読込み（明示ログイン時だけ。固定CDNの2 module）。 */
+const loadSdkModules = () => Promise.all([import(SDK_BASE + 'firebase-app.js'), import(SDK_BASE + 'firebase-auth.js')]);
 
 const el = (id) => document.getElementById(id);
 let lang = Object.hasOwn(TEXT, body.dataset.sttdLanguage) ? body.dataset.sttdLanguage : 'en';
-/** 固定キーの文言（未知のキーは空文字。入力値を文言にしない）。 */
 const T = (key) => (Object.hasOwn(TEXT[lang], key) ? TEXT[lang][key] : '');
+
+// ---- 状態（全てRAM。reloadで初期化） ----
+let sdk = null;
+let sdkLoading = null;
+let loginGeneration = 0;
+let checkGeneration = 0;
 let signedIn = false;
-let connection = null;
-let test = null;
-let note = '';
-let accountKey = 'console.accountChecking';
-let connectionKey = 'console.connectionSignedOut';
-// 認証切替・接続の再確認・解除の間は排他し、確認済みの現在状態が戻るまで送信を封鎖する。
 let accountBusy = false;
-let connectionSeq = 0;
-// 解除の確認表示と結果。解除後は本人が「状態を再確認」を押すまで送信を封鎖する。
+let accountKey = 'console.accountSignedOut';
+let connection = null;
+let connectionKey = '';
+let guideKey = '';
+let checking = false;
+let step = 1;
+const done = { 1: false, 2: false, 3: false, 4: false, 5: false };
+let noteKey = '';
+let test = null;
+let sendNote = '';
 let confirming = false;
 let disconnectKey = '';
-let disconnected = false;
-// 指示文コピーの結果（固定キー）と進行中の印。進行中は2つのコピーボタンと言語切替を封鎖し、結果は始めたコピーの文面だけに対応させる。
 let copyKey = '';
+let copyFor = '';
 let copying = false;
+const copied = { test: false, operation: false };
+const manual = { test: false, operation: false };
 
 function phaseOf(current) {
   if (current.state !== null && TERMINAL.includes(current.state)) return 'settled';
@@ -272,45 +297,114 @@ function phaseOf(current) {
   return 'unknown';
 }
 
-/** 本人のクリックで同じIDを1回確認できる時（結果不明・backendのdelivery_unknownを含む）。 */
 function checkable(current) {
   return phaseOf(current) === 'unknown' || current.state === 'delivery_unknown';
 }
 
-function sendableNow() {
-  return signedIn && connection === 'subscribed' && !accountBusy && !disconnected;
-}
-
-/** ログイン・切替・再確認・解除を受けない間（送信の1件が終わるまでと、認証切替・再確認・解除の処理中）。 */
+/** 認証処理・接続確認・解除の処理中。 */
 function busy() {
-  return accountBusy || test !== null;
+  return accountBusy || checking;
 }
 
-/** 言語の切替を受けない間（送信中・中止の確認中・結果確認中・認証切替・再確認・解除の処理中。終端後の切替は文言の差し替えだけなので受ける）。 */
+/** 送信中（1件の終端まで）か。 */
+function sending() {
+  return test !== null && phaseOf(test) === 'sending';
+}
+
+/** stepが使えるか（DOMの見た目に頼らず、各handlerもこれで検査する）。確認中は3以降を一時封鎖。 */
+function available(n) {
+  if (n === 1) return true;
+  if (n === 2) return done[1];
+  if (checking) return false;
+  if (n === 3) return done[2];
+  if (n === 4) return done[3];
+  return done[4];
+}
+
+function sendableNow() {
+  return available(4) && signedIn && connection === 'subscribed' && !busy();
+}
+
 function languageLocked() {
   return accountBusy || copying || (test !== null && (phaseOf(test) === 'sending' || test.cancel === 'pending' || test.checking));
 }
 
+/** 本人がDotsで一致を確認できる送信終端か（受領/不明。未送信・失敗・中止・期限切れ・進行中は不可）。 */
+function verifiable() {
+  if (test === null || !test.postDone || test.cancel === 'pending' || test.checking) return false;
+  if (test.state === 'delivered' || test.state === 'delivery_unknown') return true;
+  return test.state === null && test.rejected === null;
+}
+
+/** 手順nから後ろの進捗を戻す（nより前の証跡は消さない）。 */
+function resetFrom(n) {
+  for (const k of STEPS) if (k >= n) done[k] = false;
+  if (n <= 2) {
+    connection = null;
+    connectionKey = '';
+    guideKey = '';
+    confirming = false;
+    disconnectKey = '';
+  }
+  if (n <= 3) {
+    copied.test = false;
+    manual.test = false;
+  }
+  if (n <= 4) {
+    test = null;
+    sendNote = '';
+    el('sttd-text').value = '';
+  }
+  if (n <= 5) {
+    copied.operation = false;
+    manual.operation = false;
+  }
+  if (copyFor !== '' && ((n <= 3 && copyFor === 'test') || (n <= 5 && copyFor === 'operation'))) {
+    copyKey = '';
+    copyFor = '';
+  }
+  if (step > n) step = n;
+}
+
 function render() {
   const phase = test === null ? null : phaseOf(test);
-  const sendable = sendableNow();
+  for (const n of STEPS) {
+    const state = step === n ? 'current' : done[n] ? 'done' : available(n) ? 'ready' : 'locked';
+    const item = el('sttd-step-' + n);
+    item.setAttribute('data-sttd-state', state);
+    el('sttd-step-' + n + '-head').disabled = !available(n);
+    el('sttd-step-' + n + '-badge').textContent = T(state === 'current' ? 'wizard.badgeCurrent' : state === 'done' ? 'wizard.badgeDone' : state === 'ready' ? '' : 'wizard.badgeLocked');
+    el('sttd-panel-' + n).hidden = step !== n;
+  }
+  el('sttd-wizard-note').textContent = T(noteKey);
+  // 1 ログイン
   el('sttd-account-text').textContent = T(accountKey);
-  el('sttd-state-text').textContent = T(connectionKey);
   el('sttd-login').hidden = signedIn;
+  el('sttd-login').disabled = busy() || sending();
   el('sttd-switch').hidden = !signedIn;
-  el('sttd-switch').disabled = busy() || confirming;
-  el('sttd-login').disabled = busy();
-  el('sttd-refresh').hidden = !signedIn;
-  el('sttd-refresh').disabled = busy() || confirming;
+  el('sttd-switch').disabled = busy() || sending() || confirming;
+  // 2 接続確認
+  el('sttd-state-text').textContent = checking ? T('wizard.checking') : connection === null ? T(connectionKey) : T(connection === 'subscribed' ? 'console.state.subscribed' : 'common.state.' + connection);
+  el('sttd-state-guide').textContent = checking ? '' : T(guideKey);
+  el('sttd-refresh').disabled = !available(2) || busy() || sending() || confirming;
   el('sttd-disconnect').hidden = !signedIn || confirming || connection === null || connection === 'unlinked';
-  el('sttd-disconnect').disabled = busy();
+  el('sttd-disconnect').disabled = busy() || sending();
   el('sttd-disconnect-confirm').hidden = !confirming;
   el('sttd-disconnect-yes').disabled = busy();
   el('sttd-disconnect-no').disabled = busy();
   el('sttd-disconnect-result').textContent = T(disconnectKey);
-  el('sttd-copy-result').textContent = T(copyKey);
-  el('sttd-copy-test').disabled = copying;
-  el('sttd-copy-operation').disabled = copying;
+  // 3/5 プロンプト
+  for (const kind of ['test', 'operation']) {
+    const n = kind === 'test' ? 3 : 5;
+    el('sttd-copy-' + kind).disabled = copying || !available(n);
+    el('sttd-manual-' + kind).hidden = !(copyFor === kind && (copyKey === 'guide.copyUnavailable' || copyKey === 'guide.copyFailed')) || manual[kind];
+    el('sttd-manual-' + kind).disabled = copying || !available(n);
+    el('sttd-copy-result-' + kind).textContent = copyFor === kind ? T(copyKey) : '';
+    el('sttd-done-' + kind).disabled = copying || !available(n) || !(copied[kind] || manual[kind]);
+  }
+  el('sttd-complete').hidden = !done[5];
+  // 4 送信
+  const sendable = sendableNow();
   el('sttd-text').disabled = !sendable || test !== null;
   el('sttd-send').disabled = !sendable || test !== null;
   el('sttd-cancel').hidden = test === null || (phase !== 'sending' && phase !== 'unknown') || test.cancel === 'answered' || test.cancel === 'unconfirmed';
@@ -318,6 +412,7 @@ function render() {
   el('sttd-check').hidden = test === null || !checkable(test);
   el('sttd-check').disabled = test !== null && test.checking;
   el('sttd-new').hidden = test === null || phase === 'sending' || test.cancel === 'pending' || test.checking;
+  el('sttd-verify-send').disabled = !available(4) || busy() || !verifiable();
   for (const code of ['en', 'ja']) {
     const link = el('sttd-lang-' + code);
     link.setAttribute('aria-current', code === lang ? 'true' : 'false');
@@ -332,15 +427,12 @@ function render() {
     if (test.cancel === 'pending') lines.push(T('console.cancelPending'));
     if (test.cancel === 'unconfirmed' && test.state !== 'cancelled') lines.push(T('console.cancelUnconfirmed'));
     if (test.checkNote) lines.push(T(test.checkNote));
-  } else if (note) {
-    lines.push(T(note));
-  } else if (disconnected && signedIn) {
-    lines.push(T('console.sendDisabled'));
+  } else if (sendNote) {
+    lines.push(T(sendNote));
   }
   el('sttd-result').textContent = lines.join(' ');
 }
 
-/** 固定キーの文言を持つ要素と入力欄のplaceholder・title・html langを選択言語へ差し替える。 */
 function applyLanguage() {
   if (document.documentElement) document.documentElement.lang = lang;
   document.title = T('console.title');
@@ -349,110 +441,104 @@ function applyLanguage() {
   render();
 }
 
-/**
- * 言語の明示選択。送信中・処理中は受けない。画面内で差し替え、表示専用のsession cookieをbrowserで同期に設定する（固定en/jaだけ。
- * サーバーのSet-Cookieと同じ固定属性。応答順序に依存せず最後の選択が残る。cookieの読取り・他cookieの操作・HTTP・navigation・
- * form送信・ログイン・解除・送信は起こさない）。
- */
 function chooseLanguage(next) {
   if (languageLocked() || !Object.hasOwn(TEXT, next)) return;
   if (next === lang) return;
   lang = next;
-  // 以前の言語の文面に対するコピー結果を残さない（新しく表示した文面をコピー済みと誤認させない）。
   copyKey = '';
+  copyFor = '';
   applyLanguage();
   document.cookie = LANGUAGE_COOKIE + '=' + next + '; ' + COOKIE_ATTRIBUTES;
 }
 
-function showConnection(state, key) {
-  connection = state;
-  connectionKey = key;
-  el('sttd-start-guide').hidden = !(state === 'linked' || state === 'expired');
+function selectStep(n) {
+  if (!available(n)) return;
+  step = n;
   render();
 }
 
-function signedOutView(key) {
+// ---- 1 ログイン（SDKはここで初めて読む） ----
+
+function ensureSdk() {
+  if (sdk !== null) return Promise.resolve(sdk);
+  if (sdkLoading === null) {
+    sdkLoading = loadSdkModules()
+      .then(([app, authModule]) => {
+        const auth = authModule.getAuth(app.initializeApp(FIREBASE));
+        sdk = { auth, OAuthProvider: authModule.OAuthProvider, signInWithPopup: authModule.signInWithPopup, signOut: authModule.signOut };
+        return sdk;
+      })
+      .catch((error) => {
+        sdkLoading = null;
+        throw error;
+      });
+  }
+  return sdkLoading;
+}
+
+function popupBlocked(error) {
+  const code = error && typeof error.code === 'string' ? error.code : '';
+  return code === 'auth/popup-blocked';
+}
+
+/** 明示ログイン（switchingは別account）。開始時に2以降を戻す。世代が変わった古い結果では何も解放しない。 */
+async function login(switching) {
+  if (busy() || sending()) return;
+  const gen = ++loginGeneration;
+  const hadProgress = done[1];
+  resetFrom(2);
   signedIn = false;
-  confirming = false;
-  accountKey = key || 'console.accountSignedOut';
-  showConnection(null, 'console.connectionSignedOut');
+  done[1] = false;
+  step = 1;
+  noteKey = hadProgress ? 'wizard.loginReset' : '';
+  accountBusy = true;
+  accountKey = sdk === null ? 'wizard.loginLoading' : 'console.accountChecking';
+  render();
+  try {
+    let s;
+    try {
+      s = await ensureSdk();
+    } catch {
+      if (gen === loginGeneration) accountKey = 'wizard.loginLoadFailed';
+      return;
+    }
+    if (gen !== loginGeneration) return;
+    if (switching && s.auth.currentUser) await s.signOut(s.auth);
+    await s.auth.authStateReady();
+    if (gen !== loginGeneration) return;
+    if (!s.auth.currentUser || switching) {
+      try {
+        await s.signInWithPopup(s.auth, new s.OAuthProvider('apple.com'));
+      } catch (error) {
+        if (gen !== loginGeneration) return;
+        if (!s.auth.currentUser) {
+          accountKey = popupBlocked(error) ? 'wizard.loginPopupBlocked' : 'common.loginFailed';
+          return;
+        }
+      }
+    }
+    if (gen !== loginGeneration) return;
+    await s.auth.currentUser.getIdToken();
+    if (gen !== loginGeneration) return;
+    signedIn = true;
+    done[1] = true;
+    accountKey = 'wizard.loginDone';
+    step = 2;
+  } catch {
+    if (gen === loginGeneration) accountKey = 'common.loginFailed';
+  } finally {
+    if (gen === loginGeneration) {
+      accountBusy = false;
+      render();
+    }
+  }
 }
 
 async function idToken() {
-  if (!auth.currentUser) throw new Error('signed_out');
-  return auth.currentUser.getIdToken();
+  if (sdk === null || !sdk.auth.currentUser) throw new Error('signed_out');
+  return sdk.auth.currentUser.getIdToken();
 }
 
-/** 接続状態の確認（開始時に以前の状態を捨てて送信を封鎖。後から始めた確認がある時の古い結果は採用しない）。 */
-async function refreshConnection() {
-  const mine = ++connectionSeq;
-  connection = null;
-  connectionKey = 'console.connectionChecking';
-  render();
-  let token;
-  try {
-    token = await idToken();
-  } catch {
-    if (mine === connectionSeq) signedOutView('common.loginRefresh');
-    return;
-  }
-  if (mine !== connectionSeq) return;
-  signedIn = true;
-  accountKey = 'console.accountSignedIn';
-  render();
-  try {
-    const response = await fetch('/v1/web/connection', { headers: { Authorization: 'Bearer ' + token }, credentials: 'same-origin', cache: 'no-store' });
-    const json = response.ok ? await response.json() : null;
-    if (mine !== connectionSeq) return;
-    if (json && typeof json.state === 'string' && CONNECTION_STATES.includes(json.state)) {
-      return showConnection(json.state, json.state === 'subscribed' ? 'console.state.subscribed' : 'common.state.' + json.state);
-    }
-  } catch {
-    // 下の固定表示へ（状態不明を未接続・未購読と決め付けない）。
-  }
-  if (mine !== connectionSeq) return;
-  showConnection(null, 'console.connectionUnavailable');
-}
-
-/** 認証切替・接続の再確認・解除を1つずつ行う（実行中は送信・切替・再確認・解除・言語切替を封鎖。送信中は始めない）。 */
-async function exclusive(task) {
-  if (accountBusy || test !== null) return;
-  accountBusy = true;
-  connection = null;
-  render();
-  try {
-    await task();
-  } finally {
-    accountBusy = false;
-    render();
-  }
-}
-
-function login(switching) {
-  return exclusive(async () => {
-    confirming = false;
-    disconnectKey = '';
-    disconnected = false;
-    try {
-      if (switching) await signOut(auth);
-      await signInWithPopup(auth, new OAuthProvider('apple.com'));
-    } catch {
-      if (!auth.currentUser) return signedOutView('common.loginFailed');
-    }
-    await refreshConnection();
-  });
-}
-
-/** 本人の明示操作での再確認（解除後の送信封鎖もここで解く。確認済みの現在状態が戻るまでは封鎖のまま）。 */
-function manualRefresh() {
-  return exclusive(async () => {
-    disconnected = false;
-    disconnectKey = '';
-    await refreshConnection();
-  });
-}
-
-/** 期限までに決まった値だけを受け取る（後着の値では何も始めない）。 */
 function within(promise, ms) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve({ late: true }), Math.max(0, ms));
@@ -470,8 +556,8 @@ function within(promise, ms) {
 }
 
 /**
- * 1要求（tokenはAuthorizationだけ・credentials omit・redirectを辿らない）。元期限は呼出し時から認証取得・HTTP・JSON待ちを
- * 全て含む。期限内にtokenが無ければHTTPを始めずnot_sent（後着tokenで送らない）。HTTPを始めた後の失敗・timeoutはunknown。
+ * 同origin helperへの1要求（Bearer＋local nonce、credentials omit、redirectを辿らない）。元期限は認証取得・HTTP・JSON待ちを全て含む。
+ * 期限内にtokenが無ければHTTPを始めずnot_sent。HTTPを始めた後の失敗・timeoutはunknown。
  */
 async function request(path, method, ms, headers, payload) {
   const deadline = Date.now() + Math.max(0, ms);
@@ -483,11 +569,10 @@ async function request(path, method, ms, headers, payload) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), remaining);
   try {
-    const response = await fetch(API + path, {
+    const response = await fetch(path, {
       method,
-      headers: Object.assign({}, headers, { Authorization: 'Bearer ' + token }),
+      headers: Object.assign({}, headers, { Authorization: 'Bearer ' + token, [NONCE_HEADER]: NONCE }),
       body: payload,
-      mode: 'cors',
       credentials: 'omit',
       cache: 'no-store',
       redirect: 'error',
@@ -508,14 +593,182 @@ async function request(path, method, ms, headers, payload) {
   }
 }
 
-/** 応答のstate（同じcommandIdの既知stateだけ）。 */
+// ---- 2 接続確認（手動1回。確認中は3以降を封鎖。subscribed継続なら進捗保持、他は3以降を戻す） ----
+
+async function checkConnection() {
+  if (!available(2) || busy() || sending() || confirming) return;
+  const gen = ++checkGeneration;
+  checking = true;
+  render();
+  const outcome = await request('/v1/web/connection', 'GET', CONNECTION_MS, {}, undefined);
+  if (gen !== checkGeneration) return;
+  checking = false;
+  if (outcome.kind === 'not_sent') {
+    // tokenを得られない: ログインからやり直す。
+    resetFrom(2);
+    signedIn = false;
+    done[1] = false;
+    step = 1;
+    accountKey = 'common.loginRefresh';
+    return render();
+  }
+  const json = outcome.kind === 'response' ? outcome.json : null;
+  if (json && typeof json.state === 'string' && CONNECTION_STATES.includes(json.state)) {
+    connection = json.state;
+    guideKey = 'wizard.next.' + json.state;
+    if (json.state === 'subscribed') {
+      const first = !done[2];
+      done[2] = true;
+      noteKey = '';
+      if (first) step = 3;
+    } else {
+      if (done[3] || done[4] || done[5]) noteKey = 'wizard.stateReset';
+      resetFrom(3);
+      done[2] = false;
+      step = 2;
+    }
+  } else if (outcome.kind === 'response' && outcome.status === 401) {
+    resetFrom(2);
+    signedIn = false;
+    done[1] = false;
+    step = 1;
+    accountKey = 'common.loginRefresh';
+  } else {
+    connection = null;
+    connectionKey = 'console.connectionUnavailable';
+    guideKey = 'wizard.next.unavailable';
+    if (done[3] || done[4] || done[5]) noteKey = 'wizard.stateReset';
+    resetFrom(3);
+    done[2] = false;
+    step = 2;
+  }
+  render();
+}
+
+// ---- 解除（確認→1回POST→2以降を戻して再確認） ----
+
+function askDisconnect() {
+  if (busy() || sending() || !signedIn || connection === null || connection === 'unlinked') return;
+  confirming = true;
+  disconnectKey = '';
+  render();
+}
+
+function keepConnection() {
+  if (busy()) return;
+  confirming = false;
+  render();
+}
+
+function disconnect() {
+  if (!confirming || busy() || sending()) return;
+  confirming = false;
+  accountBusy = true;
+  disconnectKey = 'common.disconnecting';
+  render();
+  return (async () => {
+    const outcome = await request('/v1/web/disconnect', 'POST', DISCONNECT_MS, {}, undefined);
+    const json = outcome.kind === 'response' ? outcome.json : null;
+    const ok = outcome.kind === 'response' && outcome.status >= 200 && outcome.status < 300 && json !== null && typeof json.state === 'string' && CONNECTION_STATES.includes(json.state);
+    accountBusy = false;
+    if (done[3] || done[4] || done[5]) noteKey = 'wizard.stateReset';
+    resetFrom(2);
+    step = 2;
+    disconnectKey = ok ? 'common.disconnectDone' : 'common.disconnectFailed';
+    connectionKey = '';
+    guideKey = '';
+    render();
+    await checkConnection();
+  })();
+}
+
+// ---- 3/5 固定プロンプトのコピーと完了操作 ----
+
+function copyInstructions(kind) {
+  const n = kind === 'test' ? 3 : 5;
+  if (copying || !available(n)) return;
+  const text = T(kind === 'operation' ? 'guide.operationText' : 'guide.testText');
+  copyFor = kind;
+  const clipboard = typeof navigator === 'object' && navigator !== null ? navigator.clipboard : undefined;
+  if (!clipboard || typeof clipboard.writeText !== 'function') {
+    copyKey = 'guide.copyUnavailable';
+    return render();
+  }
+  copying = true;
+  copyKey = '';
+  render();
+  let pending;
+  try {
+    pending = Promise.resolve(clipboard.writeText(text));
+  } catch {
+    pending = Promise.reject(new Error('copy_failed'));
+  }
+  const finish = (result) => {
+    copying = false;
+    copyKey = result;
+    if (result === 'guide.copied') copied[kind] = true;
+    render();
+  };
+  return pending.then(
+    () => finish('guide.copied'),
+    () => finish('guide.copyFailed'),
+  );
+}
+
+function confirmManualCopy(kind) {
+  const n = kind === 'test' ? 3 : 5;
+  if (copying || !available(n)) return;
+  manual[kind] = true;
+  copyFor = kind;
+  copyKey = 'wizard.manualNoted';
+  render();
+}
+
+/** 3の完了操作: コピー（または手動確認）済みの時だけ。再適用なら4/5を戻す。 */
+function completeTest() {
+  if (copying || !available(3) || busy()) return;
+  if (!(copied.test || manual.test)) {
+    copyFor = 'test';
+    copyKey = 'wizard.copyRequired';
+    return render();
+  }
+  const reapplied = done[3];
+  resetFrom(4);
+  done[3] = true;
+  noteKey = reapplied ? 'wizard.testReapplied' : '';
+  step = 4;
+  render();
+}
+
+/** 4の完了操作: 本人がDotsで一致を確認した明示操作（受領/不明の終端だけ）。 */
+function verifySend() {
+  if (!available(4) || busy() || !verifiable()) return;
+  done[4] = true;
+  step = 5;
+  render();
+}
+
+/** 5の完了操作。 */
+function completeOperation() {
+  if (copying || !available(5) || busy()) return;
+  if (!(copied.operation || manual.operation)) {
+    copyFor = 'operation';
+    copyKey = 'wizard.copyRequired';
+    return render();
+  }
+  done[5] = true;
+  noteKey = '';
+  render();
+}
+
+// ---- 4 送信・中止・同ID確認 ----
+
 function stateOf(current, outcome) {
   const json = outcome.kind === 'response' ? outcome.json : null;
   if (json && json.commandId === current.commandId && typeof json.state === 'string' && Object.hasOwn(RANK, json.state)) return json.state;
   return null;
 }
 
-/** 受け取ったstateを反映する（確定した受領を中止・未確定で上書きしない、後着の弱い結果で戻さない）。 */
 function apply(current, state) {
   if (current.state !== null && RANK[current.state] >= RANK[state]) return;
   current.state = state;
@@ -523,18 +776,15 @@ function apply(current, state) {
 
 async function send() {
   if (!sendableNow() || test !== null) return;
-  // 入力値を一度だけ捕捉し、trim・正規化せずそのまま送る（trimは空白だけの判定に使うだけ）。
   const text = el('sttd-text').value;
   if (typeof text !== 'string' || text.trim() === '' || LONE_SURROGATE.test(text) || new TextEncoder().encode(text).length > MAX_TEXT_BYTES) {
-    note = 'console.inputInvalid';
+    sendNote = 'console.inputInvalid';
     return render();
   }
-  // 最初のawaitの前にこの1件を確定する（二重クリックで2件目を作らない）。
   const created = Date.now();
   const current = { commandId: crypto.randomUUID(), state: null, postDone: false, rejected: null, cancel: 'none', checking: false, checkNote: '' };
   test = current;
-  note = '';
-  confirming = false;
+  sendNote = '';
   render();
   const payload = JSON.stringify({
     schemaVersion: 2,
@@ -591,112 +841,25 @@ function newTest() {
   if (current === null || phaseOf(current) === 'sending' || current.cancel === 'pending' || current.checking) return;
   const uncertain = phaseOf(current) === 'unknown' || current.state === 'delivery_unknown' || current.state === 'in_flight' || (current.cancel === 'unconfirmed' && current.state !== 'cancelled');
   test = null;
-  note = uncertain ? 'console.duplicateWarning' : '';
+  sendNote = uncertain ? 'console.duplicateWarning' : '';
   render();
 }
 
-/** 解除の確認を開く（送信中・処理中・未ログイン・未接続では開かない。ここでは何も送らない）。 */
-function askDisconnect() {
-  if (busy() || !signedIn || connection === null || connection === 'unlinked') return;
-  confirming = true;
-  disconnectKey = '';
-  render();
-}
-
-/** 確認の取消（何も送らず、状態も変えない）。 */
-function keepConnection() {
-  if (busy()) return;
-  confirming = false;
-  render();
-}
-
-/**
- * 本人の確認後に1回だけ解除する（排他。期限10秒に認証取得を含める。tokenはAuthorizationだけ、同originのcookieは送る）。
- * 失敗・期限切れ・応答不明では成功を装わず、どの結果でも接続状態を再確認し、本人が再確認するまで送信を封鎖する。
- */
-function disconnect() {
-  if (!confirming) return;
-  return exclusive(async () => {
-    confirming = false;
-    disconnected = true;
-    disconnectKey = 'common.disconnecting';
-    render();
-    const deadline = Date.now() + DISCONNECT_MS;
-    const got = await within(idToken(), DISCONNECT_MS);
-    let ok = false;
-    if (Object.hasOwn(got, 'value') && deadline - Date.now() > 0) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), deadline - Date.now());
-      try {
-        const response = await fetch('/v1/web/disconnect', {
-          method: 'POST',
-          headers: { Authorization: 'Bearer ' + got.value },
-          credentials: 'same-origin',
-          cache: 'no-store',
-          redirect: 'error',
-          signal: controller.signal,
-        });
-        let json = null;
-        try {
-          json = await response.json();
-        } catch {
-          json = null;
-        }
-        ok = response.ok && json !== null && typeof json.state === 'string' && CONNECTION_STATES.includes(json.state);
-      } catch {
-        ok = false;
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-    disconnectKey = ok ? 'common.disconnectDone' : 'common.disconnectFailed';
-    await refreshConnection();
-  });
-}
-
-/**
- * 受信Dots向けの固定指示文（辞書のtestText/operationText）を、本人のクリック時だけclipboardへ書く。固定文以外（利用者本文・token・設定値）は
- * 書かず、clipboardを読まず、permissionを要求せず、HTTP・ログイン・同意・解除・送信を始めない。未対応・失敗は手動コピーの案内。
- */
-function copyInstructions(kind) {
-  if (copying) return;
-  const key = kind === 'operation' ? 'guide.operationText' : 'guide.testText';
-  // 文面は開始時の言語で1回だけ取り出す。進行中は言語切替・他のコピーを封鎖するので、結果はこの文面に対応する。
-  const text = T(key);
-  const clipboard = typeof navigator === 'object' && navigator !== null ? navigator.clipboard : undefined;
-  if (!clipboard || typeof clipboard.writeText !== 'function') {
-    copyKey = 'guide.copyUnavailable';
-    return render();
-  }
-  copying = true;
-  copyKey = '';
-  render();
-  let pending;
-  try {
-    pending = Promise.resolve(clipboard.writeText(text));
-  } catch {
-    pending = Promise.reject(new Error('copy_failed'));
-  }
-  const finish = (result) => {
-    copying = false;
-    copyKey = result;
-    render();
-  };
-  return pending.then(
-    () => finish('guide.copied'),
-    () => finish('guide.copyFailed'),
-  );
-}
-
-async function start() {
-  el('sttd-copy-test').onclick = () => copyInstructions('test');
-  el('sttd-copy-operation').onclick = () => copyInstructions('operation');
+function start() {
+  for (const n of STEPS) el('sttd-step-' + n + '-head').onclick = () => selectStep(n);
   el('sttd-login').onclick = () => login(false);
   el('sttd-switch').onclick = () => login(true);
-  el('sttd-refresh').onclick = () => manualRefresh();
+  el('sttd-refresh').onclick = () => checkConnection();
   el('sttd-disconnect').onclick = () => askDisconnect();
   el('sttd-disconnect-yes').onclick = () => disconnect();
   el('sttd-disconnect-no').onclick = () => keepConnection();
+  el('sttd-copy-test').onclick = () => copyInstructions('test');
+  el('sttd-copy-operation').onclick = () => copyInstructions('operation');
+  el('sttd-manual-test').onclick = () => confirmManualCopy('test');
+  el('sttd-manual-operation').onclick = () => confirmManualCopy('operation');
+  el('sttd-done-test').onclick = () => completeTest();
+  el('sttd-done-operation').onclick = () => completeOperation();
+  el('sttd-verify-send').onclick = () => verifySend();
   el('sttd-send').onclick = () => send();
   el('sttd-cancel').onclick = () => cancel();
   el('sttd-check').onclick = () => check();
@@ -707,13 +870,11 @@ async function start() {
       chooseLanguage(code);
     };
   }
+  // 初期表示では通信もSDK読込みもしない（手順1だけ有効）。
   render();
-  await auth.authStateReady();
-  if (!auth.currentUser) return signedOutView();
-  await exclusive(refreshConnection);
 }
 
-await start().catch(() => signedOutView('common.loginUnknown'));
+start();
 `;
 
 /** 固定3 pathのasset（それ以外はundefined）。 */
@@ -723,10 +884,10 @@ export interface ConsoleAsset {
   readonly headers: Record<string, string>;
 }
 
-export function consoleAsset(path: string, web: FirebaseWebConfig, apiOrigin: string, language: Language = DEFAULT_LANGUAGE): ConsoleAsset | undefined {
+export function consoleAsset(path: string, web: FirebaseWebConfig, options: ConsolePageOptions): ConsoleAsset | undefined {
   switch (path) {
     case CONSOLE_PATH:
-      return { type: 'text/html; charset=utf-8', body: renderConsolePage(web, apiOrigin, language), headers: consoleSecurityHeaders(web, apiOrigin) };
+      return { type: 'text/html; charset=utf-8', body: renderConsolePage(web, options), headers: consoleSecurityHeaders(web) };
     case CONSOLE_SCRIPT_PATH:
       return { type: 'text/javascript; charset=utf-8', body: CONSOLE_SCRIPT, headers: {} };
     case CONSOLE_STYLE_PATH:

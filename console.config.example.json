@@ -1,0 +1,9 @@
+{
+  "apiOrigin": "https://sendtexttodotsapi-000000000000.your-region.run.app",
+  "mcpOrigin": "https://your-mcp-service-000000000000.your-region.run.app",
+  "firebase": {
+    "apiKey": "your-firebase-web-api-key",
+    "authDomain": "your-project.firebaseapp.com",
+    "projectId": "your-project"
+  }
+}

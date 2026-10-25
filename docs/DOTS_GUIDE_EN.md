@@ -4,7 +4,7 @@ English | [日本語](DOTS_GUIDE.md)
 
 This guide is for users of a self-hosted SendTextToDots installation. It provides test and operational instructions that also work for a first installation or a fork.
 
-First follow the [installation guide](INSTALL_EN.md) to sign in with Apple, connect from Dots/ChatGPT through OAuth, and subscribe to `text.submitted`. Confirm that the send screen `/console` shows "Receiving". Paste the following instructions directly into the conversation with the Dots that receives your text. You can copy them from the guide on the send screen or use the text below.
+First follow the [installation guide](INSTALL_EN.md) to sign in with Apple, connect from Dots/ChatGPT through OAuth, and subscribe to `text.submitted`. Confirm that step 2 of the [local send screen](LOCAL_CONSOLE_EN.md) shows "Receiving". Paste the following instructions directly into the conversation with the Dots that receives your text. You can copy them from steps 3 and 5 of the send screen or use the text below.
 
 ## 1. Paste the test instructions into Dots before sending
 

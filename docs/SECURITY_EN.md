@@ -30,6 +30,7 @@ The storage roots, the KMS sealing format (capsule prefix, format and AAD domain
 - The four fixed secrets (signing JWKS, cookie keys, identifier HMAC key, digest key) are read once at startup from numbered Secret Manager versions and are not reused across purposes.
 - Key, secret and token values are never written to logs, responses or exceptions. Startup failure records contain only a fixed stage/code and an integer mask without values.
 - The deployment configuration is fixed to one module; if it is unset or inconsistent the service refuses before SDK creation, credentials, DB and external HTTP. The service does not start when an environment variable that could change credentials, destinations, TLS, proxies or emulators exists ([CONFIGURATION_EN.md](CONFIGURATION_EN.md)).
+- The send screen runs on the user's computer ([LOCAL_CONSOLE_EN.md](LOCAL_CONSOLE_EN.md)). Its helper listens on 127.0.0.1 only, checks Host/Origin and a per-start nonce, relays only five fixed routes to the fixed API/MCP origins with the user's Bearer token, forwards no cookies or nonce upstream, and keeps no token or text. The Cloud Run service serves no send screen; its CORS and permissions are unchanged, and Firebase is loaded by the page only on an explicit sign-in.
 - The display language cookie `sttd_language` (`en` or `ja`) is a display-only session cookie set when the user chooses a language on a page; it is never used for authentication, authorization or ownership decisions, and it does not carry tokens or personal data.
 
 <a id="mcp-oauth"></a>

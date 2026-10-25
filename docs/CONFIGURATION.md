@@ -44,6 +44,10 @@ Functions entryはimport時（discovery時）に、MCP entryと各起動口はen
 
 UUIDは例えば `node -e "console.log(crypto.randomUUID())"` で作れます（Node 22のrandomUUIDはversion 4）。
 
+## ローカル送信画面の設定
+
+ローカル送信画面（[LOCAL_CONSOLE.md](LOCAL_CONSOLE.md)）は別の小さなJSON fileを使い、公開client値だけを持ちます（`apiOrigin`・`mcpOrigin`・`firebase.apiKey/authDomain/projectId`。`console.config.example.json`参照）。`src/config/deployment.ts`は読まず変更もせず、秘密を含みません。実fileはGitへ入れません（`console.local.json`はignore済み）。
+
 ## 秘密の値
 
 設定fileには秘密の値を書きません。

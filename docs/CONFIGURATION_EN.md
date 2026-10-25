@@ -44,6 +44,10 @@ The Functions entry validates at import (discovery) time; the MCP entry and each
 
 A UUID can be generated with, for example, `node -e "console.log(crypto.randomUUID())"` (randomUUID in Node 22 is version 4).
 
+## Local send screen configuration
+
+The local send screen ([LOCAL_CONSOLE_EN.md](LOCAL_CONSOLE_EN.md)) uses a separate small JSON file with public client values only (`apiOrigin`, `mcpOrigin`, `firebase.apiKey/authDomain/projectId`; see `console.config.example.json`). It does not read or change `src/config/deployment.ts`, and it contains no secrets. Keep your real file out of Git (`console.local.json` is ignored).
+
 ## Secret values
 
 Secret values are not written in the configuration file.

@@ -157,6 +157,7 @@ test('R2 current dist packaging (RAM only): API and MCP closures contain every r
     assert.deepEqual(built.receipt[kind].files.map((file) => file.name), entries.map((entry) => entry.name));
   }
   const mcpNames = archives.mcp.map((entry) => entry.name);
-  assert.ok(mcpNames.includes('dist/connect/pages.js') && mcpNames.includes('dist/connect/console.js'), 'MCP carries the browser script modules');
+  assert.ok(mcpNames.includes('dist/connect/pages.js'), 'MCP carries the interaction script module');
+  assert.equal(mcpNames.includes('dist/connect/console.js') || mcpNames.some((name) => name.startsWith('dist/console/')), false, 'the local send screen is not part of the Cloud Run closure');
   assert.equal(built.receipt.mcp.baseImage, ARTIFACTS.baseImage);
 });

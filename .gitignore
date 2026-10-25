@@ -5,7 +5,9 @@ dist/
 *.tsbuildinfo
 *.log
 
-# ローカル環境・秘密
+# ローカル環境・秘密（ローカル送信画面の実client設定はcommitしない。sampleは console.config.example.json）
+console.local.json
+*.local.json
 .env
 .env.*
 *.pem

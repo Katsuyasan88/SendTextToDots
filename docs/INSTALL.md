@@ -25,7 +25,7 @@
    ```
 
    service名と`-`とproject numberを合わせたDNS segmentは63文字以内にします。default `run.app` URLが許可された環境で使い、配置後に使用可能であることを管理画面で照合します。Consoleが別名のhash URLや`cloudfunctions.net` URLも表示していても、無断でissuerを切り替えません。独自domainを使う場合はTLSとroutingを先に整え、同じoriginを一貫して使ってください。
-4. MCPのhostをFirebase Authenticationのauthorized domainsへ追加します。Apple側のredirect先はFirebaseの`https://<authDomain>/__/auth/handler`で、MCPの`/console`そのものとは別です。
+4. MCPのhostをFirebase Authenticationのauthorized domainsへ追加します。Apple側のredirect先はFirebaseの`https://<authDomain>/__/auth/handler`で、MCP originそのものとは別です。ローカル送信画面のために`localhost`も追加します。
 5. [CONFIGURATION.md](CONFIGURATION.md)に従い3つの新しいnamespace UUIDを生成し、以後固定します。これは秘密鍵ではありません。設定のproject/number/database/region/鍵/secret版との対応を台帳で確認します。
 
 ## 3. Cloud資源と権限を用意する
@@ -205,14 +205,14 @@ MCPのCPU/memory/instance数は上記の開始例であり、負荷試験済み�
 
 ## 6. 接続・最初の送信・停止計画
 
-[Dotsの受信テストと応答設定](DOTS_GUIDE.md)の順に、受信先Dotsへテスト用の指示文を貼り、送信した本文の一致を確認した後、運用用の指示文を貼ります。送信画面の接続案内から、選択言語の文面を表示・コピーできます。コピーだけではDotsへ送信されず、本文一致や切替完了を画面が自動判定することもありません。
+[Dotsの受信テストと応答設定](DOTS_GUIDE.md)の順に、受信先Dotsへテスト用の指示文を貼り、送信した本文の一致を確認した後、運用用の指示文を貼ります。ローカル送信画面の手順3と手順5で、選択言語の文面を表示・コピーできます。コピーだけではDotsへ送信されず、本文一致や切替完了を画面が自動判定することもありません。
 
-1. MCP originの`/console`へアクセスしAppleログインします。画面はEnglish/日本語を選べます（ページ上部の言語リンク。初期言語はブラウザの言語設定）。Dots/ChatGPTのMCP server登録先は**MCP originの`/mcp`**です。`/console`やAPI originを登録先にしません。
-2. Dots/ChatGPT側からOAuth接続し、同じFirebase利用者として明示同意します。`text.submitted`を購読して「受信中」であることを確認します。送信画面を開くだけでは購読は作られません。
-3. MCP originの`/console`の空欄に本文を入力し1件送信。受信側で入力どおりの表示を確認します。指示として実行させたい場合はDots側にその扱いを指示します。STTD自身は本文を実行しません。
-4. 直接APIを使う場合はREADMEの例を参照。Apple providerで認証した同じproject/UIDのFirebase ID tokenが必要です。Web画面のtokenを表示する管理toolは同梱しません。最初の確認には`/console`を使えます。
+1. 自分のパソコンでローカル送信画面を起動します（[LOCAL_CONSOLE.md](LOCAL_CONSOLE.md)）: `console.config.example.json`を`console.local.json`へコピーしてAPI/MCPのoriginとFirebase Webの公開設定を入れ、`npm run console -- --config console.local.json`を実行し、`http://localhost:8765/console`を開きます（English/日本語。ボタンを押すまで読み込みも送信もしません）。Firebaseのauthorized domainsへ`localhost`を追加します。手順1でAppleログインします。Dots/ChatGPTのMCP server登録先は**MCP originの`/mcp`**です。ローカル画面やAPI originを登録先にしません。
+2. Dots/ChatGPT側からOAuth接続し、同じFirebase利用者として明示同意します。`text.submitted`を購読したら、手順2の「接続を確認」で「受信中」になることを確認します（他の状態では次にすることを画面が案内します）。送信画面を開くだけでは購読は作られません。
+3. 手順3でテスト用の指示文を受信先Dotsへ貼り付けて確認します。手順4で空欄に短い本文を入力して「送信」を押し、受信側で入力どおりの表示を確認してから画面で一致を確認します。手順5で運用用の指示文を貼り付けます。STTD自身は本文を実行しません。
+4. 直接APIを使う場合はREADMEの例を参照。Apple providerで認証した同じproject/UIDのFirebase ID tokenが必要です。Web画面のtokenを表示する管理toolは同梱しません。最初の確認とその後の通常送信（手順4）にはローカル画面を使えます。
 5. `delivered`はcallbackの2xx受領で、受信側の処理完了ではありません。結果不明なら送信前に控えた同じcommandIdで状態照会し、新IDで自動再送しません。
-6. このaccountからの送信を止めるには`/console`の「接続を解除」を使います（画面で確認してから実行）。認可と購読が失効し、再開はChatGPTからの再接続です。別の接続画面はありません。
+6. このaccountからの送信を止めるにはローカル画面の手順2の「接続を解除」を使います（画面で確認してから実行）。認可と購読が失効し、再開はChatGPTからの再接続です。Cloud Runは送信画面も別の接続画面も配信しません。
 
 配置前に停止方法と保持費用を決めてください。接続解除は購読/Grantの失効で、Cloud資源の停止・廃棄ではありません。minInstances=0でも外部要求で起動し得ます。不要になったserviceの停止・削除と、DB/Secret/KMS/imageの保持はCloud側で別に判断します。暗号鍵の破棄は保存情報を復号不能にするため、費用だけを理由に一括削除しません。本sourceは自動停止/物理削除toolを含みません。
 
