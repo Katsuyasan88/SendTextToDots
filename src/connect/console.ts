@@ -146,7 +146,8 @@ ${stepHead(4, 'wizard.step4')}
 ${stepHead(5, 'wizard.step5')}
 </ol>
 <p id="sttd-wizard-note" role="status"></p>
-<section id="sttd-panel-1" class="sttd-panel" aria-labelledby="sttd-step-1-head" data-sttd-state="current" tabindex="0">
+<section id="sttd-panel-1" class="sttd-panel" aria-labelledby="sttd-panel-1-title" data-sttd-state="current" tabindex="0">
+<h2 id="sttd-panel-1-title" class="sttd-panel-title"${i18n('wizard.step1')}>${t('wizard.step1')}</h2>
 <p id="sttd-login-intro"${i18n('wizard.loginIntro')}>${t('wizard.loginIntro')}</p>
 <p id="sttd-account-text" role="status">${t('console.accountSignedOut')}</p>
 <div class="sttd-actions">
@@ -154,7 +155,8 @@ ${stepHead(5, 'wizard.step5')}
 <button type="button" id="sttd-switch" hidden${i18n('common.switchAccount')}>${t('common.switchAccount')}</button>
 </div>
 </section>
-<section id="sttd-panel-2" class="sttd-panel" aria-labelledby="sttd-step-2-head" data-sttd-state="locked" tabindex="0">
+<section id="sttd-panel-2" class="sttd-panel" aria-labelledby="sttd-panel-2-title" data-sttd-state="locked" tabindex="0">
+<h2 id="sttd-panel-2-title" class="sttd-panel-title"${i18n('wizard.step2')}>${t('wizard.step2')}</h2>
 <p id="sttd-state-intro"${i18n('wizard.stateIntro')}>${t('wizard.stateIntro')}</p>
 <p id="sttd-state-text" role="status"></p>
 <p id="sttd-state-guide"></p>
@@ -169,12 +171,14 @@ ${stepHead(5, 'wizard.step5')}
 </div>
 <p id="sttd-disconnect-result" role="status"></p>
 </section>
-<section id="sttd-panel-3" class="sttd-panel" aria-labelledby="sttd-step-3-head" data-sttd-state="locked" tabindex="0">
+<section id="sttd-panel-3" class="sttd-panel" aria-labelledby="sttd-panel-3-title" data-sttd-state="locked" tabindex="0">
+<h2 id="sttd-panel-3-title" class="sttd-panel-title"${i18n('wizard.step3')}>${t('wizard.step3')}</h2>
 <p id="sttd-guide-intro"${i18n('guide.intro')}>${t('guide.intro')}</p>
 <p id="sttd-guide-step1"${i18n('guide.step1')}>${t('guide.step1')}</p>
 ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wizard.pastedTestNext')}
 </section>
-<section id="sttd-panel-4" class="sttd-panel" aria-labelledby="sttd-step-4-head" data-sttd-state="locked" tabindex="0">
+<section id="sttd-panel-4" class="sttd-panel" aria-labelledby="sttd-panel-4-title" data-sttd-state="locked" tabindex="0">
+<h2 id="sttd-panel-4-title" class="sttd-panel-title"${i18n('wizard.step4')}>${t('wizard.step4')}</h2>
 <p id="sttd-send-intro"${i18n('wizard.sendIntro')}>${t('wizard.sendIntro')}</p>
 <label id="sttd-text-label" for="sttd-text"${i18n('console.textLabel')}>${t('console.textLabel')}</label>
 <textarea id="sttd-text" rows="4" maxlength="4096" placeholder="${t('console.textPlaceholder')}" disabled></textarea>
@@ -189,7 +193,8 @@ ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wi
 <button type="button" id="sttd-verify-send" disabled${i18n('wizard.sendVerified')}>${t('wizard.sendVerified')}</button>
 <p id="sttd-verify-hint" class="sttd-note"${i18n('wizard.sendNotVerifiable')}>${t('wizard.sendNotVerifiable')}</p>
 </section>
-<section id="sttd-panel-5" class="sttd-panel" aria-labelledby="sttd-step-5-head" data-sttd-state="locked" tabindex="0">
+<section id="sttd-panel-5" class="sttd-panel" aria-labelledby="sttd-panel-5-title" data-sttd-state="locked" tabindex="0">
+<h2 id="sttd-panel-5-title" class="sttd-panel-title"${i18n('wizard.step5')}>${t('wizard.step5')}</h2>
 <p id="sttd-guide-step3"${i18n('guide.step3')}>${t('guide.step3')}</p>
 ${instructions('operation', 'guide.showOperation', 'guide.operationText', 'guide.copyOperation', 'wizard.pastedOperationFinish')}
 </section>
@@ -223,6 +228,7 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-step[data-sttd-state="done"] .sttd-step-head { color: #4a5059; background: #f5f6f8; }
 .sttd-step[data-sttd-state="locked"] .sttd-step-head { color: #8a9099; background: #eceef1; border-color: #d9dce1; }
 .sttd-badge { font-size: 0.8rem; color: #4a5059; min-width: 3.5rem; }
+.sttd-panel-title { font-size: 1.05rem; margin: 0 0 0.5rem; }
 .sttd-instruction-block { margin-top: 0.75rem; }
 .sttd-instructions-details summary { cursor: pointer; font-weight: 600; min-height: 44px; display: flex; align-items: center; }
 .sttd-instructions { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; background: #f5f6f8; border: 1px solid #d9dce1; border-radius: 6px; padding: 0.75rem; margin: 0; }

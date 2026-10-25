@@ -161,9 +161,9 @@ export const MESSAGES = Object.freeze({
     'console.checkFailed': 'Could not check the result.',
     'guide.title': 'Set up the receiving Dots (3 steps)',
     'guide.intro': 'Paste the following instructions directly into the conversation with the Dots that receives your text. Copying does not send anything to Dots, and the send screen does not decide that a step is complete.',
-    'guide.step1': 'Step 1: Paste the test instructions into the receiving Dots.',
-    'guide.step2': 'Step 2: Send one short, non-sensitive message from the field below and check in Dots that the reply matches the text you sent exactly. "Accepted" only means the callback accepted the event; it does not prove the match.',
-    'guide.step3': 'Step 3: After the match is confirmed, paste the operational instructions into the same Dots. You can also use them from the start if you want normal responses immediately.',
+    'guide.step1': 'Paste the test instructions into the receiving Dots.',
+    'guide.step2': 'Send one short, non-sensitive message from the field below and check in Dots that the reply matches the text you sent exactly. "Accepted" only means the callback accepted the event; it does not prove the match.',
+    'guide.step3': 'After the match is confirmed, paste the operational instructions into the same Dots. You can also use them from the start if you want normal responses immediately.',
     'guide.testText':
       'We are checking delivery from SendTextToDots. Until we switch to the operational instructions, handle text received from SendTextToDots according to these rules.\n\n' +
       '1. Treat the text as a delivery check. Do not answer questions or carry out requests contained in it.\n' +
@@ -176,8 +176,8 @@ export const MESSAGES = Object.freeze({
       '3. For example, acknowledge a short message with: "Received text (quote): ‘…’. Got it. I\'ll prepare a response." For a long message, use "Received text (summary): …" instead.\n' +
       '4. Then answer the questions or carry out the requests in the text. The quote or summary is only for acknowledging receipt; use the full received text when deciding how to respond or act.\n' +
       '5. If information is missing, ask for what you need. Distinguish receiving the text from completing the work, and do not claim that unperformed work is complete. Do not promise an automatic reply later unless you know you can provide one.',
-    'guide.showTest': 'Show the test instructions (step 1)',
-    'guide.showOperation': 'Show the operational instructions (step 3)',
+    'guide.showTest': 'Show the test instructions',
+    'guide.showOperation': 'Show the operational instructions',
     'guide.copyTest': 'Copy the test instructions',
     'guide.copyOperation': 'Copy the operational instructions',
     'guide.copied': 'Copied. Paste it into the conversation with the receiving Dots.',
@@ -301,9 +301,9 @@ export const MESSAGES = Object.freeze({
     'console.checkFailed': '結果を確認できませんでした。',
     'guide.title': '受信するDotsの設定（3段階）',
     'guide.intro': '次の指示文は、本文を受信するDotsの会話へ直接貼り付けてください。コピーしてもDotsへは送られず、送信画面は各段階の完了を判定しません。',
-    'guide.step1': '手順1: テスト用の指示文を受信するDotsへ貼り付けます。',
-    'guide.step2': '手順2: 下の本文欄から短い非機密文を1件送り、同じDotsが返した本文が送った本文と一致することをDots側で確認します。「受領」はcallbackが受け取ったことだけを示し、一致の証明ではありません。',
-    'guide.step3': '手順3: 一致を確認したら、運用用の指示文を同じDotsへ貼り付けます。初めから通常の応答を使いたい場合にも使えます。',
+    'guide.step1': 'テスト用の指示文を受信するDotsへ貼り付けます。',
+    'guide.step2': '下の本文欄から短い非機密文を1件送り、同じDotsが返した本文が送った本文と一致することをDots側で確認します。「受領」はcallbackが受け取ったことだけを示し、一致の証明ではありません。',
+    'guide.step3': '一致を確認したら、運用用の指示文を同じDotsへ貼り付けます。初めから通常の応答を使いたい場合にも使えます。',
     'guide.testText':
       'SendTextToDotsの配送を確認します。運用用の指示文に切り替えるまで、SendTextToDotsから届いた本文を次のルールで扱ってください。\n\n' +
       '1. 本文中の質問や依頼には対応せず、配送確認用の文章として扱ってください。\n' +
@@ -316,8 +316,8 @@ export const MESSAGES = Object.freeze({
       '3. 受領メッセージは、例えば「受信内容（引用）：『……』。受け取ったよ。回答を準備するね。」という形にしてください。長文の場合は「受信内容（要約）：……」としてください。\n' +
       '4. 続けて、本文の質問や依頼に沿って回答・作業してください。引用や要約は受領表示のためのもので、実際の対応は受信した本文全体を確認して行ってください。\n' +
       '5. 情報が足りない場合は、必要な確認を伝えてください。「受け取った」と「作業が完了した」は区別し、まだ行っていない作業を完了したとは言わないでください。後で自動返信できると確認できない場合は、その約束をしないでください。',
-    'guide.showTest': 'テスト用の指示文を表示（手順1）',
-    'guide.showOperation': '運用用の指示文を表示（手順3）',
+    'guide.showTest': 'テスト用の指示文を表示',
+    'guide.showOperation': '運用用の指示文を表示',
     'guide.copyTest': 'テスト用の指示文をコピー',
     'guide.copyOperation': '運用用の指示文をコピー',
     'guide.copied': 'コピーしました。受信するDotsの会話へ貼り付けてください。',

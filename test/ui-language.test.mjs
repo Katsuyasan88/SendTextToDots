@@ -192,7 +192,10 @@ test('L3 rendering: every page carries html lang, title and body in the selected
     }
     assert.ok(html.indexOf('id="sttd-panel-3"') < html.indexOf('id="sttd-panel-4"') && html.indexOf('id="sttd-panel-4"') < html.indexOf('id="sttd-panel-5"'), `${lang}: step panels in order`);
   }
-  assert.ok(consoleJa.includes('>テスト用の指示文を表示（手順1）</summary>') && consoleEn.includes('>Show the operational instructions (step 3)</summary>'));
+  assert.ok(consoleJa.includes('>テスト用の指示文を表示</summary>') && consoleEn.includes('>Show the operational instructions</summary>'));
+  // 各panelの先頭に可視見出し（wizard.step1〜5）があり、sectionのaria-labelledbyはそれを指す。旧3段階ガイドの番号は画面文言に残らない。
+  for (const n of [1, 2, 3, 4, 5]) assert.ok(consoleEn.includes(`<section id="sttd-panel-${n}" class="sttd-panel" aria-labelledby="sttd-panel-${n}-title"`) && consoleEn.includes(`<h2 id="sttd-panel-${n}-title" class="sttd-panel-title" data-sttd-i18n="wizard.step${n}">${MESSAGES.en[`wizard.step${n}`]}</h2>`), `panel ${n} heading`);
+  assert.equal(/\((step|Step) [1-3]\)|（手順[1-3]）|>(Step|手順) ?[1-3][:：]/.test(consoleEn.replace(/<h2[^>]*>[^<]*<\/h2>|<button type="button" id="sttd-step-[1-5]-head"[^>]*>[^<]*<\/button>/g, '') + consoleJa.replace(/<h2[^>]*>[^<]*<\/h2>|<button type="button" id="sttd-step-[1-5]-head"[^>]*>[^<]*<\/button>/g, '')), false, 'no legacy sub-step numbers outside the wizard headings');
   assert.equal(/開発用|development send|テスト送信|test send/i.test(consoleEn + consoleJa), false, 'console is presented as the send screen');
   // 旧接続画面は無い: 辞書にconnect.*キーが無く、どの画面も/connectへリンクしない。interaction画面はOAuth専用script（/interaction/app.js）だけを読む。
   assert.deepEqual(Object.keys(MESSAGES.en).filter((key) => key.startsWith('connect.')), [], 'no legacy connection-page dictionary');
