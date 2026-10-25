@@ -99,7 +99,7 @@ console.log(response.status, await response.json());
 
 ## 制約と免責
 
-- 2026-10-25、作者の環境で実Dotsへの2件の配送（直接APIと`/console`、日本語・改行を含む）と、同じ開発環境の再起動後の単純な計算指示1件を確認しました。限定した確認であり、任意指示の実行保証ではありません。第三者Cloud環境、macOS/Linuxのbuild/testは未確認です。[LIMITATIONS](docs/LIMITATIONS.md)を参照してください。
+- 2026-10-25、作者の環境で実Dotsへの2件の配送（直接APIと`/console`、日本語・改行を含む）と、同じ開発環境の再起動後の単純な計算指示1件を確認しました。限定した確認であり、任意指示の実行保証ではありません。MacでGitHubから取得したsourceを使い、本人管理のサーバー向けに環境設定した後、実Dotsへの到達を確認したとの本人報告も受けています。取得commit・Mac環境・配置設定以外の修正有無・build/test結果の詳細は未記録です。第三者Cloud環境とLinuxは未確認です。[LIMITATIONS](docs/LIMITATIONS.md)を参照してください。
 - 本番の信頼性・負荷・費用・同UIDの複数入口・1件ごとの即時処理は保証しません。受信側でまとめて処理される場合があります。Events草案の変更も互換性に影響し得ます。
 - 本人確認はFirebaseのApple providerだけです。認証省略や任意endpoint・資格・emulator・HTTP経由の設定overrideはありません。
 - 本serviceは本文を永続保存しません。期限切れの保存metadataは利用不可になりますが、物理削除とaccount全削除は未実装です。受信後の保持・処理は受信サービスの条件に従います。RAM・SDK・OS内の物理消去も保証しません。

@@ -8,6 +8,11 @@
 
 同日、サービスを停止後に再起動し、同じブラウザで受信中の表示を確認しました。受信側Dotsへ本文を作業依頼として扱うよう伝え、デモから送った単純な計算指示1件の結果と識別子が一致することも確認しています。作業を実行するのはDots側で、SendTextToDots自体は本文を解釈・実行しません。
 
+### MacでのGitHub取得sourceの使用実績（本人報告）
+
+2026-10-25、作者がMacでGitHubから取得した構成を使い、本人管理のサーバー向けの環境設定を行った後、実Dotsへの到達を確認したと報告しています。GitHub配布sourceを別の端末から導入して使用した本人の実績として記録します。
+
+これは第三者による独立検証ではありません。MacのOS/CPU/Node/npm版、取得commit、環境設定以外のsource変更の有無、実行したbuild/testコマンドと結果、送信経路/件数は詳細未確認です。自動試験の全件合格や全導入手順の無修正再現、本番運用全般の検証済みを意味しません。
 ## 未確認
 
 | 項目 | 状態 |
@@ -20,7 +25,7 @@
 | 保持期限後の物理削除 | 期限後は利用不可にするが、期限切れデータを物理削除する処理は含まれていない。Firestore TTL等の設定は導入者の判断 |
 | account削除（本人の全データ削除） | 未実装 |
 | 購読元clientの変更 | OAuth clientは `src/oauth/cimd.ts` のChatGPTのCIMD 1件に固定。他clientでは未確認 |
-| macOS・Linuxでのbuild/test | 作者はWindows 11・Node 22.23.4・npm 10.9.9・TypeScript 7.0.2で確認。他OSは未確認 |
+| macOS・Linuxでのbuild/test | MacでGitHub取得sourceの設定後に実Dotsへ到達したとの本人報告あり。Macのbuild/testコマンド・結果と環境版は詳細未確認。Windowsの確認版はWindows 11・Node 22.23.4・npm 10.9.9・TypeScript 7.0.2。Linuxは未確認 |
 
 ## 含まれないもの
 
@@ -39,7 +44,7 @@
 
 ## 導入手順とNode版の検証範囲
 
-[INSTALL.md](INSTALL.md)の配置コマンド例は、公開sourceの契約とGoogle Cloud公式資料に照らした手順です。第三者projectでのfresh setup全体、掲載した鍵生成・API例の実行、組織policyごとのIAM/公開到達の成立は未確認です。作者環境の過去の限定実績を、これらの手順の実行証明にはしません。
+[INSTALL.md](INSTALL.md)の配置コマンド例は、公開sourceの契約とGoogle Cloud公式資料に照らした手順です。第三者projectでのfresh setup全体、掲載した鍵生成・API例の実行、組織policyごとのIAM/公開到達の成立は未確認です。MacでのGitHub取得sourceの使用・実Dots到達は上記の本人報告を記録しましたが、掲載コマンドを全てそのまま実行した証明にはしません。
 
 ローカルの確認版はNode.js 22.23.4/npm 10.9.9です。packageの`engines: >=22`は全ての22.xや上位majorの動作保証ではありません。使用する`URL.parse`は22.1.0、`zlib.crc32`は22.2.0追加のため、初期22.xは対象にできません。最低版の全機能検証やNode23以降の検証はしていません。Cloud管理のNode22 runtimeとMCPの固定base imageのpatchもローカル版と別で、同一環境ではありません。
 
