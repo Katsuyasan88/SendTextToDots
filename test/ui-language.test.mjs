@@ -1,15 +1,13 @@
 // 表示言語（en/ja）と送信画面の接続解除を、合成入力だけで確かめる。importするのはpureなdist（connect/i18n.js・connect/console.js・
-// connect/pages.js・oauth/provider.jsのrender・config/validate.js）だけで、SDK instance・DB・資格・HTTP・子process 0。kms-server.jsは評価せず、
-// compile後のdist文字列で言語とcookieの接合だけを静的に確かめる。fixtureの値は全て合成値。
-//   - L1/L2: Accept-Languageのq値・不正入力・未対応言語、cookieの欠落/不正/重複、明示選択の優先、Set-Cookieの形（session・Path・SameSite・Secure）。
+// connect/pages.js・oauth/provider.jsのrender・config/validate.js）だけで、SDK instance・DB・資格・HTTP・子process 0。kms-server.jsは評価しない
+// （routing/Origin/Bearer/no-bodyの接合はPMの差分レビュー対象で、ここではHTTP結合試験をしない）。fixtureの値は全て合成値。
+//   - L1/L2: Accept-Languageのq値・不正q値の不採用・未対応言語、cookieの欠落/不正/重複、明示選択の優先、Set-Cookieの形（session・Path・SameSite・Secure）。
 //   - L3: 各画面（console・connect・OAuthログイン/同意・OAuthエラー）のHTML lang/題名/本文が選択言語で整合し、両言語の辞書キーが一致し、
 //     machine code・CSRF・formのaction/methodを翻訳せず、言語リンクがformの外のGETリンクであること。
-//   - L4: kms-server.jsの静的接合（HTMLだけ言語を選び、`?lang=`の明示選択だけSet-Cookie、disconnect routeの認可は不変）。
-//   - L5/L6: 実CONSOLE_SCRIPTを合成DOM/SDK/fetchで実行。言語切替で文言・langが差し替わり、cookie保存のGETが同originへ1回だけ出て、送信/
-//     ログイン/解除を発火しない。送信中の切替は受けない。解除は確認→1回のPOST→状態再確認で、取消/失敗/期限切れで成功を装わず、送信を封鎖する。
+//   - L5/L6: 実CONSOLE_SCRIPTを合成DOM/SDK/fetchで実行。言語切替で文言・langが差し替わり、表示専用cookieが同期に設定されて連続切替の最後の選択が
+//     残り、HTTP/送信/ログイン/解除を発火しない。送信中の切替は受けない。解除は確認→1回のPOST→状態再確認で、取消/失敗/期限切れで成功を装わず、送信を封鎖する。
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import { after, test } from 'node:test';
 import vm from 'node:vm';
 
@@ -19,6 +17,7 @@ import {
   LANGUAGE_COOKIE,
   LANGUAGES,
   languageCookie,
+  languageCookieAttributes,
   languageFromAcceptLanguage,
   languageFromCookieHeader,
   MESSAGES,
@@ -43,9 +42,23 @@ after(() => {
   assert.deepEqual([unhandled, timers], [0, 0]);
 });
 
-test('L1 Accept-Language: q values rank ja against en, ties/unsupported/invalid/missing fall back to en, q=0 never selects', () => {
+test('L1 Accept-Language: q values rank ja against en, ties/unsupported/missing fall back to en, q=0 never selects, and an entry with an invalid q (out of range, too many digits, non-numeric, duplicated q, unknown parameter) is dropped instead of being promoted to q=1', () => {
   const cases = {
     'ja': 'ja',
+    'ja;q=abc,en;q=0.8': 'en',
+    'ja;q=1.5,en;q=0.8': 'en',
+    'ja;q=0,en;q=0.8': 'en',
+    'ja;q=0.1234,en;q=0.1': 'en',
+    'ja;q=0.5;q=0.9,en;q=0.1': 'en',
+    'ja;level=1,en;q=0.1': 'en',
+    'ja;q=-0.5,en;q=0.1': 'en',
+    'ja;q=.5,en;q=0.1': 'en',
+    'ja;q=1.000,en;q=0.999': 'ja',
+    'ja;Q=0.9,en;q=0.8': 'ja',
+    'ja; q = 0.9 ,en;q=0.8': 'ja',
+    'en;q=abc,ja;q=0.1': 'ja',
+    'ja;q=abc': 'en',
+    'ja;q=abc,en;q=abc': 'en',
     'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7': 'ja',
     'en-US,en;q=0.9,ja;q=0.8': 'en',
     'en;q=0.5,ja;q=0.9': 'ja',
@@ -60,8 +73,6 @@ test('L1 Accept-Language: q values rank ja against en, ties/unsupported/invalid/
     '*;q=0.9,ja;q=0.8': 'en',
     'JA-jp': 'ja',
     'japanese': 'en',
-    'ja;q=abc': 'ja',
-    'ja;q=1.5': 'ja',
     ';;;,,,': 'en',
     '': 'en',
     ['x'.repeat(2000)]: 'en',
@@ -92,6 +103,8 @@ test('L2 cookie and selection: the display cookie wins over Accept-Language, a m
   assert.equal(selectLanguage({ query: '', acceptLanguage: 'ja' }), 'ja');
   assert.equal(languageCookie('ja', true), 'sttd_language=ja; Path=/; SameSite=Lax; Secure');
   assert.equal(languageCookie('en', false), 'sttd_language=en; Path=/; SameSite=Lax');
+  assert.deepEqual([languageCookieAttributes(true), languageCookieAttributes(false)], ['Path=/; SameSite=Lax; Secure', 'Path=/; SameSite=Lax']);
+  assert.equal(languageCookie('en', true), `sttd_language=en; ${languageCookieAttributes(true)}`, 'the browser-side write uses the same attributes as Set-Cookie');
   for (const value of [languageCookie('ja', true), languageCookie('en', false)]) assert.equal(/Max-Age|Expires|Domain|HttpOnly/i.test(value), false, 'session cookie, display only');
   assert.throws(() => languageCookie('fr', true), TypeError);
   assert.throws(() => languageCookie('<script>', true), TypeError);
@@ -158,6 +171,7 @@ test('L3 rendering: every page carries html lang, title and body in the selected
   const consoleEn = pages.console('en');
   assert.ok(consoleJa.includes('<title>SendTextToDots 送信画面</title>') && consoleEn.includes('<title>SendTextToDots send screen</title>'));
   assert.ok(consoleJa.includes(' data-sttd-language="ja"') && consoleEn.includes(' data-sttd-language="en"'));
+  assert.ok(consoleJa.includes(' data-sttd-cookie-attributes="Path=/; SameSite=Lax; Secure"') && consoleEn.includes(' data-sttd-cookie-attributes="Path=/; SameSite=Lax; Secure"'), 'the console passes the fixed cookie attributes (https issuer: Secure)');
   assert.ok(/<textarea id="sttd-text"[^>]*placeholder="Dotsへ送る文を入力してください（4096バイトまで）"[^>]*><\/textarea>/.test(consoleJa));
   assert.ok(/<textarea id="sttd-text"[^>]*placeholder="Enter the text to send to Dots \(up to 4096 bytes\)"[^>]*><\/textarea>/.test(consoleEn));
   for (const id of ['sttd-disconnect', 'sttd-disconnect-confirm', 'sttd-disconnect-yes', 'sttd-disconnect-no', 'sttd-disconnect-result']) assert.ok(consoleEn.includes(`id="${id}"`), id);
@@ -168,33 +182,13 @@ test('L3 rendering: every page carries html lang, title and body in the selected
   assert.ok(pages.connect('ja').includes('<a id="sttd-console-link" href="/console">送信画面を開く</a>'));
   assert.equal(pages.connectNoConsole('en').includes('href="/console"'), false);
   assert.ok(pages.connectNoConsole('ja').includes('このページは接続画面です'));
-  // scriptは辞書を埋め込み、両言語を持つ。machine state名・routeは翻訳しない。
+  // scriptは辞書を埋め込み、両言語を持つ（動作はL5/L6の実行で確かめる）。
   for (const script of [CONSOLE_SCRIPT, CONNECT_SCRIPT]) {
     assert.ok(script.includes(`const TEXT = ${JSON.stringify(MESSAGES)};`), 'the fixed dictionary is embedded');
-    for (const needle of ["'unlinked', 'linked', 'subscribed', 'expired', 'change_pending'", "'/v1/web/connection'", "'/v1/web/disconnect'"]) assert.ok(script.includes(needle), needle);
-    for (const banned of ['document.cookie', 'localStorage', 'sessionStorage', 'indexedDB', 'innerHTML']) assert.equal(script.includes(banned), false, `no ${banned}`);
+    for (const banned of ['localStorage', 'sessionStorage', 'indexedDB', 'innerHTML']) assert.equal(script.includes(banned), false, `no ${banned}`);
   }
-  assert.ok(CONSOLE_SCRIPT.includes("fetch('/console?lang=' + next, { method: 'GET', credentials: 'same-origin', cache: 'no-store', redirect: 'error' })"));
-  assert.equal((CONSOLE_SCRIPT.match(/fetch\('\/v1\/web\/disconnect'/g) ?? []).length, 1, 'one disconnect call site');
+  assert.equal(CONNECT_SCRIPT.includes('document.cookie'), false, 'the connect script does not touch cookies (server links only)');
   results.L3 = { pages: Object.keys(pages).length, keys: Object.keys(MESSAGES.en).length };
-});
-
-test('L4 wiring (static read of the compiled dist): HTML routes choose the language from ?lang / cookie / Accept-Language, only an explicit ?lang sets the session cookie, the connect page learns whether /console is served, and the disconnect route keeps Origin + Bearer + no-body checks', () => {
-  const kms = readFileSync(new URL('../dist/connect/kms-server.js', import.meta.url), 'utf8');
-  assert.ok(kms.includes("selectLanguage({ query, cookie: req.headers.cookie, acceptLanguage: req.headers['accept-language'] })"));
-  assert.ok(kms.includes("headers: isLanguage(query) ? { 'Set-Cookie': languageCookie(language, true) } : {}"));
-  assert.equal((kms.match(/'Set-Cookie'/g) ?? []).length, 1, 'one Set-Cookie site (pageLanguage)');
-  assert.ok(kms.includes("const { language, headers } = path === CONSOLE_PATH ? pageLanguage(req, url) : { language: undefined, headers: {} };"), 'console assets other than the HTML do not read or set the language');
-  assert.ok(kms.includes('renderConnectPage(web, language, consoleApiOriginFor !== null)'));
-  assert.ok(kms.includes('renderInteractionLogin(web, uid, label, opened.csrf, language)') && kms.includes('renderInteractionConsent(web, uid, label, opened.csrf, language)'));
-  const disconnect = kms.slice(kms.indexOf("case '/v1/web/disconnect':"), kms.indexOf("return 'web.disconnect';"));
-  for (const needle of ["only('POST')", 'await bearerIdentity(req)', 'assertNoBody(req)', 'storage.revokeOwner(ownerId)']) assert.ok(disconnect.includes(needle), needle);
-  assert.match(disconnect, /if \(req\.headers\.origin !== undefined\)\s*requireSameOrigin\(req\);/, 'Origin check kept (tsc may break the line)');
-  assert.equal(/language|lang|cookie/i.test(disconnect), false, 'the disconnect route does not read the display language');
-  const connection = kms.slice(kms.indexOf("case '/v1/web/connection':"), kms.indexOf("return 'web.connection';"));
-  assert.equal(/language|lang|cookie/i.test(connection), false, 'the connection route does not read the display language');
-  const provider = readFileSync(new URL('../dist/oauth/provider.js', import.meta.url), 'utf8');
-  assert.ok(provider.includes("renderOAuthErrorPage(out.error, selectLanguage({ cookie: ctx.get('cookie'), acceptLanguage: ctx.get('accept-language') }))"));
 });
 
 // ---------- L5/L6: 実scriptの合成実行 ----------
@@ -265,6 +259,8 @@ function domFromHtml(html) {
   const dataset = {};
   for (const [, name, value] of bodyAttrs.matchAll(/\sdata-([a-z0-9-]+)="([^"]*)"/g)) dataset[name.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = unescapeHtml(value);
   const documentElement = { lang: /<html lang="([a-z]+)">/.exec(html)[1] };
+  /** browserのcookie jarの合成: 書込みを順に記録し、同名の最後の値を保持する。読取りは回数だけ数える（scriptは読まないはず）。 */
+  const cookies = { writes: [], reads: 0, jar: new Map() };
   const document = {
     body: { dataset },
     documentElement,
@@ -274,8 +270,19 @@ function domFromHtml(html) {
       assert.equal(selector, '[data-sttd-i18n]');
       return [...elements.values()].filter((element) => Object.hasOwn(element.dataset, 'sttdI18n'));
     },
+    get cookie() {
+      cookies.reads += 1;
+      return [...cookies.jar.entries()].map(([name, value]) => `${name}=${value}`).join('; ');
+    },
+    set cookie(value) {
+      const text = String(value);
+      cookies.writes.push(text);
+      const [pair] = text.split(';');
+      const index = pair.indexOf('=');
+      cookies.jar.set(pair.slice(0, index), pair.slice(index + 1));
+    },
   };
-  return { document, elements, writes };
+  return { document, elements, writes, cookies };
 }
 
 /**
@@ -349,7 +356,7 @@ const JA = (key) => MESSAGES.ja[key];
 const EN = (key) => MESSAGES.en[key];
 const i18nTexts = (ui) => Object.fromEntries(ui.document.querySelectorAll('[data-sttd-i18n]').map((node) => [node.dataset.sttdI18n, node.textContent]));
 
-test('L5 language switch in the real console script: the Japanese page switches to English in place (html lang, title, every fixed text, placeholder, dynamic status) with exactly one same-origin GET /console?lang=en that carries the cookie jar and triggers no API call, popup, sign-out or disconnect; clicking the current language does nothing; the switch is refused while sending', { timeout: 20_000 }, async () => {
+test('L5 language switch in the real console script: the Japanese page switches to English in place (html lang, title, every fixed text, placeholder, dynamic status) and writes the display cookie synchronously in the fixed form with no HTTP request, API call, popup, sign-out or disconnect; rapid en→ja→en keeps the last choice; the typed text is kept; clicking the current language does nothing; the switch is refused while sending', { timeout: 20_000 }, async () => {
   let connectionState = 'subscribed';
   const holds = [];
   let mode = 'deliver';
@@ -365,11 +372,11 @@ test('L5 language switch in the real console script: the Japanese page switches 
     },
     onSame: async (entry) => {
       if (entry.url === '/v1/web/connection') return { status: 200, json: { state: connectionState } };
-      if (entry.url.startsWith('/console?lang=')) return { status: 200, text: '<!DOCTYPE html>' };
       throw new Error(`unexpected same-origin request ${entry.url}`);
     },
   });
   const { el } = ui;
+  const COOKIE = (code) => `sttd_language=${code}; Path=/; SameSite=Lax; Secure`;
   assert.equal(ui.document.documentElement.lang, 'ja');
   assert.equal(ui.document.title, JA('console.title'));
   assert.equal(el('sttd-state-text').textContent, JA('console.state.subscribed'));
@@ -377,16 +384,17 @@ test('L5 language switch in the real console script: the Japanese page switches 
   assert.deepEqual(i18nTexts(ui)['console.heading'], JA('console.heading'));
   assert.equal(el('sttd-lang-ja').getAttribute('aria-current'), 'true');
   assert.equal(el('sttd-lang-en').getAttribute('aria-current'), 'false');
-  assert.equal(ui.same('/console').length, 0);
+  assert.deepEqual([ui.cookies.writes, ui.cookies.reads], [[], 0], 'loading touches no cookie');
 
-  // 同じ言語のクリックは何もしない（fetch 0）。
+  // 同じ言語のクリックは何もしない（cookie書込み 0）。
   assert.equal(el('sttd-lang-ja').click(), true, 'navigation prevented');
   await settle();
-  assert.equal(ui.same('/console').length, 0);
+  assert.deepEqual(ui.cookies.writes, []);
 
-  // Englishへ切替: 画面内で差し替え、cookie保存のGETが1回。API・popup・signOut・解除は0。
-  const before = { api: ui.api().length, popups: ui.calls.popups, signOuts: ui.calls.signOuts };
+  // Englishへ切替: 画面内で差し替え、表示cookieを同期に1回書く。HTTP・API・popup・signOut・解除は0。
+  const before = { api: ui.api().length, popups: ui.calls.popups, signOuts: ui.calls.signOuts, fetches: ui.fetches.length };
   assert.equal(el('sttd-lang-en').click(), true, 'navigation prevented (in-place switch)');
+  assert.deepEqual(ui.cookies.writes, [COOKIE('en')], 'the cookie is written synchronously, before any await');
   await settle();
   assert.equal(ui.document.documentElement.lang, 'en');
   assert.equal(ui.document.title, EN('console.title'));
@@ -398,20 +406,23 @@ test('L5 language switch in the real console script: the Japanese page switches 
   assert.equal(el('sttd-account-text').textContent, EN('console.accountSignedIn'));
   assert.equal(el('sttd-lang-en').getAttribute('aria-current'), 'true');
   assert.equal(el('sttd-lang-ja').getAttribute('aria-current'), 'false');
-  const cookieCalls = ui.same('/console');
-  assert.equal(cookieCalls.length, 1);
-  assert.deepEqual([cookieCalls[0].url, cookieCalls[0].method, cookieCalls[0].credentials, cookieCalls[0].cache, cookieCalls[0].redirect, cookieCalls[0].body], ['/console?lang=en', 'GET', 'same-origin', 'no-store', 'error', undefined]);
-  assert.deepEqual(Object.keys(cookieCalls[0].headers), [], 'no Authorization on the language request');
+  assert.equal(ui.fetches.length, before.fetches, 'no HTTP request for the language change');
   assert.deepEqual([ui.api().length, ui.calls.popups, ui.calls.signOuts, ui.same('/v1/web/disconnect').length], [before.api, before.popups, before.signOuts, 0]);
+  assert.equal(ui.cookies.reads, 0, 'the script never reads cookies');
   assert.equal(el('sttd-send').disabled, false, 'still sendable after the switch');
 
-  // 入力中の切替で入力は消えない。
+  // 入力中の切替で入力は消えない。連続切替（ja→en→ja）は同期に書くので、最後の選択がcookie jarと画面の両方に残る。
   el('sttd-text').value = 'keep me';
+  assert.equal(el('sttd-lang-ja').click(), true);
+  assert.equal(el('sttd-lang-en').click(), true);
   assert.equal(el('sttd-lang-ja').click(), true);
   await settle();
   assert.equal(el('sttd-text').value, 'keep me');
-  assert.equal(ui.same('/console').length, 2);
+  assert.deepEqual(ui.cookies.writes, [COOKIE('en'), COOKIE('ja'), COOKIE('en'), COOKIE('ja')], 'one fixed-form write per change, in order');
+  assert.equal(ui.cookies.jar.get('sttd_language'), 'ja', 'the last explicit choice is what the jar holds');
   assert.equal(ui.document.documentElement.lang, 'ja');
+  assert.equal(ui.cookies.jar.size, 1, 'no other cookie is written');
+  for (const write of ui.cookies.writes) assert.equal(/Max-Age|Expires|Domain|HttpOnly/i.test(write), false, 'session cookie, display only');
 
   // 送信中は切替を受けない（文言・lang・fetchが変わらない）。送信は1件のまま。
   mode = 'hold';
@@ -422,7 +433,7 @@ test('L5 language switch in the real console script: the Japanese page switches 
   assert.equal(el('sttd-lang-en').click(), true, 'prevented, ignored');
   await settle();
   assert.equal(ui.document.documentElement.lang, 'ja');
-  assert.equal(ui.same('/console').length, 2, 'no cookie request while sending');
+  assert.equal(ui.cookies.writes.length, 4, 'no cookie write while sending');
   assert.equal(el('sttd-result').textContent, JA('console.sending'));
   assert.equal(el('sttd-disconnect').disabled, true, 'disconnect locked while sending');
   const payload = JSON.parse(holds[0].entry.body);
@@ -435,8 +446,10 @@ test('L5 language switch in the real console script: the Japanese page switches 
   assert.equal(el('sttd-lang-en').click(), true);
   await settle();
   assert.equal(el('sttd-result').textContent, EN('console.state.delivered'));
+  assert.equal(ui.cookies.jar.get('sttd_language'), 'en');
   assert.equal(ui.api().length, 1, 'one POST in total');
-  results.L5 = { cookieRequests: ui.same('/console').length, apiCalls: ui.api().length, fixedTexts: Object.keys(texts).length };
+  assert.equal(ui.fetches.length, 2, 'only the connection check and the one POST left the page');
+  results.L5 = { cookieWrites: ui.cookies.writes.length, cookieReads: ui.cookies.reads, apiCalls: ui.api().length, fixedTexts: Object.keys(texts).length };
 });
 
 test('L6 disconnect in the real console script: confirm first (no request), cancelling the confirmation sends nothing; confirming sends one same-origin POST /v1/web/disconnect with the Bearer token (double click does not add one), locks send/switch/refresh/language meanwhile, re-checks the state and blocks sending until the user re-checks; a failed or expired attempt is not shown as success and also re-checks', { timeout: 20_000 }, async () => {
@@ -508,7 +521,7 @@ test('L6 disconnect in the real console script: confirm first (no request), canc
   el('sttd-lang-en').click();
   await settle();
   assert.equal(ui.document.documentElement.lang, 'ja', 'language switch refused while disconnecting');
-  assert.equal(ui.same('/console').length, 0);
+  assert.deepEqual(ui.cookies.writes, [], 'no cookie write while disconnecting');
   connectionState = 'unlinked';
   holds.shift().hold.release({ status: 200, json: { state: 'unlinked' } });
   await settle();
@@ -569,6 +582,7 @@ test('L6 disconnect in the real console script: confirm first (no request), canc
   assert.equal(ui.api().length, 0, 'no API request in the whole scenario');
   assert.deepEqual([ui.calls.popups, ui.calls.signOuts], [0, 0]);
   for (const text of ui.writes) assert.equal(text.includes('synthetic-id-token'), false, 'no token in the page text');
+  assert.deepEqual([ui.cookies.writes, ui.cookies.reads], [[], 0], 'disconnecting never touches cookies');
   assert.equal(holds.length, 0);
   results.L6 = { disconnects: disconnects().length, connections: connections().length };
 });

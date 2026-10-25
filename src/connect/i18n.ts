@@ -20,6 +20,7 @@ export function isLanguage(value: unknown): value is Language {
 /**
  * Accept-Languageの対応言語（en/ja）の優先順位。RFC 9110の言語範囲とq値（0〜1、小数3桁まで）を読み、`ja`・`ja-*`と`en`・`en-*`・`*`だけを
  * 採用する。日本語のq値が英語より大きければja、同点・英語優先・header無し・不正・対応言語なしはen。q=0の言語は選ばない。
+ * qの形が不正（範囲外・桁数超過・数値でない・qの重複・未知のparameter）な項目は、q省略（既定1）と同じにせず、その項目を採用しない。
  */
 export function languageFromAcceptLanguage(header: unknown): Language {
   if (typeof header !== 'string' || header.length === 0 || header.length > 1024) return DEFAULT_LANGUAGE;
@@ -31,10 +32,18 @@ export function languageFromAcceptLanguage(header: unknown): Language {
     const range = (rangeRaw ?? '').trim().toLowerCase();
     if (!/^(\*|[a-z]{1,8}(-[a-z0-9]{1,8})*)$/.test(range)) continue;
     let quality = 1;
+    let valid = true;
+    let seenQ = false;
     for (const param of params) {
       const match = /^\s*q\s*=\s*(0(\.[0-9]{0,3})?|1(\.0{0,3})?)\s*$/i.exec(param);
-      if (match) quality = Number(match[1]);
+      if (match === null || seenQ) {
+        valid = false;
+        break;
+      }
+      seenQ = true;
+      quality = Number(match[1]);
     }
+    if (!valid) continue;
     if (range === 'ja' || range.startsWith('ja-')) ja = Math.max(ja, quality);
     else if (range === 'en' || range.startsWith('en-')) en = Math.max(en, quality);
     else if (range === '*') wildcard = Math.max(wildcard, quality);
@@ -65,10 +74,15 @@ export function selectLanguage(input: { readonly query?: unknown; readonly cooki
   return languageFromAcceptLanguage(input.acceptLanguage);
 }
 
+/** 表示言語cookieの固定属性（Path=/・SameSite=Lax、httpsではSecure。Max-Age/Expires/Domainなし＝session cookie）。browser側の同期設定も同じ値を使う。 */
+export function languageCookieAttributes(secure: boolean): string {
+  return `Path=/; SameSite=Lax${secure ? '; Secure' : ''}`;
+}
+
 /** Set-Cookieの値（session cookie・Path=/・SameSite=Lax、httpsではSecure。Max-Age/Expires/Domainなし）。 */
 export function languageCookie(language: Language, secure: boolean): string {
   if (!isLanguage(language)) throw new TypeError('unsupported language');
-  return `${LANGUAGE_COOKIE}=${language}; Path=/; SameSite=Lax${secure ? '; Secure' : ''}`;
+  return `${LANGUAGE_COOKIE}=${language}; ${languageCookieAttributes(secure)}`;
 }
 
 /** 言語の明示選択へ使うURL（同じpathへ`?lang=`を付ける。他のquery・fragmentは持ち越さない）。 */

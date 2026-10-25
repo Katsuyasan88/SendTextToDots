@@ -10,15 +10,16 @@
 //   - 表示はHTTP statusではなくstate。deliveredは送信先の受領で、同じDotの反応は自動確認しない。未確定は成功扱いしない。
 //   - 解除は本人の確認（はい）の後に1回だけPOSTし、処理中は送信・切替・再確認と排他。確認の取消・失敗・期限切れでは成功を装わず、
 //     終了後は接続状態を再確認し、本人が「状態を再確認」を押すまで送信を封鎖する。
-//   - 言語はサーバーが選んだ初期言語（HTMLのlang・本文）で始まり、English/日本語の明示選択は画面内で文言を差し替え、同じGETの`?lang=`を
-//     同originへ1回送って表示専用cookieへ保存する（navigation・form送信・ログイン・解除・送信を起こさない）。送信中・処理中は切替を受けない。
+//   - 言語はサーバーが選んだ初期言語（HTMLのlang・本文）で始まり、English/日本語の明示選択は画面内で文言を差し替え、表示専用のsession cookie
+//     `sttd_language`をbrowserで同期に設定する（固定en/ja・サーバーと同じ固定属性。応答順序に依存せず最後の選択が残る。他cookieは読まない。
+//     navigation・form送信・ログイン・解除・送信・追加HTTPを起こさない）。送信中・処理中は切替を受けない。`?lang=`のGETリンクはJSなし時のfallback。
 //   - HTML・JS・CSSは固定文字列で、inline script/style・実filesystem読取り・新framework・新依存は無い。動的な値はdata属性へescape、表示はtextContent。
 //   - apiOriginとweb configは信頼する呼出元（connect/kms-server.ts）だけが渡す。利用者・argv・envから任意originを選ばせない。
 // 各要求の元期限（POST 25秒・中止5秒・同ID確認10秒）に認証取得を含め、期限後のtokenで通信を始めない。
 //   backendのdelivery_unknownでも本人クリックの同ID確認を残す。認証切替・接続再確認・解除は排他し、確認済みの現在状態まで送信を封鎖する。
 //   httpsのAPI originはDNS hostだけ（IP literal拒否）。
 
-import { DEFAULT_LANGUAGE, isLanguage, languageHref, messagesJson, text, type Language, type MessageKey } from './i18n.js';
+import { DEFAULT_LANGUAGE, isLanguage, LANGUAGE_COOKIE, languageCookieAttributes, languageHref, messagesJson, text, type Language, type MessageKey } from './i18n.js';
 import { FIREBASE_POPUP_SCRIPT_ORIGIN, FIREBASE_WEB_SDK_VERSION, type FirebaseWebConfig } from './pages.js';
 
 export const CONSOLE_PATH = '/console';
@@ -89,7 +90,10 @@ export function consoleSecurityHeaders(web: FirebaseWebConfig, apiOrigin: string
   };
 }
 
-/** /consoleのHTML（1画面）。値はdata属性へescapeして渡す。文言は選択言語の辞書から入れ、scriptが同じキーで差し替える。 */
+/**
+ * /consoleのHTML（1画面）。値はdata属性へescapeして渡す。文言は選択言語の辞書から入れ、scriptが同じキーで差し替える。
+ * 表示言語cookieの固定属性（issuerはhttpsなのでSecureつき）もdata属性で渡し、scriptはサーバーのSet-Cookieと同じ形で同期に設定する。
+ */
 export function renderConsolePage(web: FirebaseWebConfig, apiOrigin: string, language: Language = DEFAULT_LANGUAGE): string {
   checkWeb(web);
   const api = consoleApiOrigin(apiOrigin);
@@ -101,6 +105,7 @@ export function renderConsolePage(web: FirebaseWebConfig, apiOrigin: string, lan
     'sttd-firebase': JSON.stringify({ apiKey: web.apiKey, authDomain: web.authDomain, projectId: web.projectId }),
     'sttd-api-origin': api,
     'sttd-language': lang,
+    'sttd-cookie-attributes': languageCookieAttributes(true),
   })
     .map(([name, value]) => ` data-${name}="${escapeHtml(value)}"`)
     .join('');
@@ -203,6 +208,9 @@ const ERROR_STATUSES = [400, 401, 403, 409, 422, 429];
 const TERMINAL = ['delivered', 'failed', 'cancelled', 'expired', 'delivery_unknown'];
 const RANK = { in_flight: 1, delivery_unknown: 2, failed: 3, expired: 3, cancelled: 3, delivered: 4 };
 
+const LANGUAGE_COOKIE = '${LANGUAGE_COOKIE}';
+const COOKIE_ATTRIBUTES = body.dataset.sttdCookieAttributes;
+
 const el = (id) => document.getElementById(id);
 let lang = Object.hasOwn(TEXT, body.dataset.sttdLanguage) ? body.dataset.sttdLanguage : 'en';
 /** 固定キーの文言（未知のキーは空文字。入力値を文言にしない）。 */
@@ -303,15 +311,16 @@ function applyLanguage() {
 }
 
 /**
- * 言語の明示選択。送信中・処理中は受けない。画面内で差し替え、同じ画面のGETを同originへ1回送って表示専用cookieへ保存する
- * （応答本文は使わない。navigation・form送信・ログイン・解除・送信は起こさない）。
+ * 言語の明示選択。送信中・処理中は受けない。画面内で差し替え、表示専用のsession cookieをbrowserで同期に設定する（固定en/jaだけ。
+ * サーバーのSet-Cookieと同じ固定属性。応答順序に依存せず最後の選択が残る。cookieの読取り・他cookieの操作・HTTP・navigation・
+ * form送信・ログイン・解除・送信は起こさない）。
  */
 function chooseLanguage(next) {
   if (languageLocked() || !Object.hasOwn(TEXT, next)) return;
   if (next === lang) return;
   lang = next;
   applyLanguage();
-  fetch('/console?lang=' + next, { method: 'GET', credentials: 'same-origin', cache: 'no-store', redirect: 'error' }).catch(() => {});
+  document.cookie = LANGUAGE_COOKIE + '=' + next + '; ' + COOKIE_ATTRIBUTES;
 }
 
 function showConnection(state, key) {

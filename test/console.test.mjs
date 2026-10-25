@@ -154,9 +154,11 @@ test('S1 the script builds the 5-field v2 command (no task/direction/revision), 
   for (const needle of ["request('/v2/commands', 'POST'", "request('/v2/commands/' + current.commandId + '/cancel', 'POST'", "request('/v2/commands/' + current.commandId, 'GET'", "'Idempotency-Key': current.commandId", "credentials: 'omit'", "redirect: 'error'", 'const POST_MS = 25000;', 'const CANCEL_MS = 5000;', 'const LIFETIME_MS = 60000;', "new OAuthProvider('apple.com')", 'await auth.authStateReady();', 'const LONE_SURROGATE = /\\p{Cs}/u;']) {
     assert.ok(s.includes(needle), needle);
   }
-  for (const banned of ['/v1/commands', 'TASK_ID', 'TASK_LABEL', 'taskId', 'taskLabel', 'revision', 'direction', 'schemaVersion: 1', 'localStorage', 'sessionStorage', 'indexedDB', 'setInterval', 'location.', 'history.', 'console.log', 'innerHTML', 'document.cookie', 'addScope', '.normalize(', 'form.submit', '.submit(']) {
+  for (const banned of ['/v1/commands', 'TASK_ID', 'TASK_LABEL', 'taskId', 'taskLabel', 'revision', 'direction', 'schemaVersion: 1', 'localStorage', 'sessionStorage', 'indexedDB', 'setInterval', 'location.', 'history.', 'console.log', 'innerHTML', 'addScope', '.normalize(', 'form.submit', '.submit(']) {
     assert.equal(s.includes(banned), false, `no ${banned}`);
   }
+  // cookieは表示言語の同期設定（書込み）だけ。読取り・他cookieの操作は無い。
+  assert.deepEqual(s.match(/document\.cookie[^\n]*/g), ["document.cookie = LANGUAGE_COOKIE + '=' + next + '; ' + COOKIE_ATTRIBUTES;"], 'the only cookie access is the display-language write');
   // trimは空白だけの判定に使うだけで、送る値は捕捉した`text`のまま（上のpayloadの`text,`）。
   assert.equal((s.match(/\.trim\(\)/g) ?? []).length, 1);
   assert.ok(s.includes("text.trim() === ''"));
@@ -253,14 +255,22 @@ function domFromHtml(html) {
   const bodyAttrs = /<body([^>]*)>/.exec(html)[1];
   const dataset = {};
   for (const [, name, value] of bodyAttrs.matchAll(/\sdata-([a-z0-9-]+)="([^"]*)"/g)) dataset[name.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = unescapeHtml(value);
+  const cookies = { writes: [], reads: 0 };
   const document = {
     body: { dataset },
     documentElement: { lang: /<html lang="([a-z]+)">/.exec(html)[1] },
     title: /<title>([^<]*)<\/title>/.exec(html)[1],
     getElementById: (id) => elements.get(id) ?? null,
     querySelectorAll: () => [...elements.values()].filter((element) => Object.hasOwn(element.dataset, 'sttdI18n')),
+    get cookie() {
+      cookies.reads += 1;
+      return '';
+    },
+    set cookie(value) {
+      cookies.writes.push(String(value));
+    },
   };
-  return { document, elements, writes };
+  return { document, elements, writes, cookies };
 }
 
 /** CONSOLE_SCRIPTを合成のSDK・fetchで実行する（日本語表示）。API originへのfetchはonApi(entry)が返す応答（{status, json}かthrowするPromise）。 */
@@ -461,6 +471,7 @@ test('D1 the real console script on a synthetic DOM/fetch: empty textarea; input
   // 本文はtextContentへ出さない（固定文だけ）。HTML風の本文で要素は増えない。
   for (const text of [textA, textB, exact, 'cancel me', 'unknown result']) assert.equal(ui.writes.some((written) => written.includes(text)), false, 'no body in the page text');
   assert.equal(ui.elements.size, [...consoleAsset('/console', WEB, API).body.matchAll(/\sid="sttd-/g)].length);
+  assert.deepEqual(ui.cookies, { writes: [], reads: 0 }, 'sending never touches cookies');
   assert.equal(holds.length, 0);
   results.D1 = { posts: posts.length, apiCalls: ui.api().length, rejected: Object.keys(rejected).length };
 });
