@@ -176,6 +176,22 @@ test('L3 rendering: every page carries html lang, title and body in the selected
   assert.ok(/<textarea id="sttd-text"[^>]*placeholder="Enter the text to send to Dots \(up to 4096 bytes\)"[^>]*><\/textarea>/.test(consoleEn));
   for (const id of ['sttd-disconnect', 'sttd-disconnect-confirm', 'sttd-disconnect-yes', 'sttd-disconnect-no', 'sttd-disconnect-result']) assert.ok(consoleEn.includes(`id="${id}"`), id);
   assert.equal(consoleEn.includes('href="/connect"'), false, 'console no longer sends the user to /connect to disconnect');
+  // Dots設定案内: 長い指示文は初期折りたたみのdetails（openなし）内のpreにあり、summaryとコピーボタンは各言語の文言。コピーボタンはdetailsの外（閉じたままでも押せる）。
+  for (const [lang, html] of [['en', consoleEn], ['ja', consoleJa]]) {
+    for (const kind of ['test', 'operation']) {
+      const block = /<details id="sttd-guide-(?:test|operation)"[^>]*>[\s\S]*?<\/details>/g;
+      const details = [...html.matchAll(block)].map((m) => m[0]);
+      assert.equal(details.length, 2, `${lang}: two details blocks`);
+      const own = details.find((d) => d.startsWith(`<details id="sttd-guide-${kind}"`));
+      assert.ok(own && !/<details[^>]*\sopen/.test(own), `${lang}/${kind}: collapsed initially`);
+      assert.ok(own.includes(`<summary id="sttd-guide-${kind}-summary"`) && own.includes(`<pre id="sttd-guide-${kind}-text"`), `${lang}/${kind}: summary + pre inside`);
+      assert.equal(own.includes(`id="sttd-copy-${kind}"`), false, `${lang}/${kind}: the copy button is outside the details`);
+      assert.ok(html.indexOf(`id="sttd-copy-${kind}"`) > html.indexOf(own) + own.length, `${lang}/${kind}: copy button follows its details`);
+    }
+    assert.ok(html.indexOf('id="sttd-guide"') < html.indexOf('id="sttd-send-section"'), `${lang}: guide precedes the send section`);
+    assert.ok(html.indexOf('id="sttd-connection"') < html.indexOf('id="sttd-guide"'), `${lang}: guide follows the connection section`);
+  }
+  assert.ok(consoleJa.includes('>テスト用の指示文を表示（手順1）</summary>') && consoleEn.includes('>Show the operational instructions (step 3)</summary>'));
   assert.equal(/開発用|development send|テスト送信|test send/i.test(consoleEn + consoleJa), false, 'console is presented as the send screen');
   // connect: consoleを配信する構成だけ送信画面へ案内し、配信しない構成では既存機能の案内。
   assert.ok(pages.connect('en').includes('<a id="sttd-console-link" href="/console">Open the send screen</a>'));
@@ -623,6 +639,7 @@ test('L7 Dots guide in the real console script: both fixed instruction texts are
   assert.equal(el('sttd-text').value, '', 'no preset text');
   assert.ok(JA('guide.testText').includes('\n\n1. ') && JA('guide.operationText').includes('\n5. '), 'multi-line instruction texts');
   assert.equal(el('sttd-copy-result').textContent, '');
+  assert.deepEqual([el('sttd-copy-test').disabled, el('sttd-copy-operation').disabled], [false, false], 'copy buttons usable without opening the details');
   const fetchesBefore = ui.fetches.length;
 
   // テスト用をコピー: 固定文だけを1回書く。読取り/permission/HTTP/送信 0。入力中の本文は変えない。
@@ -634,24 +651,93 @@ test('L7 Dots guide in the real console script: both fixed instruction texts are
   assert.deepEqual([clipboard.reads, ui.fetches.length, ui.api().length, el('sttd-text').value], [0, fetchesBefore, 0, 'my draft']);
   assert.equal(el('sttd-send').disabled, false, 'copying does not change the send state');
 
-  // 言語切替後は表示とコピー内容が英語で一致する。
+  // 言語切替後は表示が英語になり、以前の言語に対する「コピーしました」は残らない。コピー内容も英語文面と一致する。
   assert.equal(el('sttd-lang-en').click(), true);
   await settle();
   assert.equal(el('sttd-guide-test-text').textContent, EN('guide.testText'));
   assert.equal(el('sttd-guide-operation-text').textContent, EN('guide.operationText'));
-  assert.equal(el('sttd-copy-result').textContent, EN('guide.copied'), 'the status line follows the language');
+  assert.equal(el('sttd-guide-test-summary').textContent, EN('guide.showTest'));
+  assert.equal(el('sttd-copy-result').textContent, '', 'the previous copied status is cleared on a language change');
   assert.equal(el('sttd-copy-operation').click(), true);
   await settle();
   assert.deepEqual(clipboard.writes, [JA('guide.testText'), EN('guide.operationText')]);
   assert.equal(el('sttd-copy-result').textContent, EN('guide.copied'));
 
-  // 書込みの拒否: 成功を装わず手動コピーの案内。
-  clipboard.mode = 'reject';
-  el('sttd-copy-test').click();
+  // 保留中のclipboard Promise: 重ね押し（別mode）は2回目のwriteを出さず、両ボタンと言語切替を封鎖。本文入力・送信はclipboard完了待ちに巻き込まれない。
+  const held = gate();
+  clipboard.mode = 'hold';
+  navigator.clipboard.writeText = (value) => {
+    clipboard.writes.push(value);
+    if (clipboard.mode === 'hold') return held.promise;
+    return clipboard.mode === 'ok' ? Promise.resolve() : Promise.reject(new Error('synthetic NotAllowedError'));
+  };
+  assert.equal(el('sttd-copy-test').click(), true);
   await settle();
   assert.equal(clipboard.writes.length, 3);
+  assert.equal(el('sttd-copy-result').textContent, '', 'no result while pending');
+  assert.deepEqual([el('sttd-copy-test').disabled, el('sttd-copy-operation').disabled], [true, true], 'both copy buttons locked while a copy is pending');
+  assert.equal(el('sttd-copy-operation').click(), false);
+  el('sttd-copy-operation').onclick();
+  el('sttd-copy-test').onclick();
+  await settle();
+  assert.equal(clipboard.writes.length, 3, 'no second write while pending (re-entry refused)');
+  assert.equal(el('sttd-lang-ja').getAttribute('aria-disabled'), 'true');
+  assert.equal(el('sttd-lang-ja').click(), true);
+  await settle();
+  assert.equal(ui.document.documentElement.lang, 'en', 'language switch refused while a copy is pending');
+  assert.equal(ui.cookies.writes.length, 1, 'no new cookie write');
+  // 保留中でも本文入力と送信はできる（API/本文処理をclipboardへ巻き込まない）。
+  el('sttd-text').value = 'while copying';
+  assert.equal(el('sttd-send').disabled, false);
+  assert.equal(el('sttd-send').click(), true);
+  await settle();
+  assert.equal(ui.api().length, 1, 'the POST went out while the copy was still pending');
+  assert.equal(el('sttd-result').textContent, EN('console.state.delivered'));
+  assert.equal(JSON.parse(ui.api()[0].body).text, 'while copying');
+  // 完了後: 結果は始めたコピー（英語のテスト用）に対応し、再操作できる。
+  held.release();
+  await settle();
+  assert.equal(el('sttd-copy-result').textContent, EN('guide.copied'));
+  assert.deepEqual([el('sttd-copy-test').disabled, el('sttd-copy-operation').disabled], [false, false]);
+  assert.equal(el('sttd-lang-ja').getAttribute('aria-disabled'), 'false');
+  el('sttd-new').click();
+  await settle();
+
+  // 書込みの拒否（保留後にreject）: 成功を装わず手動コピーの案内、終了後は再操作可。
+  const heldReject = gate();
+  clipboard.mode = 'hold';
+  navigator.clipboard.writeText = (value) => {
+    clipboard.writes.push(value);
+    return heldReject.promise.then(() => Promise.reject(new Error('synthetic NotAllowedError')));
+  };
+  assert.equal(el('sttd-copy-operation').click(), true);
+  await settle();
+  assert.equal(clipboard.writes.length, 4);
+  assert.equal(clipboard.writes[3], EN('guide.operationText'));
+  heldReject.release();
+  await settle();
   assert.equal(el('sttd-copy-result').textContent, EN('guide.copyFailed'));
-  assert.equal(el('sttd-guide-test-text').textContent, EN('guide.testText'), 'the text stays visible for manual copy');
+  assert.equal(el('sttd-copy-test').disabled, false, 'operable again after a failure');
+  assert.equal(el('sttd-guide-operation-text').textContent, EN('guide.operationText'), 'the text stays visible for manual copy');
+  // 同期throwも失敗として扱う。
+  navigator.clipboard.writeText = () => {
+    clipboard.writes.push('throw');
+    throw new TypeError('synthetic sync failure');
+  };
+  assert.equal(el('sttd-copy-test').click(), true);
+  await settle();
+  assert.equal(el('sttd-copy-result').textContent, EN('guide.copyFailed'));
+  assert.equal(el('sttd-copy-operation').disabled, false);
+  clipboard.writes.pop();
+  clipboard.mode = 'reject';
+  navigator.clipboard.writeText = (value) => {
+    clipboard.writes.push(value);
+    return Promise.reject(new Error('synthetic NotAllowedError'));
+  };
+  el('sttd-copy-test').click();
+  await settle();
+  assert.equal(clipboard.writes.length, 5);
+  assert.equal(el('sttd-copy-result').textContent, EN('guide.copyFailed'));
 
   // 送信してdeliveredになっても、段階の完了・本文一致を自動表示しない（結果欄は配送状態だけ）。
   el('sttd-text').value = 'short test';
@@ -663,9 +749,10 @@ test('L7 Dots guide in the real console script: both fixed instruction texts are
   const allowed = new Set(['', EN('console.accountSignedIn'), EN('console.state.subscribed'), EN('guide.copyFailed'), EN('console.sending'), EN('console.state.delivered')]);
   const unexpected = ui.writes.slice(writesBefore).filter((written) => !allowed.has(written));
   assert.deepEqual(unexpected, [], 'no automatic step-complete or match message');
-  assert.equal(ui.api().length, 1, 'one POST, started only by the send button');
-  assert.equal(clipboard.writes.length, 3, 'sending copies nothing');
-  for (const written of clipboard.writes) assert.equal(written.includes('short test') || written.includes('my draft') || written.includes('synthetic-id-token'), false, 'only the fixed instructions reach the clipboard');
+  assert.equal(ui.api().length, 2, 'two POSTs, each started only by the send button');
+  assert.equal(clipboard.writes.length, 5, 'sending copies nothing');
+  for (const written of clipboard.writes) assert.equal(written.includes('short test') || written.includes('my draft') || written.includes('while copying') || written.includes('synthetic-id-token'), false, 'only the fixed instructions reach the clipboard');
+  assert.deepEqual([...new Set(clipboard.writes)].sort(), [EN('guide.operationText'), EN('guide.testText'), JA('guide.testText')].sort(), 'only fixed instruction texts were ever written');
   results.L7 = { clipboardWrites: clipboard.writes.length, clipboardReads: clipboard.reads, apiCalls: ui.api().length };
 });
 
@@ -689,6 +776,10 @@ test('L8 Dots guide without a clipboard API: the copy button does not throw, sho
   assert.equal(el('sttd-send').disabled, true, 'linked (not subscribed): still not sendable; the guide changes no state');
   assert.equal(el('sttd-lang-ja').click(), true);
   await settle();
-  assert.equal(el('sttd-copy-result').textContent, JA('guide.copyUnavailable'));
+  assert.equal(el('sttd-copy-result').textContent, '', 'the copy status is cleared on a language change');
   assert.equal(el('sttd-guide-test-text').textContent, JA('guide.testText'));
+  assert.equal(el('sttd-copy-test').click(), true);
+  await settle();
+  assert.equal(el('sttd-copy-result').textContent, JA('guide.copyUnavailable'), 'the guidance follows the new language when copying again');
+  assert.equal(ui.fetches.length, fetchesBefore);
 });

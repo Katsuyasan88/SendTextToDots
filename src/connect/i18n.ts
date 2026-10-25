@@ -178,6 +178,8 @@ export const MESSAGES = Object.freeze({
       '3. For example, acknowledge a short message with: "Received text (quote): ‘…’. Got it. I\'ll prepare a response." For a long message, use "Received text (summary): …" instead.\n' +
       '4. Then answer the questions or carry out the requests in the text. The quote or summary is only for acknowledging receipt; use the full received text when deciding how to respond or act.\n' +
       '5. If information is missing, ask for what you need. Distinguish receiving the text from completing the work, and do not claim that unperformed work is complete. Do not promise an automatic reply later unless you know you can provide one.',
+    'guide.showTest': 'Show the test instructions (step 1)',
+    'guide.showOperation': 'Show the operational instructions (step 3)',
     'guide.copyTest': 'Copy the test instructions',
     'guide.copyOperation': 'Copy the operational instructions',
     'guide.copied': 'Copied. Paste it into the conversation with the receiving Dots.',
@@ -283,6 +285,8 @@ export const MESSAGES = Object.freeze({
       '3. 受領メッセージは、例えば「受信内容（引用）：『……』。受け取ったよ。回答を準備するね。」という形にしてください。長文の場合は「受信内容（要約）：……」としてください。\n' +
       '4. 続けて、本文の質問や依頼に沿って回答・作業してください。引用や要約は受領表示のためのもので、実際の対応は受信した本文全体を確認して行ってください。\n' +
       '5. 情報が足りない場合は、必要な確認を伝えてください。「受け取った」と「作業が完了した」は区別し、まだ行っていない作業を完了したとは言わないでください。後で自動返信できると確認できない場合は、その約束をしないでください。',
+    'guide.showTest': 'テスト用の指示文を表示（手順1）',
+    'guide.showOperation': '運用用の指示文を表示（手順3）',
     'guide.copyTest': 'テスト用の指示文をコピー',
     'guide.copyOperation': '運用用の指示文をコピー',
     'guide.copied': 'コピーしました。受信するDotsの会話へ貼り付けてください。',

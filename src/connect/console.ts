@@ -156,12 +156,20 @@ export function renderConsolePage(web: FirebaseWebConfig, apiOrigin: string, lan
 <li id="sttd-guide-step2"${i18n('guide.step2')}>${t('guide.step2')}</li>
 <li id="sttd-guide-step3"${i18n('guide.step3')}>${t('guide.step3')}</li>
 </ol>
-<h3 id="sttd-guide-test-title"${i18n('guide.step1')}>${t('guide.step1')}</h3>
+<div class="sttd-instruction-block">
+<details id="sttd-guide-test" class="sttd-instructions-details">
+<summary id="sttd-guide-test-summary"${i18n('guide.showTest')}>${t('guide.showTest')}</summary>
 <pre id="sttd-guide-test-text" class="sttd-instructions" tabindex="0"${i18n('guide.testText')}>${t('guide.testText')}</pre>
+</details>
 <button type="button" id="sttd-copy-test"${i18n('guide.copyTest')}>${t('guide.copyTest')}</button>
-<h3 id="sttd-guide-operation-title"${i18n('guide.step3')}>${t('guide.step3')}</h3>
+</div>
+<div class="sttd-instruction-block">
+<details id="sttd-guide-operation" class="sttd-instructions-details">
+<summary id="sttd-guide-operation-summary"${i18n('guide.showOperation')}>${t('guide.showOperation')}</summary>
 <pre id="sttd-guide-operation-text" class="sttd-instructions" tabindex="0"${i18n('guide.operationText')}>${t('guide.operationText')}</pre>
+</details>
 <button type="button" id="sttd-copy-operation"${i18n('guide.copyOperation')}>${t('guide.copyOperation')}</button>
+</div>
 <p id="sttd-copy-result" role="status"></p>
 </section>
 <section id="sttd-send-section" aria-labelledby="sttd-send-title">
@@ -202,7 +210,8 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-actions { display: flex; flex-wrap: wrap; }
 .sttd-steps { padding-left: 1.25rem; margin: 0.5rem 0; }
 .sttd-steps li { margin: 0.25rem 0; }
-h3 { font-size: 0.95rem; margin: 1rem 0 0.25rem; }
+.sttd-instruction-block { margin-top: 0.75rem; }
+.sttd-instructions-details summary { cursor: pointer; font-weight: 600; min-height: 44px; display: flex; align-items: center; }
 .sttd-instructions { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; background: #f5f6f8; border: 1px solid #d9dce1; border-radius: 6px; padding: 0.75rem; margin: 0; }
 #sttd-result, #sttd-disconnect-result { font-weight: 600; min-height: 1.5em; overflow-wrap: anywhere; }
 .sttd-note { font-size: 0.85rem; color: #4a5059; }
@@ -252,8 +261,9 @@ let connectionSeq = 0;
 let confirming = false;
 let disconnectKey = '';
 let disconnected = false;
-// 指示文コピーの結果（固定キー）。
+// 指示文コピーの結果（固定キー）と進行中の印。進行中は2つのコピーボタンと言語切替を封鎖し、結果は始めたコピーの文面だけに対応させる。
 let copyKey = '';
+let copying = false;
 
 function phaseOf(current) {
   if (current.state !== null && TERMINAL.includes(current.state)) return 'settled';
@@ -278,7 +288,7 @@ function busy() {
 
 /** 言語の切替を受けない間（送信中・中止の確認中・結果確認中・認証切替・再確認・解除の処理中。終端後の切替は文言の差し替えだけなので受ける）。 */
 function languageLocked() {
-  return accountBusy || (test !== null && (phaseOf(test) === 'sending' || test.cancel === 'pending' || test.checking));
+  return accountBusy || copying || (test !== null && (phaseOf(test) === 'sending' || test.cancel === 'pending' || test.checking));
 }
 
 function render() {
@@ -299,6 +309,8 @@ function render() {
   el('sttd-disconnect-no').disabled = busy();
   el('sttd-disconnect-result').textContent = T(disconnectKey);
   el('sttd-copy-result').textContent = T(copyKey);
+  el('sttd-copy-test').disabled = copying;
+  el('sttd-copy-operation').disabled = copying;
   el('sttd-text').disabled = !sendable || test !== null;
   el('sttd-send').disabled = !sendable || test !== null;
   el('sttd-cancel').hidden = test === null || (phase !== 'sending' && phase !== 'unknown') || test.cancel === 'answered' || test.cancel === 'unconfirmed';
@@ -346,6 +358,8 @@ function chooseLanguage(next) {
   if (languageLocked() || !Object.hasOwn(TEXT, next)) return;
   if (next === lang) return;
   lang = next;
+  // 以前の言語の文面に対するコピー結果を残さない（新しく表示した文面をコピー済みと誤認させない）。
+  copyKey = '';
   applyLanguage();
   document.cookie = LANGUAGE_COOKIE + '=' + next + '; ' + COOKIE_ATTRIBUTES;
 }
@@ -645,13 +659,16 @@ function disconnect() {
  * 書かず、clipboardを読まず、permissionを要求せず、HTTP・ログイン・同意・解除・送信を始めない。未対応・失敗は手動コピーの案内。
  */
 function copyInstructions(kind) {
+  if (copying) return;
   const key = kind === 'operation' ? 'guide.operationText' : 'guide.testText';
+  // 文面は開始時の言語で1回だけ取り出す。進行中は言語切替・他のコピーを封鎖するので、結果はこの文面に対応する。
   const text = T(key);
   const clipboard = typeof navigator === 'object' && navigator !== null ? navigator.clipboard : undefined;
   if (!clipboard || typeof clipboard.writeText !== 'function') {
     copyKey = 'guide.copyUnavailable';
     return render();
   }
+  copying = true;
   copyKey = '';
   render();
   let pending;
@@ -660,15 +677,14 @@ function copyInstructions(kind) {
   } catch {
     pending = Promise.reject(new Error('copy_failed'));
   }
+  const finish = (result) => {
+    copying = false;
+    copyKey = result;
+    render();
+  };
   return pending.then(
-    () => {
-      copyKey = 'guide.copied';
-      render();
-    },
-    () => {
-      copyKey = 'guide.copyFailed';
-      render();
-    },
+    () => finish('guide.copied'),
+    () => finish('guide.copyFailed'),
   );
 }
 
