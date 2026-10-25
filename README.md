@@ -32,7 +32,7 @@ The owner is the user identified by the verified Firebase token. A subscription 
 | Component | Runtime | Role |
 | --- | --- | --- |
 | Send API | Cloud Functions 2nd gen (`sendtexttodotsapi`) | Authenticated text submission, one signed delivery attempt, status lookup, and cancellation |
-| MCP/OAuth and web UI | Cloud Run (`dist/deployment/connect.js`) | OAuth authorization, Events subscriptions at `/mcp`, and the send screen at `/console` (Apple login, connection state, disconnect, one send). `/connect` remains for compatibility |
+| MCP/OAuth and web UI | Cloud Run (`dist/deployment/connect.js`) | OAuth authorization, Events subscriptions at `/mcp`, and the send screen at `/console` (Apple login, connection state, disconnect, one send). There is no separate connection page |
 | Storage | Firestore | User connections, OAuth authorizations, subscriptions sealed with KMS, and command status without message text |
 | Keys | Cloud KMS and Secret Manager | Sealing keys and separate signing, cookie, identifier, and digest secrets |
 
@@ -121,7 +121,7 @@ Read the [security design and reporting status](docs/SECURITY_EN.md). A private 
 | `src/deployment/` | Functions entry, Cloud Run entry, and CORS |
 | `src/google-runtime/` | Owned Google SDK initialization, Cloud runtime gate, and rejection of unsafe environment variables |
 | `src/delivery/`, `src/commands/` | Send API validation, single delivery attempt, cancellation, and status |
-| `src/connect/`, `src/oauth/`, `src/mcp/`, `src/events/` | Send screen and connection web UI (English/Japanese dictionary in `i18n.ts`), OAuth, MCP Events, subscriptions, and signatures |
+| `src/connect/`, `src/oauth/`, `src/mcp/`, `src/events/` | Send screen and OAuth interaction pages (English/Japanese dictionary in `i18n.ts`), OAuth, MCP Events, subscriptions, and signatures |
 | `src/storage/`, `src/protection/`, `src/keys/` | Firestore storage formats, KMS sealing, and secret reads |
 | `src/egress/` | Safe outbound HTTPS with IP validation, pinned connections, TLS, deadlines, and limits |
 | `scripts/` | Offline packaging (`package-artifacts.mjs`) and test runner |

@@ -57,21 +57,22 @@ Deadlines: the processing budget is the shorter of 20 seconds from receipt and t
 
 The send screen `/console` (served on the MCP origin) sends the text the user typed into its empty input directly to the API in the same five-field form (there is no direction or preset selection). It also shows the connection state and disconnects through the existing `/v1/web/disconnect` after an explicit confirmation. The API CORS allows only the three routes above from the configured MCP origin (allowed headers: authorization, content-type, idempotency-key; `Retry-After` exposed; no wildcard or credential cookies). Old v1 routes with an Origin and other origins get a fixed 403; requests without an Origin proceed to normal processing without CORS headers (v1 is 404).
 
-## 3. Connection web and connection state
+## 3. Send screen and connection state
+
+The send screen is the only web entry. There is no separate connection page; `/connect` and `/connect/app.js` are not served (404 like any unknown path).
 
 | Endpoint | Content |
 | --- | --- |
 | `GET /console` | Send screen (Apple sign-in, state, disconnect, one send, cancel, same-ID lookup). Served only when the deployment configuration provides the API origin |
-| `GET /connect` | Connection web kept for compatibility (Apple sign-in, state, disconnect) with a link to `/console` |
 | `GET /v1/web/connection` | Bearer Firebase ID token. `{state}` |
 | `POST /v1/web/disconnect` | Revokes the same owner's Grant and subscription. `{state}` |
-| `/interaction/{uid}`, `…/login`, `…/consent`, `…/deny` | OAuth authorization interaction (same origin, CSRF, explicit consent every time) |
+| `/interaction/{uid}`, `…/login`, `…/consent`, `…/deny`, `/interaction/app.js` | OAuth authorization interaction (same origin, CSRF, explicit consent every time) and its fixed script |
 | `/mcp` | MCP (Bearer access token, scope `sttd:events`) |
 | `/.well-known/*`, `/oauth/*` | OAuth metadata, token and other endpoints (`oidc-provider`) |
 
-The routes and scope of the connection web and OAuth are separate from the send API version and do not change in 0.3.0.
+The `/v1/web/*` routes, the OAuth routes and the scope are separate from the send API version and do not change in 0.3.0.
 
-Display language: the HTML pages (`/console`, `/connect`, the OAuth interaction and the user-facing OAuth error page) are rendered in English or Japanese. An explicit choice through `?lang=en` or `?lang=ja` is stored in the display-only session cookie `sttd_language` (Path=/, SameSite=Lax, Secure, no expiry); the send screen writes the same cookie in the browser when you switch its language, so the last choice is kept; without it the `Accept-Language` preference decides (Japanese when preferred, otherwise English). The cookie is never used for authentication or authorization, and machine codes, fields, scopes, routes and the text being sent are never translated.
+Display language: the HTML pages (`/console`, the OAuth interaction and the user-facing OAuth error page) are rendered in English or Japanese. An explicit choice through `?lang=en` or `?lang=ja` is stored in the display-only session cookie `sttd_language` (Path=/, SameSite=Lax, Secure, no expiry); the send screen writes the same cookie in the browser when you switch its language, so the last choice is kept; without it the `Accept-Language` preference decides (Japanese when preferred, otherwise English). The cookie is never used for authentication or authorization, and machine codes, fields, scopes, routes and the text being sent are never translated.
 
 State priority: no valid Grant → unlinked, a destination replacement awaiting approval → change_pending, a valid subscription → subscribed, the most recent subscription expired → expired, otherwise (no subscription or subscription cancelled) → linked.
 

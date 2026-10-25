@@ -1,4 +1,4 @@
-// MCP/OAuth/接続WebのKMS接続server。startDevelopmentKmsConnectServerが、接続Web（/connect・script・状態・解除）・provider interaction
+// MCP/OAuth/送信画面のKMS接続server。startDevelopmentKmsConnectServerが、接続状態/解除API（/v1/web/*）・provider interaction（＋その固定script）
 // （login/consent/deny）・/console（固定API originの操作画面）・MCP・protected resource metadata・OAuth/.well-knownを、要求ごとのcontext・
 // KMS port・AS resolver・MCP入口・購読登録runtime・購読viewの上で内部に組み立て、固定のhttps publicOrigin（issuer）で0.0.0.0の指定portに
 // 待ち受ける。OAuth profileはconnect-kms-development。任意のresolver・store・proof・validatorの注入口は無い。
@@ -58,10 +58,9 @@ import { ConnectStorage, isConnectNamespace } from './firestore.js';
 import { isLanguage, LANGUAGE_QUERY, languageCookie, selectLanguage, type Language } from './i18n.js';
 import { createConnectKmsSealingPort } from './kms-port.js';
 import {
-  CONNECT_SCRIPT,
-  CONNECT_SCRIPT_PATH,
+  INTERACTION_SCRIPT,
+  INTERACTION_SCRIPT_PATH,
   pageSecurityHeaders,
-  renderConnectPage,
   renderInteractionConsent,
   renderInteractionLogin,
   type FirebaseWebConfig,
@@ -1009,19 +1008,13 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         return path === CONSOLE_PATH ? 'console.page' : path === CONSOLE_SCRIPT_PATH ? 'console.script' : 'console.style';
       }
 
+      // 旧接続画面（/connect・/connect/app.js）は無い。redirect・互換pageを置かず、下の未知pathと同じ固定404へ落ちる。
       switch (path) {
-        case '/connect': {
+        case INTERACTION_SCRIPT_PATH:
           only('GET');
           await guarded(() => assertNoBody(req));
-          const { language, headers } = pageLanguage(req, url);
-          send(res, 200, 'text/html; charset=utf-8', renderConnectPage(web, language, consoleApiOriginFor !== null), { ...pageSecurityHeaders(web), ...headers });
-          return 'connect.page';
-        }
-        case CONNECT_SCRIPT_PATH:
-          only('GET');
-          await guarded(() => assertNoBody(req));
-          send(res, 200, 'text/javascript; charset=utf-8', CONNECT_SCRIPT);
-          return 'connect.script';
+          send(res, 200, 'text/javascript; charset=utf-8', INTERACTION_SCRIPT);
+          return 'interaction.script';
         case '/v1/web/connection': {
           only('GET');
           const verified = await bearerIdentity(req);

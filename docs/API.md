@@ -57,21 +57,22 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 
 送信画面 `/console`（MCP originで配信）は、空の入力欄に利用者が入力した本文を同じ5項目の形でAPIへ直接送ります（方向・定型文の選択はありません）。接続状態の表示と、明示の確認後に既存の `/v1/web/disconnect` で行う接続解除も同じ画面にあります。APIのCORSは設定のMCP originからの上の3 routeだけを許可します（許可header: authorization・content-type・idempotency-key、`Retry-After` を公開、wildcard・credential cookieなし）。Originが付いた旧v1 routeや他のoriginは固定の403、Originの無い要求はCORS headerを付けずに通常の処理（v1は404）へ進みます。
 
-## 3. 接続Webと接続状態
+## 3. 送信画面と接続状態
+
+Webの入口は送信画面だけです。別の接続画面はなく、`/connect`・`/connect/app.js`は配信しません（未知pathと同じ404）。
 
 | endpoint | 内容 |
 | --- | --- |
 | `GET /console` | 送信画面（Appleログイン・状態・接続解除・1件送信・中止・同ID確認）。配置設定がAPI originを与える構成だけで配信 |
-| `GET /connect` | 互換のため残す接続Web（Appleログイン・状態・接続解除）。`/console`への案内つき |
 | `GET /v1/web/connection` | Bearer Firebase ID token。`{state}` |
 | `POST /v1/web/disconnect` | 同ownerのGrant/購読を失効。`{state}` |
-| `/interaction/{uid}`・`…/login`・`…/consent`・`…/deny` | OAuth認可のinteraction（同origin・CSRF・毎回の明示同意） |
+| `/interaction/{uid}`・`…/login`・`…/consent`・`…/deny`・`/interaction/app.js` | OAuth認可のinteraction（同origin・CSRF・毎回の明示同意）とその固定script |
 | `/mcp` | MCP（Bearer access token、scope `sttd:events`） |
 | `/.well-known/*`・`/oauth/*` | OAuth metadata・token等（`oidc-provider`） |
 
-接続Web・OAuthのrouteとscopeは送信APIの版とは別で、0.3.0でも変わりません。
+`/v1/web/*`・OAuthのrouteとscopeは送信APIの版とは別で、0.3.0でも変わりません。
 
-表示言語: HTML画面（`/console`・`/connect`・OAuth interaction・利用者向けOAuthエラー）は英語/日本語で描きます。`?lang=en` / `?lang=ja` の明示選択は表示専用のsession cookie `sttd_language`（Path=/・SameSite=Lax・Secure・期限なし）へ保存し、送信画面での言語切替も同じcookieをbrowserで書くため最後の選択が残ります。無い時は `Accept-Language` の優先順位（日本語選好ならja、それ以外はen）で決めます。このcookieを認証・認可に使わず、machine code・field・scope・route・送信本文は翻訳しません。
+表示言語: HTML画面（`/console`・OAuth interaction・利用者向けOAuthエラー）は英語/日本語で描きます。`?lang=en` / `?lang=ja` の明示選択は表示専用のsession cookie `sttd_language`（Path=/・SameSite=Lax・Secure・期限なし）へ保存し、送信画面での言語切替も同じcookieをbrowserで書くため最後の選択が残ります。無い時は `Accept-Language` の優先順位（日本語選好ならja、それ以外はen）で決めます。このcookieを認証・認可に使わず、machine code・field・scope・route・送信本文は翻訳しません。
 
 状態の優先順位: 有効なGrantが無い→unlinked、承認待ちの送信先置換→change_pending、有効な購読→subscribed、直前の購読が期限切れ→expired、それ以外（未購読・購読取消）→linked。
 

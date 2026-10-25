@@ -25,7 +25,7 @@
    ```
 
    service名と`-`とproject numberを合わせたDNS segmentは63文字以内にします。default `run.app` URLが許可された環境で使い、配置後に使用可能であることを管理画面で照合します。Consoleが別名のhash URLや`cloudfunctions.net` URLも表示していても、無断でissuerを切り替えません。独自domainを使う場合はTLSとroutingを先に整え、同じoriginを一貫して使ってください。
-4. MCPのhostをFirebase Authenticationのauthorized domainsへ追加します。Apple側のredirect先はFirebaseの`https://<authDomain>/__/auth/handler`で、MCPの`/connect`そのものとは別です。
+4. MCPのhostをFirebase Authenticationのauthorized domainsへ追加します。Apple側のredirect先はFirebaseの`https://<authDomain>/__/auth/handler`で、MCPの`/console`そのものとは別です。
 5. [CONFIGURATION.md](CONFIGURATION.md)に従い3つの新しいnamespace UUIDを生成し、以後固定します。これは秘密鍵ではありません。設定のproject/number/database/region/鍵/secret版との対応を台帳で確認します。
 
 ## 3. Cloud資源と権限を用意する
@@ -207,12 +207,12 @@ MCPのCPU/memory/instance数は上記の開始例であり、負荷試験済み�
 
 [Dotsの受信テストと応答設定](DOTS_GUIDE.md)の順に、受信先Dotsへテスト用の指示文を貼り、送信した本文の一致を確認した後、運用用の指示文を貼ります。送信画面の接続案内から、選択言語の文面を表示・コピーできます。コピーだけではDotsへ送信されず、本文一致や切替完了を画面が自動判定することもありません。
 
-1. MCP originの`/console`へアクセスしAppleログインします。画面はEnglish/日本語を選べます（ページ上部の言語リンク。初期言語はブラウザの言語設定）。Dots/ChatGPTのMCP server登録先は**MCP originの`/mcp`**です。`/console`・`/connect`やAPI originを登録先にしません。
+1. MCP originの`/console`へアクセスしAppleログインします。画面はEnglish/日本語を選べます（ページ上部の言語リンク。初期言語はブラウザの言語設定）。Dots/ChatGPTのMCP server登録先は**MCP originの`/mcp`**です。`/console`やAPI originを登録先にしません。
 2. Dots/ChatGPT側からOAuth接続し、同じFirebase利用者として明示同意します。`text.submitted`を購読して「受信中」であることを確認します。送信画面を開くだけでは購読は作られません。
 3. MCP originの`/console`の空欄に本文を入力し1件送信。受信側で入力どおりの表示を確認します。指示として実行させたい場合はDots側にその扱いを指示します。STTD自身は本文を実行しません。
 4. 直接APIを使う場合はREADMEの例を参照。Apple providerで認証した同じproject/UIDのFirebase ID tokenが必要です。Web画面のtokenを表示する管理toolは同梱しません。最初の確認には`/console`を使えます。
 5. `delivered`はcallbackの2xx受領で、受信側の処理完了ではありません。結果不明なら送信前に控えた同じcommandIdで状態照会し、新IDで自動再送しません。
-6. このaccountからの送信を止めるには`/console`の「接続を解除」を使います（画面で確認してから実行）。認可と購読が失効し、再開はChatGPTからの再接続です。`/connect`も互換のため同じ解除機能つきで残ります。
+6. このaccountからの送信を止めるには`/console`の「接続を解除」を使います（画面で確認してから実行）。認可と購読が失効し、再開はChatGPTからの再接続です。別の接続画面はありません。
 
 配置前に停止方法と保持費用を決めてください。接続解除は購読/Grantの失効で、Cloud資源の停止・廃棄ではありません。minInstances=0でも外部要求で起動し得ます。不要になったserviceの停止・削除と、DB/Secret/KMS/imageの保持はCloud側で別に判断します。暗号鍵の破棄は保存情報を復号不能にするため、費用だけを理由に一括削除しません。本sourceは自動停止/物理削除toolを含みません。
 
@@ -234,5 +234,5 @@ MCPのCPU/memory/instance数は上記の開始例であり、負荷試験済み�
 0.3.0は新規導入専用です。
 
 - 送信API・Eventsの契約が0.2.0から非互換に変わりました。送信は `/v2/commands` 系で、要求は `schemaVersion` 2・`commandId`・`text`・`createdAt`・`expiresAt` の5項目だけ、Eventsは `text.submitted`（dataは `schemaVersion` 2・`commandId`・`text`・`expiresAt` の4項目）です。0.2.0の `/v1/commands` 系route（404）、`schemaVersion` 1や `direction`・`taskId`・`taskLabel`・`revision` を含む要求（400）、旧イベント名 `shortcut.triggered` の購読（NotFound）は受け付けません。新旧の変換・別名・redirectはありません。入力元は[API.md](API.md)の新しい契約で送ってください。
-- 保存形式の識別子（上の保存root・`sttdkms1`・markerのversion・command状態の文書形式）とOAuth scope・接続Webのrouteは0.2.0から変えていません。ただし、これは0.2.0で保存したGrant・購読・command状態をそのまま引き継げる保証ではありません。0.2.0の配置を0.3.0へ置き換える移行手順・自動移行は提供せず、確認もしていません。既存の保存データ・購読を流用せず、新しい導入（別の保存namespace・接続・購読）として0.3.0を配置してください。
+- 保存形式の識別子（上の保存root・`sttdkms1`・markerのversion・command状態の文書形式）とOAuth scope・`/v1/web/*`のrouteは0.2.0から変えていません（旧接続画面`/connect`は0.3.0で廃止）。ただし、これは0.2.0で保存したGrant・購読・command状態をそのまま引き継げる保証ではありません。0.2.0の配置を0.3.0へ置き換える移行手順・自動移行は提供せず、確認もしていません。既存の保存データ・購読を流用せず、新しい導入（別の保存namespace・接続・購読）として0.3.0を配置してください。
 - 0.2.0より前の版とは、OAuth scope名・Firestoreの保存root・KMS封緘の形式（prefix・format・AAD）も異なり、互換性がありません。それらの版で保存したGrant・購読・command状態・markerは読まず、旧scopeのtokenも受け付けません。

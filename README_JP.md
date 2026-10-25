@@ -32,7 +32,7 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 | 部分 | 実行先 | 役割 |
 | --- | --- | --- |
 | 送信API | Cloud Functions 第2世代（`sendtexttodotsapi`） | 認証済み本文の受付、署名付き配送1回、状態照会、中止 |
-| MCP/OAuth・接続Web | Cloud Run（`dist/deployment/connect.js`） | OAuth認可、`/mcp`でのEvents購読、送信画面`/console`（Appleログイン・接続状態・接続解除・1件送信）。`/connect`は互換のため残す |
+| MCP/OAuth・送信画面 | Cloud Run（`dist/deployment/connect.js`） | OAuth認可、`/mcp`でのEvents購読、送信画面`/console`（Appleログイン・接続状態・接続解除・1件送信）。別の接続画面はない |
 | 保存 | Firestore | 利用者の接続、OAuth認可、KMS封緘した購読、本文を含まないcommand状態 |
 | 鍵 | Cloud KMS・Secret Manager | 封緘鍵と、署名・cookie・識別子・digest用に分離した秘密 |
 
@@ -121,7 +121,7 @@ console.log(response.status, await response.json());
 | `src/deployment/` | Functions entry・Cloud Run entry・CORS |
 | `src/google-runtime/` | Google SDKの所有起動（Cloud実行環境gate・危険な環境変数の拒否） |
 | `src/delivery/`・`src/commands/` | 送信APIの入力検証・単回配送・中止・状態 |
-| `src/connect/`・`src/oauth/`・`src/mcp/`・`src/events/` | 送信画面・接続Web（英日辞書は`i18n.ts`）・OAuth・MCP Events・購読・署名 |
+| `src/connect/`・`src/oauth/`・`src/mcp/`・`src/events/` | 送信画面・OAuth interaction画面（英日辞書は`i18n.ts`）・OAuth・MCP Events・購読・署名 |
 | `src/storage/`・`src/protection/`・`src/keys/` | Firestore保存形式・KMS封緘・Secret読取り |
 | `src/egress/` | 安全なHTTPS送出（IP検証・固定接続・TLS・期限・上限） |
 | `scripts/` | offline包装（`package-artifacts.mjs`）・試験runner |

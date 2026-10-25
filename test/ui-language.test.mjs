@@ -24,7 +24,7 @@ import {
   selectLanguage,
   text,
 } from '../dist/connect/i18n.js';
-import { CONNECT_SCRIPT, renderConnectPage, renderInteractionConsent, renderInteractionLogin } from '../dist/connect/pages.js';
+import { INTERACTION_SCRIPT, INTERACTION_SCRIPT_PATH, renderInteractionConsent, renderInteractionLogin } from '../dist/connect/pages.js';
 import { loadDeploymentConfig } from '../dist/config/validate.js';
 import { renderOAuthErrorPage } from '../dist/oauth/provider.js';
 
@@ -123,8 +123,6 @@ test('L3 rendering: every page carries html lang, title and body in the selected
   assert.equal(text('fr', 'console.title'), MESSAGES.en['console.title'], 'unknown language falls back to en');
   const pages = {
     console: (lang) => consoleAsset('/console', WEB, API, lang).body,
-    connect: (lang) => renderConnectPage(WEB, lang, true),
-    connectNoConsole: (lang) => renderConnectPage(WEB, lang, false),
     login: (lang) => renderInteractionLogin(WEB, 'uid-1', 'Client "A"', 'csrf-1', lang),
     consent: (lang) => renderInteractionConsent(WEB, 'uid-1', 'Client "A"', 'csrf-1', lang),
     oauthError: (lang) => renderOAuthErrorPage('access_denied', lang),
@@ -145,7 +143,7 @@ test('L3 rendering: every page carries html lang, title and body in the selected
     assert.equal(render('fr'), en, `${name}: unsupported language falls back to en`);
   }
   // 言語リンク: 同じpathへのGETリンクで、formの外。選択中はaria-current。
-  for (const [name, path] of [['console', '/console'], ['connect', '/connect'], ['login', '/interaction/uid-1'], ['consent', '/interaction/uid-1']]) {
+  for (const [name, path] of [['console', '/console'], ['login', '/interaction/uid-1'], ['consent', '/interaction/uid-1']]) {
     for (const lang of ['en', 'ja']) {
       const html = pages[name](lang);
       assert.ok(html.includes(`<a id="sttd-lang-en" href="${path}?lang=en" hreflang="en" lang="en"${lang === 'en' ? ' aria-current="true"' : ''}>English</a>`), `${name}/${lang}: en link`);
@@ -193,17 +191,18 @@ test('L3 rendering: every page carries html lang, title and body in the selected
   }
   assert.ok(consoleJa.includes('>テスト用の指示文を表示（手順1）</summary>') && consoleEn.includes('>Show the operational instructions (step 3)</summary>'));
   assert.equal(/開発用|development send|テスト送信|test send/i.test(consoleEn + consoleJa), false, 'console is presented as the send screen');
-  // connect: consoleを配信する構成だけ送信画面へ案内し、配信しない構成では既存機能の案内。
-  assert.ok(pages.connect('en').includes('<a id="sttd-console-link" href="/console">Open the send screen</a>'));
-  assert.ok(pages.connect('ja').includes('<a id="sttd-console-link" href="/console">送信画面を開く</a>'));
-  assert.equal(pages.connectNoConsole('en').includes('href="/console"'), false);
-  assert.ok(pages.connectNoConsole('ja').includes('このページは接続画面です'));
-  // scriptは辞書を埋め込み、両言語を持つ（動作はL5/L6の実行で確かめる）。
-  for (const script of [CONSOLE_SCRIPT, CONNECT_SCRIPT]) {
+  // 旧接続画面は無い: 辞書にconnect.*キーが無く、どの画面も/connectへリンクしない。interaction画面はOAuth専用script（/interaction/app.js）だけを読む。
+  assert.deepEqual(Object.keys(MESSAGES.en).filter((key) => key.startsWith('connect.')), [], 'no legacy connection-page dictionary');
+  for (const name of Object.keys(pages)) for (const lang of ['en', 'ja']) assert.equal(/href="\/connect|\/connect\/app\.js|sttd-console-link/.test(pages[name](lang)), false, `${name}/${lang}: no link to the removed connection page`);
+  assert.equal(INTERACTION_SCRIPT_PATH, '/interaction/app.js');
+  for (const lang of ['en', 'ja']) for (const name of ['login', 'consent']) assert.ok(pages[name](lang).includes(`<script type="module" src="${INTERACTION_SCRIPT_PATH}"></script>`), `${name}/${lang}: interaction script`);
+  // scriptは辞書を埋め込み、両言語を持つ（動作はL5〜L8の実行で確かめる）。
+  for (const script of [CONSOLE_SCRIPT, INTERACTION_SCRIPT]) {
     assert.ok(script.includes(`const TEXT = ${JSON.stringify(MESSAGES)};`), 'the fixed dictionary is embedded');
     for (const banned of ['localStorage', 'sessionStorage', 'indexedDB', 'innerHTML']) assert.equal(script.includes(banned), false, `no ${banned}`);
   }
-  assert.equal(CONNECT_SCRIPT.includes('document.cookie'), false, 'the connect script does not touch cookies (server links only)');
+  assert.equal(INTERACTION_SCRIPT.includes('document.cookie'), false, 'the interaction script does not touch cookies (server links only)');
+  assert.equal(/\/v1\/web\//.test(INTERACTION_SCRIPT), false, 'the interaction script has no connection-state or disconnect call (the send screen owns them)');
   results.L3 = { pages: Object.keys(pages).length, keys: Object.keys(MESSAGES.en).length };
 });
 

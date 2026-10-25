@@ -1,15 +1,15 @@
-// SendTextToDots接続Webの最小画面。Appleログイン（Firebase Web SDK、Apple providerのみ・追加scopeなし）・接続許可・状態・受信開始の案内・
-// 接続解除。受信開始はChatGPT側の購読（events/subscribe）を待つ案内で、押しただけで購読済みにしない。
+// OAuth interaction（login/consent）の最小画面と、その固定script。Appleログイン（Firebase Web SDK、Apple providerのみ・追加scopeなし）・
+// ログイン中accountの継続・明示のaccount切替・本人の明示同意/拒否（native form POST、CSRF）。通常入口の送信画面は connect/console.ts。
 // 値はdata属性へescapeして渡し、inline scriptを置かない。Web SDKは公式CDNの固定版だけを読み込む。
 // 文言はen/jaの固定辞書（connect/i18n.ts）から入れ、各画面にEnglish/日本語の明示選択（同じpathへの`?lang=`のGETリンク）を置く。
-// 言語のリンクはform送信・ログイン・同意・拒否・解除を起こさない。/connectは互換のため残し、通常入口の/consoleへ案内する。
+// 言語のリンクはform送信・ログイン・同意・拒否を起こさない。旧接続画面（/connect）は無く、互換route・redirectも置かない。
 
 import { DEFAULT_LANGUAGE, isLanguage, languageHref, messagesJson, text, type Language, type MessageKey } from './i18n.js';
 
 export const FIREBASE_WEB_SDK_VERSION = '13.0.0';
 const SDK_BASE = `https://www.gstatic.com/firebasejs/${FIREBASE_WEB_SDK_VERSION}/`;
-export const CONNECT_SCRIPT_PATH = '/connect/app.js';
-export const CONNECT_PATH = '/connect';
+/** OAuth interaction画面が読む固定script（同origin）。 */
+export const INTERACTION_SCRIPT_PATH = '/interaction/app.js';
 
 /** 公開してよいFirebase Webの設定値だけ（秘密ではない）。 */
 export interface FirebaseWebConfig {
@@ -59,14 +59,14 @@ function languageNav(path: string, lang: Language): string {
 <a id="sttd-lang-ja" href="${languageHref(path, 'ja')}" hreflang="ja" lang="ja"${current('ja')}>${t('common.languageJapanese')}</a></nav>`;
 }
 
-function shell(web: FirebaseWebConfig, view: string, lang: Language, path: string, titleKey: MessageKey, body: string, attributes: Record<string, string>): string {
+function shell(web: FirebaseWebConfig, view: string, lang: Language, path: string, body: string, attributes: Record<string, string>): string {
   const data = Object.entries({ 'sttd-view': view, 'sttd-firebase': JSON.stringify(web), 'sttd-language': lang, ...attributes })
     .map(([name, value]) => ` data-${name}="${escapeHtml(value)}"`)
     .join('');
-  const title = escapeHtml(text(lang, titleKey));
+  const title = escapeHtml(text(lang, 'interaction.title'));
   return `<!DOCTYPE html>
 <html lang="${lang}"><head><meta charset="utf-8"><title>${title}</title>
-<script type="module" src="${CONNECT_SCRIPT_PATH}"></script></head>
+<script type="module" src="${INTERACTION_SCRIPT_PATH}"></script></head>
 <body${data}>
 ${languageNav(path, lang)}
 <h1>${title}</h1>
@@ -83,7 +83,6 @@ export function renderInteractionLogin(web: FirebaseWebConfig, uid: string, clie
     'interaction-login',
     lang,
     `/interaction/${escapeHtml(uid)}`,
-    'connect.title',
     `<p>${t('interaction.client')}${escapeHtml(clientLabel)}</p>
 <p>${t('interaction.loginGuide')}</p>
 <button type="button" id="sttd-continue" hidden>${t('common.continueSignedIn')}</button>
@@ -104,7 +103,6 @@ export function renderInteractionConsent(web: FirebaseWebConfig, uid: string, cl
     'interaction-consent',
     lang,
     action,
-    'connect.title',
     `<p>${escapeHtml(clientLabel)}${t('interaction.consentQuestion')}</p>
 <form method="post" action="${action}/consent">
 <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
@@ -119,42 +117,13 @@ export function renderInteractionConsent(web: FirebaseWebConfig, uid: string, cl
 }
 
 /**
- * 接続設定ページ（OAuth外、互換のため残す）。状態・受信開始の案内・接続解除。状態の取得はログイン後にscriptが行う。
- * consoleを配信する構成（consoleAvailable）では通常入口の/consoleへ案内し、配信しない構成では既存機能だけを案内する。
+ * interaction画面のscript（login画面だけが操作を持つ。consent画面はnative formで、scriptは何もしない）。SDKの復元を待ち、復元済みsessionが
+ * あればそのtokenを使ってpopupを開かない（本人の「続ける」操作だけで同じinteractionへ進む）。popupは未ログインか、本人の明示のaccount切替
+ * （signOut後）の時だけ。復元済みsessionのtoken更新に失敗した時は、自動でpopupを開かず、ログインの操作へ戻す。
+ * Apple providerへscopeを足さない（氏名・メールを要求しない）。ID tokenはbodyだけで送り、URLへ入れない。
+ * 文言はbodyのdata-sttd-language（サーバーが選んだ言語）で、埋め込んだ固定辞書から引く。接続状態の表示・解除はこの画面に無い（送信画面の役割）。
  */
-export function renderConnectPage(web: FirebaseWebConfig, language: Language = DEFAULT_LANGUAGE, consoleAvailable = false): string {
-  const lang = languageOf(language);
-  const t = (key: MessageKey) => escapeHtml(text(lang, key));
-  const guide = consoleAvailable
-    ? `<p>${t('connect.consoleGuide')} <a id="sttd-console-link" href="/console">${t('connect.consoleLink')}</a></p>`
-    : `<p>${t('connect.consoleUnavailable')}</p>`;
-  return shell(
-    web,
-    'connect',
-    lang,
-    CONNECT_PATH,
-    'connect.title',
-    `${guide}
-<button type="button" id="sttd-apple-login" hidden>${t('common.appleLogin')}</button>
-<button type="button" id="sttd-switch-account" hidden>${t('common.switchAccount')}</button>
-<p id="sttd-message" role="status"></p>
-<section id="sttd-state" hidden>
-<p id="sttd-state-text" role="status"></p>
-<p id="sttd-start-guide" hidden>${t('common.startGuide')}</p>
-<button type="button" id="sttd-disconnect" hidden>${t('common.disconnect')}</button>
-</section>`,
-    {},
-  );
-}
-
-/**
- * 画面のscript。SDKの復元を待ち、復元済みsessionがあればそのtokenを使ってpopupを開かない（interactionでは本人の
- * 「続ける」操作だけで同じinteractionへ進む）。popupは未ログインか、本人の明示のaccount切替（signOut後）の時だけ。
- * 復元済みsessionのtoken更新に失敗した時は、自動でpopupを開かず、ログインの操作へ戻す。
- * Apple providerへscopeを足さない（氏名・メールを要求しない）。ID tokenはbody/Authorizationだけで送り、URLへ入れない。
- * 文言はbodyのdata-sttd-language（サーバーが選んだ言語）で、埋め込んだ固定辞書から引く。
- */
-export const CONNECT_SCRIPT = `import { initializeApp } from '${SDK_BASE}firebase-app.js';
+export const INTERACTION_SCRIPT = `import { initializeApp } from '${SDK_BASE}firebase-app.js';
 import { getAuth, OAuthProvider, signInWithPopup, signOut } from '${SDK_BASE}firebase-auth.js';
 
 const body = document.body;
@@ -163,11 +132,10 @@ const auth = getAuth(initializeApp(JSON.parse(body.dataset.sttdFirebase)));
 const TEXT = ${messagesJson()};
 const lang = Object.hasOwn(TEXT, body.dataset.sttdLanguage) ? body.dataset.sttdLanguage : 'en';
 const T = (key) => (Object.hasOwn(TEXT[lang], key) ? TEXT[lang][key] : '');
-const STATES = ['unlinked', 'linked', 'subscribed', 'expired', 'change_pending'];
 const el = (id) => document.getElementById(id);
 
 function say(text) {
-  const node = el('sttd-message') ?? el('sttd-state-text');
+  const node = el('sttd-message');
   if (node) node.textContent = text;
 }
 
@@ -209,40 +177,16 @@ async function interactionLogin(idToken) {
     body: JSON.stringify({ csrf: body.dataset.sttdCsrf, idToken }),
   });
   if (response.status === 204) location.reload();
-  else say(T('connect.loginConfirmFailed'));
+  else say(T('interaction.loginConfirmFailed'));
 }
-
-async function showState(idToken) {
-  const response = await fetch('/v1/web/connection', { headers: { Authorization: 'Bearer ' + idToken } });
-  if (!response.ok) return say(T('common.stateUnavailable'));
-  const { state } = await response.json();
-  show('sttd-state', true);
-  show('sttd-apple-login', false);
-  show('sttd-switch-account', true);
-  say(STATES.includes(state) ? T('common.state.' + state) : T('common.stateUnavailable'));
-  show('sttd-start-guide', state === 'linked' || state === 'expired');
-  show('sttd-disconnect', state !== 'unlinked');
-}
-
-const proceed = view === 'interaction-login' ? interactionLogin : showState;
 
 async function start() {
-  if (view !== 'interaction-login' && view !== 'connect') return;
-  el('sttd-apple-login').onclick = () => run(async () => proceed(await popupIdToken()), T('common.loginFailed'));
-  el('sttd-switch-account').onclick = () => run(async () => proceed(await switchedIdToken()), T('common.loginFailed'));
-  const disconnect = el('sttd-disconnect');
-  if (disconnect) {
-    disconnect.onclick = () =>
-      run(async () => {
-        const response = await fetch('/v1/web/disconnect', { method: 'POST', headers: { Authorization: 'Bearer ' + (await restoredIdToken()) } });
-        if (!response.ok) return say(T('common.disconnectFailed'));
-        await showState(await restoredIdToken());
-      }, T('common.loginRefresh'));
-  }
+  if (view !== 'interaction-login') return;
+  el('sttd-apple-login').onclick = () => run(async () => interactionLogin(await popupIdToken()), T('common.loginFailed'));
+  el('sttd-switch-account').onclick = () => run(async () => interactionLogin(await switchedIdToken()), T('common.loginFailed'));
   await auth.authStateReady();
   if (!auth.currentUser) return signedOut();
   show('sttd-switch-account', true);
-  if (view === 'connect') return run(async () => showState(await restoredIdToken()), T('common.loginRefresh'));
   show('sttd-continue', true);
   el('sttd-continue').onclick = () => run(async () => interactionLogin(await restoredIdToken()), T('common.loginRefresh'));
 }

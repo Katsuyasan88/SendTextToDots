@@ -175,7 +175,6 @@ test('W1 wiring (static read of the compiled dist): Functions applies CORS befor
   assert.ok(serve.indexOf('if (applyConsoleCors(req, res))') > 0 && serve.indexOf('if (applyConsoleCors(req, res))') < serve.indexOf('startShared()'));
   const kms = readFileSync(new URL('../dist/connect/kms-server.js', import.meta.url), 'utf8');
   assert.ok(/from ['"]\.\/console\.js['"]/.test(kms) && kms.includes('deployment !== null && config.publicOrigin === deployment.connect.publicOrigin ? deployment.api.publicOrigin : null'));
-  assert.ok(kms.indexOf('consoleApiOriginFor !== null') < kms.indexOf("case '/connect':"));
   assert.ok(functions.includes('const M = loadDeploymentConfig();') && functions.includes('region: M.location'), 'the entry reads the validated deployment config at import');
 });
 

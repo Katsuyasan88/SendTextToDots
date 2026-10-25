@@ -8,7 +8,7 @@ import { test } from 'node:test';
 
 import { CONNECT_STORAGE_ROOT } from '../dist/connect/firestore.js';
 import { consoleAsset, CONSOLE_SCRIPT } from '../dist/connect/console.js';
-import { CONNECT_SCRIPT, renderConnectPage, renderInteractionConsent, renderInteractionLogin } from '../dist/connect/pages.js';
+import { INTERACTION_SCRIPT, renderInteractionConsent, renderInteractionLogin } from '../dist/connect/pages.js';
 import { loadDeploymentConfig } from '../dist/config/validate.js';
 import { DELIVERY_STORAGE_ROOT } from '../dist/delivery/kms-store.js';
 import { STTD_SCOPE } from '../dist/oauth/provider.js';
@@ -124,14 +124,14 @@ test('実codec: 別domain（AAD tag）や別namespaceで封緘した暗号文は
   await rejects(codecOf(kms.transport, 't268_0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d').open(BINDING, sealed, operation()), 'unavailable');
 });
 
-test('接続/操作画面: id/dataはsttd-、scriptのdatasetはsttdCamelCaseで対応する', () => {
+test('OAuth interaction/送信画面: id/dataはsttd-、scriptのdatasetはsttdCamelCaseで対応する', () => {
   const deployment = loadDeploymentConfig();
   const web = { apiKey: 'synthetic-web-api-key', authDomain: deployment.web.authDomain, projectId: deployment.web.projectId };
-  const connectHtml = [renderConnectPage(web), renderInteractionLogin(web, 'uid-1', 'client', 'csrf-1'), renderInteractionConsent(web, 'uid-1', 'client', 'csrf-1')].join('\n');
+  const interactionHtml = [renderInteractionLogin(web, 'uid-1', 'client', 'csrf-1'), renderInteractionConsent(web, 'uid-1', 'client', 'csrf-1')].join('\n');
   const consoleHtml = consoleAsset('/console', web, deployment.api.publicOrigin).body;
   const camel = (name) => name.replace(/-([a-z])/g, (_, char) => char.toUpperCase());
 
-  for (const [html, script] of [[connectHtml, CONNECT_SCRIPT], [consoleHtml, CONSOLE_SCRIPT]]) {
+  for (const [html, script] of [[interactionHtml, INTERACTION_SCRIPT], [consoleHtml, CONSOLE_SCRIPT]]) {
     const ids = [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
     const data = [...html.matchAll(/\sdata-([a-z0-9-]+)=/g)].map((match) => match[1]);
     assert.ok(ids.length > 0 && data.length > 0);
