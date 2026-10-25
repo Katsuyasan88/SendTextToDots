@@ -1,0 +1,52 @@
+# 依存・生成物・一時出力
+node_modules/
+dist/
+.tmp/
+*.tsbuildinfo
+*.log
+
+# ローカル環境・秘密
+.env
+.env.*
+*.pem
+*.key
+*.p8
+*.p12
+
+# OSのローカルファイル
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 非公開の開発運用（正本は別の非公開repository。公開rootに置く参照もここで除外）
+/AGENTS.md
+/CLAUDE.md
+/CLAUDE.local.md
+/AGENTS.local.md
+/TASKS.md
+/BACKLOG.md
+/USER_TESTS.md
+/reviews/
+/discussions/
+/release_records/
+/tasks/
+/logs/
+/private/
+
+# AI・editorの個人設定
+.claude/
+.codex/
+.cursor/
+.aider*
+.continue/
+.vscode/
+.idea/
+
+# 追加の秘密・資格の形
+*.pfx
+*.jks
+*.keystore
+service-account*.json
+credentials*.json
+*.secret
+*.secrets

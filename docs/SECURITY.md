@@ -1,0 +1,66 @@
+# セキュリティとデータの扱い
+
+公開用のプライバシーポリシーではありません。導入者は自分の配置について、保存場所・ログ・委託先・表示を確認してください。
+
+## データの扱い
+
+- 本文（`text`）・event bytesは送信APIの要求処理中のRAMだけで扱い、DB・キュー・ログ・応答へ保存・出力しません。DBへ書くのは本文を含まないcommand状態と鍵付きdigestだけです。自分で作ったBufferは処理後に0埋めしますが、RAM・SDK・OS内の物理消去は保証しません。
+- 本人確認はFirebase Authentication（Apple provider）だけで、検証済みUIDを内部ownerへ結びます。氏名・メール・Apple raw ID・tokenを独自に保存しません（Firebase/Apple自身のaccount情報は別に存在します）。
+- 本文は購読先（例: ChatGPT）へ届き、その後の保持・処理は受信側サービスの条件に従います。
+
+| データ | 場所 | 保持の設計 |
+| --- | --- | --- |
+| owner（UIDとの対応・失効版・最終利用） | Firestore `sttdConnect` | 最終利用から90日無活動で失効 |
+| OAuth record（Grant・token等。payloadはKMS封緘） | Firestore `sttdConnect` | 各期限。Grant/refreshは90日無活動で失効、取消で即失効 |
+| 接続interaction | Firestore `sttdConnect` | 5分・単回 |
+| callback URL・購読secret（KMS封緘） | Firestore `sttdAuth` | 有効な購読中。回転時の旧secretは5分 |
+| command状態（ID・鍵付きdigest・購読参照・state・時刻。本文なし） | Firestore `sttdDelivery` | 24時間で利用不可 |
+| 本文 | 要求処理中のRAM | 要求の終了・期限まで |
+
+期限切れデータの物理削除処理は含まれていません（[LIMITATIONS.md](LIMITATIONS.md)）。
+
+保存root・KMS封緘の形式（capsule prefix・format・AADのdomain）・OAuth scopeは0.2.0で導入した値を0.3.0でも使い、0.2.0より前の版のデータやtokenを読み替える・受け入れる経路はありません。封緘の開封はformat・domain・保存位置が一致した場合だけ成功し、所有・期限・署名・単回配送・認可の検査は変わりません。0.3.0は送信API・Eventsの契約が0.2.0と非互換で（v2・`schemaVersion` 2・`text.submitted`。旧v1・旧項目・旧イベント名は拒否）、保存形式の識別子が同じでも0.2.0のデータを引き継ぐ移行は提供・確認していないため、新規導入として配置してください（[INSTALL.md](INSTALL.md#030の互換性)）。
+
+## 認可と秘密
+
+- API・購読・照会・取消はtoken由来のownerを強制し、入力のownerIdを信用しません。Firebase ID token・MCPのOAuth token・Webhook secretを相互に流用しません。
+- 長期の保護はCloud KMSの直接暗号化で、AADへ用途・recordId・owner等を束縛し、開封ごとに期待AADを作り直します。
+- 4用途の固定秘密（署名JWKS・cookie鍵・識別子HMAC鍵・digest鍵）はSecret Managerの数値版を起動時に1回だけ読み、用途間で流用しません。
+- 鍵・秘密・tokenの値をログ・応答・例外へ出しません。起動失敗の記録は固定のstage/codeと値を含まない整数maskだけです。
+- 配置設定は1 moduleに固定し、未設定・不整合ならSDK生成・資格・DB・外部HTTPの前に拒否します。資格・宛先・TLS・proxy・emulatorを変え得る環境変数があれば起動しません（[CONFIGURATION.md](CONFIGURATION.md)）。
+
+<a id="mcp-oauth"></a>
+
+## MCP/OAuth認証
+
+- `oidc-provider` 9.12.2の固定profile（https issuer、resource `<issuer>/mcp`、scope `sttd:events` だけ）。PKCE S256・redirect・resource・scopeの一致を要求し、認可コードは単回です。
+- 新しい認可は毎回、接続Webで本人（Firebase ID token検証済み）が明示同意します。同意は同ownerと元のinteraction・CSRFへ単回で束縛します。
+- clientはCIMDで許可した1件だけ（client_id・redirect・JWKS URLの完全一致、`private_key_jwt`）。client assertionはclient_idとjtiの組を単回予約します。
+- access tokenは15分のopaque Bearer。refreshは単回回転・再使用検知で同Grantを失効させます。購読はGrantへ束縛し、Grant失効後は配送しません。
+
+<a id="safe-https-egress"></a>
+
+## 安全なHTTPS送出
+
+callbackの検証・配送・CIMD取得は共通の送出部品を使います。
+
+- HTTPSの443だけ。userinfo・fragment・空白・制御文字・backslashを拒否。
+- DNSの全回答IPを検証し、localhost・private・link-local・予約・metadata・IANA特殊用途範囲（Globally Reachableでも保守的に拒否、根拠は `references/`）、mapped・変換・zone・非正規表記を拒否します。検証したIPへ固定して接続し、hostnameでTLSを照合します。
+- 期限は最大10秒、応答本文は8192 byteまで。redirectを追わず、圧縮応答を拒否し、呼出し元のheader・秘密を転送しません。
+- 失敗は固定分類だけを返し、URL・IP・元例外を出しません。
+
+## 主な脅威と対応
+
+| 脅威 | 対応 |
+| --- | --- |
+| 他ユーザーへの誤配送 | token→owner→唯一の購読を固定し、送出権のtransactionで最新を再検査 |
+| 二重配送 | owner当たり有効な購読は1つ、置換は本人承認。owner＋commandIdの単回送出、自動再送なし |
+| 古い指示 | 60秒の寿命、送出前の期限確認、キュー・履歴再生なし |
+| SSRF / DNS rebinding | 上記の安全な送出 |
+| 秘密の漏えい | KMS封緘・Secret Manager・ログ禁止 |
+| プロンプト注入 | 本文は利用者のデータとして運び、serverの指示文を混ぜない |
+| 大量送信・費用 | ownerの件数枠・本文上限・Functionsのmax instance/concurrency。全体の費用上限・停止は導入者の運用 |
+
+## 脆弱性の報告
+
+公開repositoryのsecurity報告の受付方法は公開時に定めます。それまでは公開issueへ秘密・実データ・tokenを書かないでください。

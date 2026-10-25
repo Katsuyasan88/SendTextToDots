@@ -1,0 +1,11 @@
+rules_version = '2';
+
+// SendTextToDots: deny-all. Access is server-only through IAM plus the service's owner/Grant checks.
+// Client apps and Dots never read or write Firestore directly.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

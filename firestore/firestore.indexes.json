@@ -1,0 +1,30 @@
+{
+  "indexes": [],
+  "fieldOverrides": [
+    {
+      "collectionGroup": "oidc",
+      "fieldPath": "sealed",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "owners",
+      "fieldPath": "sealedUid",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "fieldPath": "active.sealedUrl",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "fieldPath": "active.sealedSecret",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "fieldPath": "active.previousSecret.sealed",
+      "indexes": []
+    }
+  ]
+}
