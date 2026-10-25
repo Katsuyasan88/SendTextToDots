@@ -13,6 +13,10 @@
 //   - 言語はサーバーが選んだ初期言語（HTMLのlang・本文）で始まり、English/日本語の明示選択は画面内で文言を差し替え、表示専用のsession cookie
 //     `sttd_language`をbrowserで同期に設定する（固定en/ja・サーバーと同じ固定属性。応答順序に依存せず最後の選択が残る。他cookieは読まない。
 //     navigation・form送信・ログイン・解除・送信・追加HTTPを起こさない）。送信中・処理中は切替を受けない。`?lang=`のGETリンクはJSなし時のfallback。
+//   - 接続欄の下に受信Dotsの設定案内（テスト用指示文→送信テスト→運用用指示文）を置く。指示文は辞書の固定文（docs/DOTS_GUIDE*.mdのcode blockと同文）で、
+//     表示（手動コピー可）と、本人のクリックでnavigator.clipboard.writeTextへ固定文だけを書くボタン。clipboardの読取り・permission要求・利用者本文/token/設定値の
+//     書込みは無く、未対応/失敗では成功を装わず手動コピーを案内する。コピーでHTTP/ログイン/同意/購読/解除/送信を始めず、本文欄のpresetにもしない。
+//     段階の完了（Dots側の本文一致・運用切替）は利用者がDotsで確認し、画面は自動判定・保存しない。
 //   - HTML・JS・CSSは固定文字列で、inline script/style・実filesystem読取り・新framework・新依存は無い。動的な値はdata属性へescape、表示はtextContent。
 //   - apiOriginとweb configは信頼する呼出元（connect/kms-server.ts）だけが渡す。利用者・argv・envから任意originを選ばせない。
 // 各要求の元期限（POST 25秒・中止5秒・同ID確認10秒）に認証取得を含め、期限後のtokenで通信を始めない。
@@ -144,6 +148,22 @@ export function renderConsolePage(web: FirebaseWebConfig, apiOrigin: string, lan
 </div>
 <p id="sttd-disconnect-result" role="status"></p>
 </section>
+<section id="sttd-guide" aria-labelledby="sttd-guide-title">
+<h2 id="sttd-guide-title"${i18n('guide.title')}>${t('guide.title')}</h2>
+<p id="sttd-guide-intro"${i18n('guide.intro')}>${t('guide.intro')}</p>
+<ol class="sttd-steps">
+<li id="sttd-guide-step1"${i18n('guide.step1')}>${t('guide.step1')}</li>
+<li id="sttd-guide-step2"${i18n('guide.step2')}>${t('guide.step2')}</li>
+<li id="sttd-guide-step3"${i18n('guide.step3')}>${t('guide.step3')}</li>
+</ol>
+<h3 id="sttd-guide-test-title"${i18n('guide.step1')}>${t('guide.step1')}</h3>
+<pre id="sttd-guide-test-text" class="sttd-instructions" tabindex="0"${i18n('guide.testText')}>${t('guide.testText')}</pre>
+<button type="button" id="sttd-copy-test"${i18n('guide.copyTest')}>${t('guide.copyTest')}</button>
+<h3 id="sttd-guide-operation-title"${i18n('guide.step3')}>${t('guide.step3')}</h3>
+<pre id="sttd-guide-operation-text" class="sttd-instructions" tabindex="0"${i18n('guide.operationText')}>${t('guide.operationText')}</pre>
+<button type="button" id="sttd-copy-operation"${i18n('guide.copyOperation')}>${t('guide.copyOperation')}</button>
+<p id="sttd-copy-result" role="status"></p>
+</section>
 <section id="sttd-send-section" aria-labelledby="sttd-send-title">
 <h2 id="sttd-send-title"${i18n('console.send')}>${t('console.send')}</h2>
 <label id="sttd-text-label" for="sttd-text"${i18n('console.textLabel')}>${t('console.textLabel')}</label>
@@ -180,6 +200,10 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-language a[aria-current="true"] { font-weight: 700; text-decoration: none; color: #1d1f23; }
 .sttd-language a[aria-disabled="true"] { color: #5b616b; pointer-events: none; }
 .sttd-actions { display: flex; flex-wrap: wrap; }
+.sttd-steps { padding-left: 1.25rem; margin: 0.5rem 0; }
+.sttd-steps li { margin: 0.25rem 0; }
+h3 { font-size: 0.95rem; margin: 1rem 0 0.25rem; }
+.sttd-instructions { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; background: #f5f6f8; border: 1px solid #d9dce1; border-radius: 6px; padding: 0.75rem; margin: 0; }
 #sttd-result, #sttd-disconnect-result { font-weight: 600; min-height: 1.5em; overflow-wrap: anywhere; }
 .sttd-note { font-size: 0.85rem; color: #4a5059; }
 [hidden] { display: none !important; }
@@ -228,6 +252,8 @@ let connectionSeq = 0;
 let confirming = false;
 let disconnectKey = '';
 let disconnected = false;
+// 指示文コピーの結果（固定キー）。
+let copyKey = '';
 
 function phaseOf(current) {
   if (current.state !== null && TERMINAL.includes(current.state)) return 'settled';
@@ -272,6 +298,7 @@ function render() {
   el('sttd-disconnect-yes').disabled = busy();
   el('sttd-disconnect-no').disabled = busy();
   el('sttd-disconnect-result').textContent = T(disconnectKey);
+  el('sttd-copy-result').textContent = T(copyKey);
   el('sttd-text').disabled = !sendable || test !== null;
   el('sttd-send').disabled = !sendable || test !== null;
   el('sttd-cancel').hidden = test === null || (phase !== 'sending' && phase !== 'unknown') || test.cancel === 'answered' || test.cancel === 'unconfirmed';
@@ -613,7 +640,41 @@ function disconnect() {
   });
 }
 
+/**
+ * 受信Dots向けの固定指示文（辞書のtestText/operationText）を、本人のクリック時だけclipboardへ書く。固定文以外（利用者本文・token・設定値）は
+ * 書かず、clipboardを読まず、permissionを要求せず、HTTP・ログイン・同意・解除・送信を始めない。未対応・失敗は手動コピーの案内。
+ */
+function copyInstructions(kind) {
+  const key = kind === 'operation' ? 'guide.operationText' : 'guide.testText';
+  const text = T(key);
+  const clipboard = typeof navigator === 'object' && navigator !== null ? navigator.clipboard : undefined;
+  if (!clipboard || typeof clipboard.writeText !== 'function') {
+    copyKey = 'guide.copyUnavailable';
+    return render();
+  }
+  copyKey = '';
+  render();
+  let pending;
+  try {
+    pending = Promise.resolve(clipboard.writeText(text));
+  } catch {
+    pending = Promise.reject(new Error('copy_failed'));
+  }
+  return pending.then(
+    () => {
+      copyKey = 'guide.copied';
+      render();
+    },
+    () => {
+      copyKey = 'guide.copyFailed';
+      render();
+    },
+  );
+}
+
 async function start() {
+  el('sttd-copy-test').onclick = () => copyInstructions('test');
+  el('sttd-copy-operation').onclick = () => copyInstructions('operation');
   el('sttd-login').onclick = () => login(false);
   el('sttd-switch').onclick = () => login(true);
   el('sttd-refresh').onclick = () => manualRefresh();

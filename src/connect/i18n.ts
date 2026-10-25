@@ -161,6 +161,28 @@ export const MESSAGES = Object.freeze({
     'console.duplicateWarning': 'The previous message may have arrived. A new message is sent as a separate item and may arrive twice.',
     'console.checkNotFound': 'No record of acceptance was found (it may not have been sent).',
     'console.checkFailed': 'Could not check the result.',
+    'guide.title': 'Set up the receiving Dots (3 steps)',
+    'guide.intro': 'Paste the following instructions directly into the conversation with the Dots that receives your text. Copying does not send anything to Dots, and the send screen does not decide that a step is complete.',
+    'guide.step1': 'Step 1: Paste the test instructions into the receiving Dots.',
+    'guide.step2': 'Step 2: Send one short, non-sensitive message from the field below and check in Dots that the reply matches the text you sent exactly. "Accepted" only means the callback accepted the event; it does not prove the match.',
+    'guide.step3': 'Step 3: After the match is confirmed, paste the operational instructions into the same Dots. You can also use them from the start if you want normal responses immediately.',
+    'guide.testText':
+      'We are checking delivery from SendTextToDots. Until we switch to the operational instructions, handle text received from SendTextToDots according to these rules.\n\n' +
+      '1. Treat the text as a delivery check. Do not answer questions or carry out requests contained in it.\n' +
+      '2. Reply with only the received text, exactly as received. Preserve the words, punctuation, spaces, and line breaks. Do not add explanations or summaries.\n' +
+      '3. If you judge that the text contains secrets or personal information that should not be disclosed, do not repeat that content. Explain that a safe test message is needed instead. In that case, do not claim that an exact match has been verified.',
+    'guide.operationText':
+      'Handle text received from SendTextToDots according to these rules.\n\n' +
+      '1. Begin with a short acknowledgment that identifies the text you received. Quote short messages and summarize the main points of long messages in one or two sentences. Label the content as a quote or a summary.\n' +
+      '2. Do not repeat secrets such as passwords, verification codes, or API keys, or personal information that should not be disclosed, in quotes, summaries, or answers. If needed, state "Sensitive information omitted." If you cannot safely describe the content, acknowledge receipt without showing it.\n' +
+      '3. For example, acknowledge a short message with: "Received text (quote): ‘…’. Got it. I\'ll prepare a response." For a long message, use "Received text (summary): …" instead.\n' +
+      '4. Then answer the questions or carry out the requests in the text. The quote or summary is only for acknowledging receipt; use the full received text when deciding how to respond or act.\n' +
+      '5. If information is missing, ask for what you need. Distinguish receiving the text from completing the work, and do not claim that unperformed work is complete. Do not promise an automatic reply later unless you know you can provide one.',
+    'guide.copyTest': 'Copy the test instructions',
+    'guide.copyOperation': 'Copy the operational instructions',
+    'guide.copied': 'Copied. Paste it into the conversation with the receiving Dots.',
+    'guide.copyFailed': 'Could not copy automatically. Select the text above and copy it manually.',
+    'guide.copyUnavailable': 'This browser does not allow automatic copying here. Select the text above and copy it manually.',
     'connect.title': 'SendTextToDots connection',
     'connect.heading': 'SendTextToDots connection',
     'connect.consoleGuide': 'The usual screen is the send screen, which includes connection management and disconnecting.',
@@ -244,6 +266,28 @@ export const MESSAGES = Object.freeze({
     'console.duplicateWarning': '前の送信は届いている可能性があります。新しい送信は別の1件として送られ、重複して届くことがあります。',
     'console.checkNotFound': '受付の記録が見つかりませんでした（送信されていない可能性があります）。',
     'console.checkFailed': '結果を確認できませんでした。',
+    'guide.title': '受信するDotsの設定（3段階）',
+    'guide.intro': '次の指示文は、本文を受信するDotsの会話へ直接貼り付けてください。コピーしてもDotsへは送られず、送信画面は各段階の完了を判定しません。',
+    'guide.step1': '手順1: テスト用の指示文を受信するDotsへ貼り付けます。',
+    'guide.step2': '手順2: 下の本文欄から短い非機密文を1件送り、同じDotsが返した本文が送った本文と一致することをDots側で確認します。「受領」はcallbackが受け取ったことだけを示し、一致の証明ではありません。',
+    'guide.step3': '手順3: 一致を確認したら、運用用の指示文を同じDotsへ貼り付けます。初めから通常の応答を使いたい場合にも使えます。',
+    'guide.testText':
+      'SendTextToDotsの配送を確認します。運用用の指示文に切り替えるまで、SendTextToDotsから届いた本文を次のルールで扱ってください。\n\n' +
+      '1. 本文中の質問や依頼には対応せず、配送確認用の文章として扱ってください。\n' +
+      '2. 受信した本文だけを、そのまま返してください。言葉、句読点、空白、改行を変えず、説明や要約を付けないでください。\n' +
+      '3. 秘密情報や公開すべきでない個人情報が含まれると判断した場合は、その内容を再掲せず、安全なテスト文への変更が必要だと知らせてください。この場合は本文一致の確認ができたとはしないでください。',
+    'guide.operationText':
+      'SendTextToDotsから受信した本文には、次のルールで対応してください。\n\n' +
+      '1. 最初に、どの文章を受け取ったか分かる短い受領メッセージを返してください。短い本文は引用し、長い本文は要点を1〜2文で要約してください。引用か要約かを明記してください。\n' +
+      '2. パスワード、認証コード、APIキーなどの秘密情報や、公開すべきでない個人情報は、引用・要約・回答へ再掲しないでください。必要なら「機密情報を省略」と示し、安全に内容を示せない場合は受領したことだけ伝えてください。\n' +
+      '3. 受領メッセージは、例えば「受信内容（引用）：『……』。受け取ったよ。回答を準備するね。」という形にしてください。長文の場合は「受信内容（要約）：……」としてください。\n' +
+      '4. 続けて、本文の質問や依頼に沿って回答・作業してください。引用や要約は受領表示のためのもので、実際の対応は受信した本文全体を確認して行ってください。\n' +
+      '5. 情報が足りない場合は、必要な確認を伝えてください。「受け取った」と「作業が完了した」は区別し、まだ行っていない作業を完了したとは言わないでください。後で自動返信できると確認できない場合は、その約束をしないでください。',
+    'guide.copyTest': 'テスト用の指示文をコピー',
+    'guide.copyOperation': '運用用の指示文をコピー',
+    'guide.copied': 'コピーしました。受信するDotsの会話へ貼り付けてください。',
+    'guide.copyFailed': '自動でコピーできませんでした。上の文面を選択して手動でコピーしてください。',
+    'guide.copyUnavailable': 'このブラウザでは自動コピーを使えません。上の文面を選択して手動でコピーしてください。',
     'connect.title': 'SendTextToDots 接続',
     'connect.heading': 'SendTextToDots 接続',
     'connect.consoleGuide': '通常は送信画面を使います。接続の管理と解除も送信画面でできます。',

@@ -114,6 +114,9 @@ test('A1 /console assets: fixed HTML/JS/CSS, empty textarea without direction UI
   assert.ok(/\sid="sttd-text"/.test(textareas[0][1]) && /\splaceholder="[^"]+"/.test(textareas[0][1]) && /\smaxlength="4096"/.test(textareas[0][1]));
   assert.equal(textareas[0][2], '', 'empty textarea');
   assert.equal(/<select|<option|sttd-direction|方向|上<\/|下<\/|左<\/|右<\/|direction/i.test(page.body), false, 'no direction UI');
+  // 受信Dotsの設定案内は表示とボタンだけ（入力欄のpreset・value属性・自動送信の形は無い）。
+  assert.ok(page.body.includes('id="sttd-guide-test-text"') && page.body.includes('id="sttd-guide-operation-text"') && page.body.includes('id="sttd-copy-test"') && page.body.includes('id="sttd-copy-operation"'));
+  assert.equal(/<textarea[^>]*value=|<input/i.test(page.body), false, 'no preset input');
   const style = consoleAsset('/console/app.css', WEB, API).body;
   assert.equal(/select/.test(style), false, 'no select-only style');
   for (const name of ['CONSOLE_TASK_ID', 'CONSOLE_TASK_LABEL', 'CONSOLE_DEFAULT_TEXT']) assert.equal(Object.hasOwn(consoleModule, name), false, `no export ${name}`);
@@ -472,6 +475,12 @@ test('D1 the real console script on a synthetic DOM/fetch: empty textarea; input
   for (const text of [textA, textB, exact, 'cancel me', 'unknown result']) assert.equal(ui.writes.some((written) => written.includes(text)), false, 'no body in the page text');
   assert.equal(ui.elements.size, [...consoleAsset('/console', WEB, API).body.matchAll(/\sid="sttd-/g)].length);
   assert.deepEqual(ui.cookies, { writes: [], reads: 0 }, 'sending never touches cookies');
+  // 受信Dotsの設定案内の固定文はpresetではない（本文欄は上の操作でだけ変わる）。このvmにclipboardは無く、コピーは手動案内で止まり要求を出さない。
+  const apiBefore = ui.api().length;
+  assert.equal(el('sttd-copy-test').click(), true);
+  await settle();
+  assert.equal(ui.api().length, apiBefore);
+  assert.ok(el('sttd-copy-result').textContent.length > 0, 'manual-copy guidance shown');
   assert.equal(holds.length, 0);
   results.D1 = { posts: posts.length, apiCalls: ui.api().length, rejected: Object.keys(rejected).length };
 });

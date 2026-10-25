@@ -289,7 +289,7 @@ function domFromHtml(html) {
  * CONSOLE_SCRIPTを合成のSDK・fetchで実行する。同originのfetchはonSame(entry)、API originへのfetchはonApi(entry)が返す応答
  * （{status, json}かthrowするPromise）。tokenの取得はhooks.token()で差し替えられる（期限切れの合成）。
  */
-async function runConsole(language, { onApi, onSame, token }) {
+async function runConsole(language, { onApi, onSame, token, navigator }) {
   const html = consoleAsset('/console', WEB, API, language).body;
   const dom = domFromHtml(html);
   let source = CONSOLE_SCRIPT;
@@ -344,7 +344,9 @@ async function runConsole(language, { onApi, onSame, token }) {
       text: async () => bodyText ?? '',
     };
   };
-  const context = vm.createContext({ document: dom.document, fetch, crypto: { randomUUID }, TextEncoder, setTimeout, clearTimeout, AbortController, __sdk: sdk });
+  const globals = { document: dom.document, fetch, crypto: { randomUUID }, TextEncoder, setTimeout, clearTimeout, AbortController, __sdk: sdk };
+  if (navigator !== undefined) globals.navigator = navigator;
+  const context = vm.createContext(globals);
   await vm.runInContext(`(async () => {\n${source}\n})()`, context, { filename: 'console-app.js' });
   await settle();
   const same = (path) => fetches.filter((entry) => entry.url === path || entry.url.startsWith(`${path}?`));
@@ -585,4 +587,108 @@ test('L6 disconnect in the real console script: confirm first (no request), canc
   assert.deepEqual([ui.cookies.writes, ui.cookies.reads], [[], 0], 'disconnecting never touches cookies');
   assert.equal(holds.length, 0);
   results.L6 = { disconnects: disconnects().length, connections: connections().length };
+});
+
+test('L7 Dots guide in the real console script: both fixed instruction texts are shown in the selected language and follow a switch; a copy click writes exactly the fixed text of the current language to the clipboard once (nothing read, no permission, no HTTP, no send, textarea untouched); a rejected write or a missing clipboard shows the manual-copy fallback instead of success; delivered never marks a step complete', { timeout: 20_000 }, async () => {
+  const clipboard = { writes: [], reads: 0, mode: 'ok' };
+  const navigator = {
+    clipboard: {
+      writeText: (value) => {
+        clipboard.writes.push(value);
+        return clipboard.mode === 'ok' ? Promise.resolve() : Promise.reject(new Error('synthetic NotAllowedError'));
+      },
+      readText: () => {
+        clipboard.reads += 1;
+        return Promise.resolve('');
+      },
+    },
+    permissions: {
+      query: () => {
+        throw new Error('permission query must not be used');
+      },
+    },
+  };
+  const ui = await runConsole('ja', {
+    navigator,
+    onApi: async (entry) => ({ status: 200, json: { commandId: JSON.parse(entry.body).commandId, state: 'delivered' } }),
+    onSame: async (entry) => {
+      if (entry.url === '/v1/web/connection') return { status: 200, json: { state: 'subscribed' } };
+      throw new Error(`unexpected same-origin request ${entry.url}`);
+    },
+  });
+  const { el } = ui;
+  // 表示: 辞書の固定文（docsのcode blockと同文であることはPMが文書照合）。textareaはpresetされず空。
+  assert.equal(el('sttd-guide-test-text').textContent, JA('guide.testText'));
+  assert.equal(el('sttd-guide-operation-text').textContent, JA('guide.operationText'));
+  assert.equal(el('sttd-text').value, '', 'no preset text');
+  assert.ok(JA('guide.testText').includes('\n\n1. ') && JA('guide.operationText').includes('\n5. '), 'multi-line instruction texts');
+  assert.equal(el('sttd-copy-result').textContent, '');
+  const fetchesBefore = ui.fetches.length;
+
+  // テスト用をコピー: 固定文だけを1回書く。読取り/permission/HTTP/送信 0。入力中の本文は変えない。
+  el('sttd-text').value = 'my draft';
+  assert.equal(el('sttd-copy-test').click(), true);
+  await settle();
+  assert.deepEqual(clipboard.writes, [JA('guide.testText')]);
+  assert.equal(el('sttd-copy-result').textContent, JA('guide.copied'));
+  assert.deepEqual([clipboard.reads, ui.fetches.length, ui.api().length, el('sttd-text').value], [0, fetchesBefore, 0, 'my draft']);
+  assert.equal(el('sttd-send').disabled, false, 'copying does not change the send state');
+
+  // 言語切替後は表示とコピー内容が英語で一致する。
+  assert.equal(el('sttd-lang-en').click(), true);
+  await settle();
+  assert.equal(el('sttd-guide-test-text').textContent, EN('guide.testText'));
+  assert.equal(el('sttd-guide-operation-text').textContent, EN('guide.operationText'));
+  assert.equal(el('sttd-copy-result').textContent, EN('guide.copied'), 'the status line follows the language');
+  assert.equal(el('sttd-copy-operation').click(), true);
+  await settle();
+  assert.deepEqual(clipboard.writes, [JA('guide.testText'), EN('guide.operationText')]);
+  assert.equal(el('sttd-copy-result').textContent, EN('guide.copied'));
+
+  // 書込みの拒否: 成功を装わず手動コピーの案内。
+  clipboard.mode = 'reject';
+  el('sttd-copy-test').click();
+  await settle();
+  assert.equal(clipboard.writes.length, 3);
+  assert.equal(el('sttd-copy-result').textContent, EN('guide.copyFailed'));
+  assert.equal(el('sttd-guide-test-text').textContent, EN('guide.testText'), 'the text stays visible for manual copy');
+
+  // 送信してdeliveredになっても、段階の完了・本文一致を自動表示しない（結果欄は配送状態だけ）。
+  el('sttd-text').value = 'short test';
+  const writesBefore = ui.writes.length;
+  assert.equal(el('sttd-send').click(), true);
+  await settle();
+  assert.equal(el('sttd-result').textContent, EN('console.state.delivered'));
+  // 送信で書かれる画面文は配送状態・account/接続状態・既存のコピー結果だけ（段階完了・本文一致・切替済みを示す新しい文は無い）。
+  const allowed = new Set(['', EN('console.accountSignedIn'), EN('console.state.subscribed'), EN('guide.copyFailed'), EN('console.sending'), EN('console.state.delivered')]);
+  const unexpected = ui.writes.slice(writesBefore).filter((written) => !allowed.has(written));
+  assert.deepEqual(unexpected, [], 'no automatic step-complete or match message');
+  assert.equal(ui.api().length, 1, 'one POST, started only by the send button');
+  assert.equal(clipboard.writes.length, 3, 'sending copies nothing');
+  for (const written of clipboard.writes) assert.equal(written.includes('short test') || written.includes('my draft') || written.includes('synthetic-id-token'), false, 'only the fixed instructions reach the clipboard');
+  results.L7 = { clipboardWrites: clipboard.writes.length, clipboardReads: clipboard.reads, apiCalls: ui.api().length };
+});
+
+test('L8 Dots guide without a clipboard API: the copy button does not throw, shows the manual-copy guidance, writes nothing and starts no request', { timeout: 20_000 }, async () => {
+  const ui = await runConsole('en', {
+    onApi: async () => {
+      throw new Error('no API request expected');
+    },
+    onSame: async (entry) => {
+      if (entry.url === '/v1/web/connection') return { status: 200, json: { state: 'linked' } };
+      throw new Error(`unexpected same-origin request ${entry.url}`);
+    },
+  });
+  const { el } = ui;
+  const fetchesBefore = ui.fetches.length;
+  assert.equal(el('sttd-copy-operation').click(), true);
+  await settle();
+  assert.equal(el('sttd-copy-result').textContent, EN('guide.copyUnavailable'));
+  assert.equal(el('sttd-guide-operation-text').textContent, EN('guide.operationText'));
+  assert.equal(ui.fetches.length, fetchesBefore);
+  assert.equal(el('sttd-send').disabled, true, 'linked (not subscribed): still not sendable; the guide changes no state');
+  assert.equal(el('sttd-lang-ja').click(), true);
+  await settle();
+  assert.equal(el('sttd-copy-result').textContent, JA('guide.copyUnavailable'));
+  assert.equal(el('sttd-guide-test-text').textContent, JA('guide.testText'));
 });
