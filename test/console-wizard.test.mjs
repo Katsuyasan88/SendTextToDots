@@ -618,6 +618,58 @@ test('W9 stale copy results: a clipboard write that completes after a reset (sig
   results.W9 = { clipboardWrites: clipboard.writes.length };
 });
 
+test('W10 click propagation: a completion click inside the active panel moves to the next step and the bubbling click does not re-select the old panel; the first click into an inactive panel (even on a control or summary) only re-selects it and runs no control; locked panels ignore clicks and keys and their details stay closed; Enter/Space re-selects a done panel', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk();
+  const { clipboard, navigator } = clipboardStub();
+  const { onFetch } = helper();
+  const ui = await runConsole({ html: html('en'), onFetch, sdk, navigator });
+  const { el } = ui;
+  // 未解放panel内のsummary/ボタンへのclick・keyは再選択も操作も起こさず、detailsも開かない。
+  assert.equal(el('sttd-guide-operation-summary').click(), true, 'the event is dispatched (pointer target is the summary in this synthetic check)');
+  assert.equal(el('sttd-guide-operation').open, false, 'locked details stay closed');
+  el('sttd-guide-operation-summary').keydown('Enter');
+  assert.equal(el('sttd-guide-operation').open, false);
+  assert.deepEqual([ui.panelState(5), clipboard.writes.length, ui.fetches.length], ['locked', 0, 0]);
+  await reachStep3(ui, sdk);
+  // activeなpanel3内の「貼り付けて次へ」: 同じclickが親panelへ伝播しても手順4がcurrentのまま。
+  el('sttd-copy-test').click();
+  await settle();
+  assert.equal(el('sttd-done-test').parent.id, 'sttd-panel-3', 'the fixture models the panel as the ancestor of its controls');
+  assert.equal(el('sttd-done-test').click(), true);
+  await settle();
+  assert.deepEqual([ui.panelState(3), ui.panelState(4)], ['done', 'current'], 'the completion click is not followed by a re-selection of step 3');
+  // 非active（done）のpanel3内のcontrolへの最初のclickは再選択だけ（コピーは実行されない）。
+  const writesBefore = clipboard.writes.length;
+  el('sttd-copy-test').disabled = false; // pointer-events:none相当のCSSは合成DOMに無いので、controlがtargetになった最悪形を再現する。
+  assert.equal(el('sttd-copy-test').click(), true);
+  await settle();
+  assert.deepEqual([ui.panelState(3), ui.panelState(4), clipboard.writes.length], ['current', 'ready', writesBefore], 're-selection only; the control did not run');
+  // 次のclickは通常どおり動く（activeになったので）。
+  el('sttd-copy-test').click();
+  await settle();
+  assert.equal(clipboard.writes.length, writesBefore + 1);
+  // 4へ戻り送信→一致確認のclickも伝播で戻らない。
+  assert.equal(ui.clickPanel(4), true);
+  el('sttd-text').value = 'propagation check';
+  el('sttd-send').click();
+  await settle();
+  assert.equal(el('sttd-verify-send').click(), true);
+  await settle();
+  assert.deepEqual([ui.panelState(4), ui.panelState(5)], ['done', 'current'], 'the verification click does not fall back to step 4');
+  // done panelの余白へのEnter/Spaceで再選択（preventDefaultされる）。activeなpanelへのEnterは何もしない。
+  assert.equal(ui.keyPanel(4, ' '), true);
+  assert.equal(ui.panelState(4), 'current');
+  assert.equal(ui.keyPanel(4, 'Enter'), false, 'already active: no default prevented, nothing changes');
+  assert.equal(ui.panelState(4), 'current');
+  // 非active（ready）panel5のsummaryをclick → 再選択だけでdetailsは開かない。次のclickで開く。
+  assert.equal(el('sttd-guide-operation-summary').click(), true);
+  assert.deepEqual([ui.panelState(5), el('sttd-guide-operation').open], ['current', false]);
+  el('sttd-guide-operation-summary').click();
+  assert.equal(el('sttd-guide-operation').open, true, 'the summary works once its panel is active');
+  assert.equal(ui.api().filter((entry) => entry.method === 'POST' && entry.url === '/v2/commands').length, 1, 'no extra send from any of the clicks');
+  results.W10 = { clipboardWrites: clipboard.writes.length };
+});
+
 test('W7 disconnect from step 2: confirm first, one POST, steps 2+ reset and the state re-checked; nothing sent on cancel', { timeout: 20_000 }, async () => {
   const sdk = syntheticSdk();
   const { navigator } = clipboardStub();

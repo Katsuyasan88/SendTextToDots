@@ -27,9 +27,60 @@ export function gate() {
   return { promise, release: (value) => release(value), fail: (error) => fail(error) };
 }
 
+/**
+ * 実browserのイベント経路（capture: 祖先→target、target、bubble: target→祖先）を最小限に再現する。
+ * 祖先は、要素を含む`<section id="sttd-panel-N">`と、summary/preを含む`<details>`だけ（それ以外の入れ子は不要）。
+ */
+function dispatch(elements, target, type, init = {}) {
+  const path = [];
+  for (let node = target.parent; node; node = node.parent) path.unshift(node);
+  const event = {
+    type,
+    target,
+    key: init.key,
+    defaultPrevented: false,
+    propagationStopped: false,
+    preventDefault() {
+      this.defaultPrevented = true;
+    },
+    stopPropagation() {
+      this.propagationStopped = true;
+    },
+  };
+  const run = (node, phase) => {
+    for (const listener of node.listeners[type]?.[phase] ?? []) {
+      if (event.propagationStopped) return;
+      listener(event);
+    }
+  };
+  for (const node of path) {
+    if (event.propagationStopped) break;
+    run(node, 'capture');
+  }
+  if (!event.propagationStopped) {
+    run(target, 'capture');
+    if (type === 'click' && typeof target.onclick === 'function' && !event.propagationStopped) target.onclick(event);
+    if (type === 'keydown' && typeof target.onkeydown === 'function' && !event.propagationStopped) target.onkeydown(event);
+    run(target, 'bubble');
+  }
+  for (const node of [...path].reverse()) {
+    if (event.propagationStopped) break;
+    run(node, 'bubble');
+  }
+  // summaryの既定動作: 親detailsの開閉（preventDefaultされなければ）。
+  if (type === 'click' && target.tag === 'summary' && !event.defaultPrevented && target.parent?.tag === 'details') target.parent.open = !target.parent.open;
+  return event;
+}
+
 export function domFromHtml(html) {
   const elements = new Map();
   const writes = [];
+  /** 要素の位置から包含するpanel/detailsを決めるための範囲表。 */
+  const ranges = [];
+  for (const match of html.matchAll(/<(section|details)\b[^>]*\sid="(sttd-[^"]+)"[^>]*>/g)) {
+    const close = html.indexOf(`</${match[1]}>`, match.index);
+    ranges.push({ id: match[2], tag: match[1], start: match.index, end: close });
+  }
   for (const match of html.matchAll(/<(\w+)\b([^>]*\sid="(sttd-[^"]+)"[^>]*)>/g)) {
     const [, tag, attrs, id] = match;
     const after = match.index + match[0].length;
@@ -45,11 +96,20 @@ export function domFromHtml(html) {
       tag,
       hidden: /\shidden(\s|$)/.test(attrs),
       disabled: /\sdisabled(\s|$)/.test(attrs),
+      open: /\sopen(\s|$)/.test(attrs),
       value: initial,
       placeholder: attributes.placeholder ?? '',
       dataset,
       onclick: null,
       onkeydown: null,
+      parent: null,
+      position: match.index,
+      listeners: {},
+      addEventListener(type, listener, options) {
+        const capture = options === true || (typeof options === 'object' && options !== null && options.capture === true);
+        this.listeners[type] ??= { capture: [], bubble: [] };
+        this.listeners[type][capture ? 'capture' : 'bubble'].push(listener);
+      },
       get textContent() {
         return textContent;
       },
@@ -63,15 +123,31 @@ export function domFromHtml(html) {
       getAttribute(name) {
         return attributes[name] ?? null;
       },
-      /** browserと同じく、disabled・hiddenの要素はclickを処理しない。リンクはpreventDefaultの有無を返す。 */
+      /**
+       * browserと同じく、disabled・hiddenの要素はclickイベントを起こさない。起こす場合は実際の経路（祖先のcapture→target→bubble）で配送する。
+       * 戻り値: リンクはpreventDefaultの有無、それ以外はイベントが配送されたか。
+       */
       click() {
-        if (this.disabled || this.hidden || typeof this.onclick !== 'function') return false;
-        let prevented = false;
-        this.onclick({ preventDefault: () => (prevented = true) });
-        return tag === 'a' ? prevented : true;
+        if (this.disabled || this.hidden) return false;
+        const event = dispatch(elements, this, 'click');
+        return tag === 'a' ? event.defaultPrevented : true;
+      },
+      /** keydownを実際の経路で配送する。戻り値はdefaultPrevented。 */
+      keydown(key) {
+        if (this.hidden) return false;
+        return dispatch(elements, this, 'keydown', { key }).defaultPrevented;
       },
     };
     elements.set(id, element);
+  }
+  // 包含関係（panel/details）を親として結ぶ。最も内側の範囲を親にする。
+  for (const element of elements.values()) {
+    let parent = null;
+    for (const range of ranges) {
+      if (range.id === element.id || element.position <= range.start || element.position >= range.end) continue;
+      if (parent === null || range.start > parent.start) parent = range;
+    }
+    element.parent = parent === null ? null : elements.get(parent.id);
   }
   const bodyAttrs = /<body([^>]*)>/.exec(html)[1];
   const dataset = {};
@@ -198,13 +274,9 @@ export async function runConsole({ html, onFetch, sdk, navigator }) {
   const web = (path) => fetches.filter((entry) => entry.url === path);
   const stepState = (n) => dom.elements.get(`sttd-step-${n}`).getAttribute('data-sttd-state');
   const panelState = (n) => dom.elements.get(`sttd-panel-${n}`).getAttribute('data-sttd-state');
-  /** panel内のクリック（panelのonclickへbubbleする合成）。 */
+  /** panelの余白のクリック（targetはpanel自身）。非active内のcontrolはpointer-events:noneなので、その上のクリックもpanelがtargetになる。 */
   const clickPanel = (n) => dom.elements.get(`sttd-panel-${n}`).click();
-  const keyPanel = (n, key) => {
-    const panel = dom.elements.get(`sttd-panel-${n}`);
-    let prevented = false;
-    if (typeof panel.onkeydown === 'function') panel.onkeydown({ key, preventDefault: () => (prevented = true) });
-    return prevented;
-  };
+  /** panelへのkeydown（戻り値はdefaultPrevented）。 */
+  const keyPanel = (n, key) => dom.elements.get(`sttd-panel-${n}`).keydown(key);
   return { ...dom, fetches, api, web, stepState, panelState, clickPanel, keyPanel, el: (id) => dom.elements.get(id) };
 }

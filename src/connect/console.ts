@@ -232,6 +232,7 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-panel[data-sttd-state="locked"] { opacity: 0.55; background: #eceef1; }
 .sttd-panel[data-sttd-state="done"], .sttd-panel[data-sttd-state="ready"] { opacity: 0.8; background: #f5f6f8; cursor: pointer; }
 .sttd-panel[data-sttd-state="current"] { border: 2px solid #1f5fbf; }
+.sttd-panel[aria-disabled="true"] button, .sttd-panel[aria-disabled="true"] textarea, .sttd-panel[aria-disabled="true"] details, .sttd-panel[aria-disabled="true"] summary, .sttd-panel[aria-disabled="true"] pre, .sttd-panel[aria-disabled="true"] a { pointer-events: none; }
 .sttd-complete { font-weight: 700; border: 2px solid #1f5fbf; border-radius: 8px; padding: 0.75rem; }
 [hidden] { display: none !important; }
 `;
@@ -482,11 +483,24 @@ function selectStep(n) {
   render();
 }
 
-/** panel自身のクリック/keyboard（Enter/Space）での再活性化。未解放は何もしない。activeなpanel内の操作は妨げない。 */
-function activatePanel(n, event) {
-  if (step === n || !available(n)) return;
-  if (event && typeof event.preventDefault === 'function' && event.key !== undefined) event.preventDefault();
+/**
+ * panelのクリック/keyboard（Enter/Space）での再活性化。capture phaseでイベント開始時のactive状態を見る:
+ *   - 非activeなpanelへの最初のclick/keyは「再選択だけ」。伝播を止め既定動作も止めるので、内部のbutton・summary/detailsは動かない
+ *     （未解放なら再選択もせず何も起きない）。
+ *   - activeなpanel内のclick（「貼り付けて次へ」「本文一致を確認して次へ」等）はそのまま内部handlerへ届き、stepが次へ移っても
+ *     このhandlerはbubbleで再び呼ばれないため、元のpanelが再選択されて戻ることは無い。
+ */
+function panelCapture(n, event) {
+  if (step === n) return;
+  if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+  if (event && typeof event.preventDefault === 'function') event.preventDefault();
+  if (!available(n)) return;
   selectStep(n);
+}
+
+function panelKeyCapture(n, event) {
+  if (!event || (event.key !== 'Enter' && event.key !== ' ')) return;
+  panelCapture(n, event);
 }
 
 /** ログイン中accountの変化（別owner・ログアウト・失効）: 以降の要求を止め、2以降を戻してログインからやり直す。古いasync結果は世代で捨てる。 */
@@ -932,11 +946,9 @@ function newTest() {
 function start() {
   for (const n of STEPS) {
     el('sttd-step-' + n + '-head').onclick = () => selectStep(n);
-    // 前のpanelのどこをクリックしても（Enter/Spaceでも）再活性化できる。未解放は何もしない。
-    el('sttd-panel-' + n).onclick = (event) => activatePanel(n, event);
-    el('sttd-panel-' + n).onkeydown = (event) => {
-      if (event && (event.key === 'Enter' || event.key === ' ')) activatePanel(n, event);
-    };
+    // 前のpanelのどこをクリックしても（Enter/Spaceでも）再活性化できる。capture phaseで判定し、非activeへのclickは内部操作にしない。
+    el('sttd-panel-' + n).addEventListener('click', (event) => panelCapture(n, event), true);
+    el('sttd-panel-' + n).addEventListener('keydown', (event) => panelKeyCapture(n, event), true);
   }
   el('sttd-login').onclick = () => login(false);
   el('sttd-switch').onclick = () => login(true);

@@ -34,7 +34,7 @@ MacはNode.js 22.23.2/npm 12.0.2で、`npm ci --ignore-scripts --no-audit --no-f
 | 購読元clientの変更 | OAuth clientは `src/oauth/cimd.ts` のChatGPTのCIMD 1件に固定。他clientでは未確認 |
 | macOS・Linuxでのbuild/test | 上記の作者提供資料ではMac build成功・試験108成功/4失敗、Linux Cloud Buildは112/112成功。Macのloopback試験の移植性は未解決。Windowsの確認版はWindows 11・Node 22.23.4・npm 10.9.9・TypeScript 7.0.2。全OS/版への保証ではない |
 | 表示言語 | 英語/日本語の画面と言語cookieは合成試験だけで確認。実ブラウザでの動作と他言語は未確認で、英語・日本語以外は英語になる |
-| ローカル送信画面 | helper・5段階セットアップ・中継は合成SDK/DOM/fetchとloopbackだけで確認。実ブラウザでのログイン・clipboard・Apple popup・実配置への中継は未確認。作者の過去の実配送は旧Cloud Run `/console`（現在は無い）で行ったもの |
+| ローカル送信画面 | helper・5段階セットアップ・中継は合成SDK/DOM/fetchとloopbackだけで確認。実ブラウザでのログイン・clipboard・Apple popup・実配置への中継は未確認。作者の過去の実配送は旧Cloud Run `/console`（現在のsourceには含まれない。配置済み環境に残っているかは配置時期による）で行ったもの |
 
 ## 含まれないもの
 
