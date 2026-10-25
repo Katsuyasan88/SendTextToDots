@@ -6,6 +6,7 @@
 
 import Provider, { errors, interactionPolicy, type AdapterFactory, type Configuration, type JWKS } from 'oidc-provider';
 
+import { DEFAULT_LANGUAGE, isLanguage, selectLanguage, text, type Language } from '../connect/i18n.js';
 import type { SafeEgress } from '../egress/safe-egress.js';
 import { isDevelopmentPublicOrigin } from '../http/origin.js';
 import type { AuthPolicy, Clock } from '../policy.js';
@@ -62,6 +63,16 @@ export interface OAuthProviderDeps {
 /** MCPのresource識別子。issuer配下の `/mcp` だけ。 */
 export function resourceFor(issuer: string): string {
   return `${issuer}/mcp`;
+}
+
+/**
+ * 利用者向けOAuthエラー画面（固定文のみ）。machine codeは形が既知の`[a-z_]{1,64}`の時だけdata属性へ置き、error_description・入力値・
+ * 内部詳細・tokenは出さない。文言はen/jaの固定辞書から。
+ */
+export function renderOAuthErrorPage(error: unknown, language: Language): string {
+  const lang: Language = isLanguage(language) ? language : DEFAULT_LANGUAGE;
+  const code = typeof error === 'string' && /^[a-z_]{1,64}$/.test(error) ? error : 'error';
+  return `<!DOCTYPE html><html lang="${lang}"><head><meta charset="utf-8"><title>${text(lang, 'oauth.errorTitle')}</title></head><body><p data-sttd-error="${code}">${text(lang, 'oauth.error')}</p></body></html>`;
 }
 
 export function createOAuthProvider(deps: OAuthProviderDeps): Provider {
@@ -171,12 +182,10 @@ export function createOAuthProvider(deps: OAuthProviderDeps): Provider {
       policy: interactionChecks,
       url: (_ctx, interaction) => `${INTERACTION_PATH_PREFIX}${interaction.uid}`,
     },
-    // 入力値やerror_descriptionを画面へ反映しない。
+    // 入力値やerror_descriptionを画面へ反映しない。文言だけ表示言語（表示専用cookie → Accept-Language）で描く。
     renderError: (ctx, out) => {
       ctx.type = 'html';
-      ctx.body = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>SendTextToDots</title></head><body><p data-sttd-error="${
-        /^[a-z_]{1,64}$/.test(out.error) ? out.error : 'error'
-      }">接続を完了できませんでした。</p></body></html>`;
+      ctx.body = renderOAuthErrorPage(out.error, selectLanguage({ cookie: ctx.get('cookie'), acceptLanguage: ctx.get('accept-language') }));
     },
   });
 

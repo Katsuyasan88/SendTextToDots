@@ -1,5 +1,7 @@
 # 導入
 
+[English](INSTALL_EN.md) | 日本語
+
 この手順は、自分のGoogle Cloud / Firebaseへ0.3.0を新規導入するための構成と作業順です。第三者projectでこの手順を一通り実行した検証は未完了です。[LIMITATIONS.md](LIMITATIONS.md)の確認範囲を超えて、配置成功・本番運用を保証するものではありません。Cloudコマンドは資源・費用・権限を変更するので、対象projectと予算を確認してから実行してください。
 
 ## 1. 用意するもの
@@ -203,11 +205,12 @@ MCPのCPU/memory/instance数は上記の開始例であり、負荷試験済み�
 
 ## 6. 接続・最初の送信・停止計画
 
-1. MCP originの`/connect`へアクセスしAppleログインします。Dots/ChatGPTのMCP server登録先は**MCP originの`/mcp`**です。`/connect`やAPI originを登録先にしません。
-2. Dots/ChatGPT側からOAuth接続し、同じFirebase利用者として明示同意します。`text.submitted`を購読して受信中であることを確認します。接続Webを開くだけでは購読は作られません。
+1. MCP originの`/console`へアクセスしAppleログインします。画面はEnglish/日本語を選べます（ページ上部の言語リンク。初期言語はブラウザの言語設定）。Dots/ChatGPTのMCP server登録先は**MCP originの`/mcp`**です。`/console`・`/connect`やAPI originを登録先にしません。
+2. Dots/ChatGPT側からOAuth接続し、同じFirebase利用者として明示同意します。`text.submitted`を購読して「受信中」であることを確認します。送信画面を開くだけでは購読は作られません。
 3. MCP originの`/console`の空欄に本文を入力し1件送信。受信側で入力どおりの表示を確認します。指示として実行させたい場合はDots側にその扱いを指示します。STTD自身は本文を実行しません。
 4. 直接APIを使う場合はREADMEの例を参照。Apple providerで認証した同じproject/UIDのFirebase ID tokenが必要です。Web画面のtokenを表示する管理toolは同梱しません。最初の確認には`/console`を使えます。
 5. `delivered`はcallbackの2xx受領で、受信側の処理完了ではありません。結果不明なら送信前に控えた同じcommandIdで状態照会し、新IDで自動再送しません。
+6. このaccountからの送信を止めるには`/console`の「接続を解除」を使います（画面で確認してから実行）。認可と購読が失効し、再開はChatGPTからの再接続です。`/connect`も互換のため同じ解除機能つきで残ります。
 
 配置前に停止方法と保持費用を決めてください。接続解除は購読/Grantの失効で、Cloud資源の停止・廃棄ではありません。minInstances=0でも外部要求で起動し得ます。不要になったserviceの停止・削除と、DB/Secret/KMS/imageの保持はCloud側で別に判断します。暗号鍵の破棄は保存情報を復号不能にするため、費用だけを理由に一括削除しません。本sourceは自動停止/物理削除toolを含みません。
 

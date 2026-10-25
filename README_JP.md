@@ -8,7 +8,7 @@ SendTextToDotsは自分で配置して使う中継サービスです。認証済
 
 > **状態: 実験的。** [MCP Eventsの草案](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md)のWebhook配送を使っています。草案や受信側サービスの変更により、更新が必要になったり互換性が失われたりする可能性があります。OpenAI・Apple・Googleの公式製品、または承認された連携ではありません。
 
-ホスト済みのサービスではなく、自分で配置するソースです。詳細ドキュメント（`docs/`）も日本語です。
+ホスト済みのサービスではなく、自分で配置するソースです。詳細ドキュメント（`docs/`）は日本語と英語（`*_EN.md`）があり、Web画面も英語/日本語を切り替えられます。
 
 ## 配送の流れ
 
@@ -32,7 +32,7 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 | 部分 | 実行先 | 役割 |
 | --- | --- | --- |
 | 送信API | Cloud Functions 第2世代（`sendtexttodotsapi`） | 認証済み本文の受付、署名付き配送1回、状態照会、中止 |
-| MCP/OAuth・接続Web | Cloud Run（`dist/deployment/connect.js`） | OAuth認可、`/mcp`でのEvents購読、`/connect`でのAppleログイン、開発用送信画面`/console` |
+| MCP/OAuth・接続Web | Cloud Run（`dist/deployment/connect.js`） | OAuth認可、`/mcp`でのEvents購読、送信画面`/console`（Appleログイン・接続状態・接続解除・1件送信）。`/connect`は互換のため残す |
 | 保存 | Firestore | 利用者の接続、OAuth認可、KMS封緘した購読、本文を含まないcommand状態 |
 | 鍵 | Cloud KMS・Secret Manager | 封緘鍵と、署名・cookie・識別子・digest用に分離した秘密 |
 
@@ -54,8 +54,8 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 3. [導入手順](docs/INSTALL.md)に従い、service URLを決定し、Cloud資源・service account・runtime権限（`firebaseauth.users.get`を含む）・秘密・KMS購読markerを用意。[CONFIGURATION](docs/CONFIGURATION.md)を参照し、唯一の配置設定`src/config/deployment.ts`を編集します。
 4. `npm run build`後、`npm run package`でAPI ZIPとMCP Cloud Build source archiveをoffline作成。包装だけでは配置されません。同じ内容での再包装は`output_exists`で停止します。既存archiveの確認方法は[INSTALL](docs/INSTALL.md)を参照してください。
 5. [INSTALL](docs/INSTALL.md)のarchive配置例・origin/IAM確認に従い、APIをCloud Functions 第2世代、MCP/OAuthをDockerfile → Cloud Build → Cloud Runの順で配置します。Cloud資源作成・配置・停止のtoolは同梱されません。導入者のCloud権限が必要で、第三者projectでの手順全体の実行検証は未完了です。
-6. 配置したMCP originの`/connect`でAppleログイン。Dots/ChatGPT側からMCP serverへOAuth接続し、`text.submitted`を購読します。
-7. MCP originの`/console`の空欄に本文を入力し、1件送って受信側で確認します。購読後は下のAPI例でも送信できます。
+6. 配置したMCP originの`/console`でAppleログイン（画面はEnglish/日本語を選べます）。Dots/ChatGPT側からMCP serverへOAuth接続し、`text.submitted`を購読すると画面が「受信中」になります。
+7. 同じ`/console`の空欄に本文を入力し、1件送って受信側で確認します。購読後は下のAPI例でも送信できます。同じ画面の「接続を解除」は確認の後に認可と購読を失効させます。
 
 配布設定は未設定（`configured: false`）です。そのままbuild・配置しても、両serviceはSDK生成・資格取得・DB・外部HTTPの前に固定の設定errorで止まります。
 
@@ -119,14 +119,14 @@ console.log(response.status, await response.json());
 | `src/deployment/` | Functions entry・Cloud Run entry・CORS |
 | `src/google-runtime/` | Google SDKの所有起動（Cloud実行環境gate・危険な環境変数の拒否） |
 | `src/delivery/`・`src/commands/` | 送信APIの入力検証・単回配送・中止・状態 |
-| `src/connect/`・`src/oauth/`・`src/mcp/`・`src/events/` | 接続Web・OAuth・MCP Events・購読・署名 |
+| `src/connect/`・`src/oauth/`・`src/mcp/`・`src/events/` | 送信画面・接続Web（英日辞書は`i18n.ts`）・OAuth・MCP Events・購読・署名 |
 | `src/storage/`・`src/protection/`・`src/keys/` | Firestore保存形式・KMS封緘・Secret読取り |
 | `src/egress/` | 安全なHTTPS送出（IP検証・固定接続・TLS・期限・上限） |
 | `scripts/` | offline包装（`package-artifacts.mjs`）・試験runner |
 | `test/` | 自動試験（合成値だけ） |
-| `references/` | 宛先IP分類の根拠にしたIANA表（CC0 1.0） |
+| `references/` | 宛先IP分類の根拠にしたIANA表（CC0 1.0）。[references/README.md](references/README.md) |
 | `firestore/` | 全拒否のFirestore rulesと索引除外 |
 
 ## License
 
-[MIT](LICENSE) © 2026 Katsuyasan88。第三者のpackage・SDK・参照dataは [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。
+[MIT](LICENSE) © 2026 Katsuyasan88。第三者のpackage・SDK・参照dataは [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)（[English](THIRD_PARTY_NOTICES_EN.md)）を参照してください。

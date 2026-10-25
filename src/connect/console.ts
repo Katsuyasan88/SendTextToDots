@@ -1,18 +1,24 @@
-// 本人用の簡易ブラウザ操作画面（/console）。Appleログイン（既存Firebase Web SDK 13.0.0・Apple providerのみ・追加scopeなし）・
-// 接続/購読状態（同originの既存 /v1/web/connection）・利用者が入力した本文の送信・中止・本人のクリックによる同じIDの結果確認だけ。
+// 本人用のブラウザ送信画面（/console）。Appleログイン（既存Firebase Web SDK 13.0.0・Apple providerのみ・追加scopeなし）・
+// 接続/購読状態（同originの既存 /v1/web/connection）・接続解除（同originの既存 POST /v1/web/disconnect。確認してから1回だけ）・
+// 利用者が入力した本文の送信・中止・本人のクリックによる同じIDの結果確認。表示はen/ja（connect/i18n.ts）。
 //   - 本文欄は空で始まり、例文・定型文・方向の選択・固定taskは無い。入力値をtrim・正規化せずそのままv2の5項目で送る。
 //   - 指示・中止・結果確認は、固定Functions originへbrowserから直接送る（MCPは本文を中継しない）。tokenはAuthorizationだけ、credentials:omit。
 //   - 本文はRAM/DOMだけ（localStorage・sessionStorage・IndexedDB・URL・ログへ保存0。Firebase SDK自身の認証session保存とは別）。
 //   - 空・空白だけ・対にならないsurrogate・4096 UTF-8 byte超は通信前に拒否する（maxlengthは補助で、byte検査の代わりにしない）。
-//   - 送信POSTは最大25秒（元期限内）、二重クリックでPOSTを増やさない。送信中は本文・account切替を封鎖し中止だけ。
-//     終端後は「新しいテスト」を明示に押すまで再送しない。自動POST再送・定期poll 0。中止は同commandIdへ最大5秒。
+//   - 送信POSTは最大25秒（元期限内）、二重クリックでPOSTを増やさない。送信中は本文・account切替・解除・言語切替を封鎖し中止だけ。
+//     終端後は「新しい送信」を明示に押すまで再送しない。自動POST再送・定期poll 0。中止は同commandIdへ最大5秒。
 //   - 表示はHTTP statusではなくstate。deliveredは送信先の受領で、同じDotの反応は自動確認しない。未確定は成功扱いしない。
+//   - 解除は本人の確認（はい）の後に1回だけPOSTし、処理中は送信・切替・再確認と排他。確認の取消・失敗・期限切れでは成功を装わず、
+//     終了後は接続状態を再確認し、本人が「状態を再確認」を押すまで送信を封鎖する。
+//   - 言語はサーバーが選んだ初期言語（HTMLのlang・本文）で始まり、English/日本語の明示選択は画面内で文言を差し替え、同じGETの`?lang=`を
+//     同originへ1回送って表示専用cookieへ保存する（navigation・form送信・ログイン・解除・送信を起こさない）。送信中・処理中は切替を受けない。
 //   - HTML・JS・CSSは固定文字列で、inline script/style・実filesystem読取り・新framework・新依存は無い。動的な値はdata属性へescape、表示はtextContent。
 //   - apiOriginとweb configは信頼する呼出元（connect/kms-server.ts）だけが渡す。利用者・argv・envから任意originを選ばせない。
 // 各要求の元期限（POST 25秒・中止5秒・同ID確認10秒）に認証取得を含め、期限後のtokenで通信を始めない。
-//   backendのdelivery_unknownでも本人クリックの同ID確認を残す。認証切替・接続再確認は排他し、確認済みの現在状態まで送信を封鎖する。
+//   backendのdelivery_unknownでも本人クリックの同ID確認を残す。認証切替・接続再確認・解除は排他し、確認済みの現在状態まで送信を封鎖する。
 //   httpsのAPI originはDNS hostだけ（IP literal拒否）。
 
+import { DEFAULT_LANGUAGE, isLanguage, languageHref, messagesJson, text, type Language, type MessageKey } from './i18n.js';
 import { FIREBASE_POPUP_SCRIPT_ORIGIN, FIREBASE_WEB_SDK_VERSION, type FirebaseWebConfig } from './pages.js';
 
 export const CONSOLE_PATH = '/console';
@@ -83,45 +89,68 @@ export function consoleSecurityHeaders(web: FirebaseWebConfig, apiOrigin: string
   };
 }
 
-/** /consoleのHTML（1画面）。値はdata属性へescapeして渡す。 */
-export function renderConsolePage(web: FirebaseWebConfig, apiOrigin: string): string {
+/** /consoleのHTML（1画面）。値はdata属性へescapeして渡す。文言は選択言語の辞書から入れ、scriptが同じキーで差し替える。 */
+export function renderConsolePage(web: FirebaseWebConfig, apiOrigin: string, language: Language = DEFAULT_LANGUAGE): string {
   checkWeb(web);
   const api = consoleApiOrigin(apiOrigin);
-  const data = Object.entries({ 'sttd-firebase': JSON.stringify({ apiKey: web.apiKey, authDomain: web.authDomain, projectId: web.projectId }), 'sttd-api-origin': api })
+  const lang: Language = isLanguage(language) ? language : DEFAULT_LANGUAGE;
+  const t = (key: MessageKey) => escapeHtml(text(lang, key));
+  /** 固定キーの文言をtextContentとして持つ要素（scriptの言語切替が同じキーで差し替える）。 */
+  const i18n = (key: MessageKey) => ` data-sttd-i18n="${key}"`;
+  const data = Object.entries({
+    'sttd-firebase': JSON.stringify({ apiKey: web.apiKey, authDomain: web.authDomain, projectId: web.projectId }),
+    'sttd-api-origin': api,
+    'sttd-language': lang,
+  })
     .map(([name, value]) => ` data-${name}="${escapeHtml(value)}"`)
     .join('');
+  const current = (candidate: Language) => (candidate === lang ? ' aria-current="true"' : '');
   return `<!DOCTYPE html>
-<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SendTextToDots 操作画面</title>
+<html lang="${lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${t('console.title')}</title>
 <link rel="stylesheet" href="${CONSOLE_STYLE_PATH}">
 <script type="module" src="${CONSOLE_SCRIPT_PATH}"></script></head>
 <body${data}>
 <main>
-<h1>SendTextToDots 操作画面（開発用）</h1>
+<nav class="sttd-language" aria-labelledby="sttd-language-label">
+<span id="sttd-language-label"${i18n('common.language')}>${t('common.language')}</span>
+<a id="sttd-lang-en" href="${languageHref(CONSOLE_PATH, 'en')}" hreflang="en" lang="en"${current('en')}>${t('common.languageEnglish')}</a>
+<a id="sttd-lang-ja" href="${languageHref(CONSOLE_PATH, 'ja')}" hreflang="ja" lang="ja"${current('ja')}>${t('common.languageJapanese')}</a>
+</nav>
+<h1 id="sttd-heading"${i18n('console.heading')}>${t('console.heading')}</h1>
+<p id="sttd-intro"${i18n('console.intro')}>${t('console.intro')}</p>
 <section id="sttd-account" aria-labelledby="sttd-account-title">
-<h2 id="sttd-account-title">アカウント</h2>
-<p id="sttd-account-text" role="status">ログイン状態を確認しています…</p>
-<button type="button" id="sttd-login" hidden>Appleでログイン</button>
-<button type="button" id="sttd-switch" hidden>別のAppleアカウントでログイン</button>
+<h2 id="sttd-account-title"${i18n('console.account')}>${t('console.account')}</h2>
+<p id="sttd-account-text" role="status">${t('console.accountChecking')}</p>
+<button type="button" id="sttd-login" hidden${i18n('common.appleLogin')}>${t('common.appleLogin')}</button>
+<button type="button" id="sttd-switch" hidden${i18n('common.switchAccount')}>${t('common.switchAccount')}</button>
 </section>
 <section id="sttd-connection" aria-labelledby="sttd-connection-title">
-<h2 id="sttd-connection-title">接続と受信の状態</h2>
-<p id="sttd-state-text" role="status">ログインすると表示します。</p>
-<p id="sttd-start-guide" hidden>受信を始めるには、ChatGPTのSendTextToDots接続で「このDotsで受信を開始」と依頼してください。確認が済むと「受信中」になります。</p>
-<button type="button" id="sttd-refresh" hidden>状態を再確認</button>
-<p><a href="/connect">接続の解除・詳細（接続画面）</a></p>
-</section>
-<section id="sttd-test" aria-labelledby="sttd-test-title">
-<h2 id="sttd-test-title">テスト送信</h2>
-<label for="sttd-text">送る文（このページの中だけで使い、保存しません）</label>
-<textarea id="sttd-text" rows="4" maxlength="4096" placeholder="Dotsへ送る文を入力してください（4096バイトまで）" disabled></textarea>
+<h2 id="sttd-connection-title"${i18n('console.connection')}>${t('console.connection')}</h2>
+<p id="sttd-state-text" role="status">${t('console.connectionSignedOut')}</p>
+<p id="sttd-start-guide" hidden${i18n('common.startGuide')}>${t('common.startGuide')}</p>
 <div class="sttd-actions">
-<button type="button" id="sttd-send" disabled>1件だけ送信</button>
-<button type="button" id="sttd-cancel" hidden>中止</button>
-<button type="button" id="sttd-check" hidden>同じIDの結果を確認</button>
-<button type="button" id="sttd-new" hidden>新しいテスト</button>
+<button type="button" id="sttd-refresh" hidden${i18n('console.refresh')}>${t('console.refresh')}</button>
+<button type="button" id="sttd-disconnect" hidden${i18n('common.disconnect')}>${t('common.disconnect')}</button>
+</div>
+<div id="sttd-disconnect-confirm" role="group" aria-labelledby="sttd-disconnect-question" hidden>
+<p id="sttd-disconnect-question"${i18n('common.disconnectConfirm')}>${t('common.disconnectConfirm')}</p>
+<button type="button" id="sttd-disconnect-yes"${i18n('common.disconnectYes')}>${t('common.disconnectYes')}</button>
+<button type="button" id="sttd-disconnect-no"${i18n('common.disconnectNo')}>${t('common.disconnectNo')}</button>
+</div>
+<p id="sttd-disconnect-result" role="status"></p>
+</section>
+<section id="sttd-send-section" aria-labelledby="sttd-send-title">
+<h2 id="sttd-send-title"${i18n('console.send')}>${t('console.send')}</h2>
+<label id="sttd-text-label" for="sttd-text"${i18n('console.textLabel')}>${t('console.textLabel')}</label>
+<textarea id="sttd-text" rows="4" maxlength="4096" placeholder="${t('console.textPlaceholder')}" disabled></textarea>
+<div class="sttd-actions">
+<button type="button" id="sttd-send" disabled${i18n('console.sendOne')}>${t('console.sendOne')}</button>
+<button type="button" id="sttd-cancel" hidden${i18n('console.cancel')}>${t('console.cancel')}</button>
+<button type="button" id="sttd-check" hidden${i18n('console.check')}>${t('console.check')}</button>
+<button type="button" id="sttd-new" hidden${i18n('console.new')}>${t('console.new')}</button>
 </div>
 <p id="sttd-result" role="status"></p>
-<p class="sttd-note">「受領」は送信先がSendTextToDotsからの1件を受け取ったという意味です。Dotsの返答はChatGPTの画面で確認してください。</p>
+<p id="sttd-note" class="sttd-note"${i18n('console.note')}>${t('console.note')}</p>
 </section>
 </main>
 </body></html>`;
@@ -138,15 +167,22 @@ label { display: block; font-weight: 600; margin: 0.75rem 0 0.25rem; }
 textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 0.5rem; border: 1px solid #b8bdc6; border-radius: 6px; }
 button { font: inherit; min-height: 44px; padding: 0.5rem 1rem; margin: 0.5rem 0.5rem 0 0; border-radius: 8px; border: 1px solid #1f5fbf; background: #1f5fbf; color: #fff; }
 button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
-#sttd-cancel { background: #fff; color: #b3261e; border-color: #b3261e; }
+#sttd-cancel, #sttd-disconnect, #sttd-disconnect-yes { background: #fff; color: #b3261e; border-color: #b3261e; }
+#sttd-disconnect-no { background: #fff; color: #1d1f23; border-color: #b8bdc6; }
+#sttd-disconnect-confirm { border: 1px solid #b3261e; border-radius: 8px; padding: 0.75rem; margin-top: 0.75rem; }
+.sttd-language { display: flex; gap: 0.75rem; align-items: center; justify-content: flex-end; font-size: 0.9rem; min-height: 44px; }
+.sttd-language a { color: #1f5fbf; padding: 0.5rem 0.25rem; }
+.sttd-language a[aria-current="true"] { font-weight: 700; text-decoration: none; color: #1d1f23; }
+.sttd-language a[aria-disabled="true"] { color: #5b616b; pointer-events: none; }
 .sttd-actions { display: flex; flex-wrap: wrap; }
-#sttd-result { font-weight: 600; min-height: 1.5em; overflow-wrap: anywhere; }
+#sttd-result, #sttd-disconnect-result { font-weight: 600; min-height: 1.5em; overflow-wrap: anywhere; }
 .sttd-note { font-size: 0.85rem; color: #4a5059; }
 [hidden] { display: none !important; }
 `;
 
 /**
- * 画面のscript（固定asset）。状態の表示・単回送信・中止・本人のクリックでの同ID確認だけ。自動popup・自動再送・定期pollは無い。
+ * 画面のscript（固定asset）。状態の表示・単回送信・中止・本人のクリックでの同ID確認・確認後の接続解除・言語の切替だけ。
+ * 自動popup・自動再送・定期pollは無い。文言は埋め込んだ固定辞書（connect/i18n.ts）からキーで引く。
  */
 export const CONSOLE_SCRIPT = `import { initializeApp } from '${CONSOLE_SDK_BASE}firebase-app.js';
 import { getAuth, OAuthProvider, signInWithPopup, signOut } from '${CONSOLE_SDK_BASE}firebase-auth.js';
@@ -154,49 +190,36 @@ import { getAuth, OAuthProvider, signInWithPopup, signOut } from '${CONSOLE_SDK_
 const body = document.body;
 const API = body.dataset.sttdApiOrigin;
 const auth = getAuth(initializeApp(JSON.parse(body.dataset.sttdFirebase)));
+const TEXT = ${messagesJson()};
 const POST_MS = 25000;
 const CANCEL_MS = 5000;
 const CHECK_MS = 10000;
+const DISCONNECT_MS = 10000;
 const LIFETIME_MS = 60000;
 const MAX_TEXT_BYTES = 4096;
 const LONE_SURROGATE = /\\p{Cs}/u;
-const CONNECTION = {
-  unlinked: 'ログイン済み・Dotsとの接続はまだありません',
-  linked: '接続許可済み・受信開始待ち',
-  subscribed: '受信中（テスト送信できます）',
-  expired: '受信の期限が切れました。ChatGPTで受信を再開してください',
-  change_pending: '送信先の変更確認待ち',
-};
-const STATE_TEXT = {
-  in_flight: '処理中です（結果はまだ確定していません）。',
-  delivered: '送信先が受領しました。Dotsの返答を確認してください（Dotsの反応は自動では確認していません）。',
-  failed: '送信できませんでした。',
-  cancelled: '中止しました（送信されていません）。',
-  expired: '期限切れのため送信されませんでした。',
-  delivery_unknown: '届いたか分かりません。重複に注意してください。',
-};
-const ERROR_TEXT = {
-  400: '送信内容を受け付けられませんでした（送信されていません）。',
-  401: 'ログインを確認できませんでした。もう一度ログインしてください（送信されていません）。',
-  403: '接続が無効です。ChatGPTで接続と受信開始をやり直してください（送信されていません）。',
-  409: '受信中のDotsが無いか、送信先の確認待ちです（送信されていません）。',
-  422: '送信時刻を受け付けられませんでした。端末の時計を確認してください（送信されていません）。',
-  429: '混雑しています。しばらく待ってから新しいテストを始めてください（送信されていません）。',
-};
-const UNKNOWN_TEXT = '結果を確認できません。届いている可能性があります。「同じIDの結果を確認」で確認できます。';
-const CANCEL_UNCONFIRMED = '中止を確認できません。届いている可能性があります。';
-const DUPLICATE_WARNING = '前のテストは届いている可能性があります。新しいテストは別の1件として送られ、重複して届くことがあります。';
+const CONNECTION_STATES = ['unlinked', 'linked', 'subscribed', 'expired', 'change_pending'];
+const ERROR_STATUSES = [400, 401, 403, 409, 422, 429];
 const TERMINAL = ['delivered', 'failed', 'cancelled', 'expired', 'delivery_unknown'];
 const RANK = { in_flight: 1, delivery_unknown: 2, failed: 3, expired: 3, cancelled: 3, delivered: 4 };
 
 const el = (id) => document.getElementById(id);
+let lang = Object.hasOwn(TEXT, body.dataset.sttdLanguage) ? body.dataset.sttdLanguage : 'en';
+/** 固定キーの文言（未知のキーは空文字。入力値を文言にしない）。 */
+const T = (key) => (Object.hasOwn(TEXT[lang], key) ? TEXT[lang][key] : '');
 let signedIn = false;
 let connection = null;
 let test = null;
 let note = '';
-// 認証切替・接続の再確認の間は排他し、確認済みの現在状態が戻るまで送信を封鎖する。
+let accountKey = 'console.accountChecking';
+let connectionKey = 'console.connectionSignedOut';
+// 認証切替・接続の再確認・解除の間は排他し、確認済みの現在状態が戻るまで送信を封鎖する。
 let accountBusy = false;
 let connectionSeq = 0;
+// 解除の確認表示と結果。解除後は本人が「状態を再確認」を押すまで送信を封鎖する。
+let confirming = false;
+let disconnectKey = '';
+let disconnected = false;
 
 function phaseOf(current) {
   if (current.state !== null && TERMINAL.includes(current.state)) return 'settled';
@@ -211,18 +234,36 @@ function checkable(current) {
 }
 
 function sendableNow() {
-  return signedIn && connection === 'subscribed' && !accountBusy;
+  return signedIn && connection === 'subscribed' && !accountBusy && !disconnected;
+}
+
+/** ログイン・切替・再確認・解除を受けない間（送信の1件が終わるまでと、認証切替・再確認・解除の処理中）。 */
+function busy() {
+  return accountBusy || test !== null;
+}
+
+/** 言語の切替を受けない間（送信中・中止の確認中・結果確認中・認証切替・再確認・解除の処理中。終端後の切替は文言の差し替えだけなので受ける）。 */
+function languageLocked() {
+  return accountBusy || (test !== null && (phaseOf(test) === 'sending' || test.cancel === 'pending' || test.checking));
 }
 
 function render() {
   const phase = test === null ? null : phaseOf(test);
   const sendable = sendableNow();
+  el('sttd-account-text').textContent = T(accountKey);
+  el('sttd-state-text').textContent = T(connectionKey);
   el('sttd-login').hidden = signedIn;
   el('sttd-switch').hidden = !signedIn;
-  el('sttd-switch').disabled = test !== null || accountBusy;
-  el('sttd-login').disabled = test !== null || accountBusy;
+  el('sttd-switch').disabled = busy() || confirming;
+  el('sttd-login').disabled = busy();
   el('sttd-refresh').hidden = !signedIn;
-  el('sttd-refresh').disabled = test !== null || accountBusy;
+  el('sttd-refresh').disabled = busy() || confirming;
+  el('sttd-disconnect').hidden = !signedIn || confirming || connection === null || connection === 'unlinked';
+  el('sttd-disconnect').disabled = busy();
+  el('sttd-disconnect-confirm').hidden = !confirming;
+  el('sttd-disconnect-yes').disabled = busy();
+  el('sttd-disconnect-no').disabled = busy();
+  el('sttd-disconnect-result').textContent = T(disconnectKey);
   el('sttd-text').disabled = !sendable || test !== null;
   el('sttd-send').disabled = !sendable || test !== null;
   el('sttd-cancel').hidden = test === null || (phase !== 'sending' && phase !== 'unknown') || test.cancel === 'answered' || test.cancel === 'unconfirmed';
@@ -230,32 +271,61 @@ function render() {
   el('sttd-check').hidden = test === null || !checkable(test);
   el('sttd-check').disabled = test !== null && test.checking;
   el('sttd-new').hidden = test === null || phase === 'sending' || test.cancel === 'pending' || test.checking;
+  for (const code of ['en', 'ja']) {
+    const link = el('sttd-lang-' + code);
+    link.setAttribute('aria-current', code === lang ? 'true' : 'false');
+    link.setAttribute('aria-disabled', languageLocked() ? 'true' : 'false');
+  }
   const lines = [];
   if (test !== null) {
-    if (test.state !== null) lines.push(STATE_TEXT[test.state]);
-    else if (phase === 'sending') lines.push('送信中です。中止できます。');
-    else if (test.rejected !== null) lines.push(test.rejected);
-    else lines.push(UNKNOWN_TEXT);
-    if (test.cancel === 'pending') lines.push('中止を確認しています…');
-    if (test.cancel === 'unconfirmed' && test.state !== 'cancelled') lines.push(CANCEL_UNCONFIRMED);
-    if (test.checkNote) lines.push(test.checkNote);
+    if (test.state !== null) lines.push(T('console.state.' + test.state));
+    else if (phase === 'sending') lines.push(T('console.sending'));
+    else if (test.rejected !== null) lines.push(T(test.rejected));
+    else lines.push(T('console.unknown'));
+    if (test.cancel === 'pending') lines.push(T('console.cancelPending'));
+    if (test.cancel === 'unconfirmed' && test.state !== 'cancelled') lines.push(T('console.cancelUnconfirmed'));
+    if (test.checkNote) lines.push(T(test.checkNote));
   } else if (note) {
-    lines.push(note);
+    lines.push(T(note));
+  } else if (disconnected && signedIn) {
+    lines.push(T('console.sendDisabled'));
   }
   el('sttd-result').textContent = lines.join(' ');
 }
 
-function showConnection(state, text) {
+/** 固定キーの文言を持つ要素と入力欄のplaceholder・title・html langを選択言語へ差し替える。 */
+function applyLanguage() {
+  if (document.documentElement) document.documentElement.lang = lang;
+  document.title = T('console.title');
+  for (const node of document.querySelectorAll('[data-sttd-i18n]')) node.textContent = T(node.dataset.sttdI18n);
+  el('sttd-text').placeholder = T('console.textPlaceholder');
+  render();
+}
+
+/**
+ * 言語の明示選択。送信中・処理中は受けない。画面内で差し替え、同じ画面のGETを同originへ1回送って表示専用cookieへ保存する
+ * （応答本文は使わない。navigation・form送信・ログイン・解除・送信は起こさない）。
+ */
+function chooseLanguage(next) {
+  if (languageLocked() || !Object.hasOwn(TEXT, next)) return;
+  if (next === lang) return;
+  lang = next;
+  applyLanguage();
+  fetch('/console?lang=' + next, { method: 'GET', credentials: 'same-origin', cache: 'no-store', redirect: 'error' }).catch(() => {});
+}
+
+function showConnection(state, key) {
   connection = state;
-  el('sttd-state-text').textContent = text;
+  connectionKey = key;
   el('sttd-start-guide').hidden = !(state === 'linked' || state === 'expired');
   render();
 }
 
-function signedOutView(message) {
+function signedOutView(key) {
   signedIn = false;
-  el('sttd-account-text').textContent = message || 'ログインしていません。';
-  showConnection(null, 'ログインすると表示します。');
+  confirming = false;
+  accountKey = key || 'console.accountSignedOut';
+  showConnection(null, 'console.connectionSignedOut');
 }
 
 async function idToken() {
@@ -267,32 +337,34 @@ async function idToken() {
 async function refreshConnection() {
   const mine = ++connectionSeq;
   connection = null;
-  el('sttd-state-text').textContent = '状態を確認しています…';
+  connectionKey = 'console.connectionChecking';
   render();
   let token;
   try {
     token = await idToken();
   } catch {
-    if (mine === connectionSeq) signedOutView('ログイン状態を更新できませんでした。もう一度ログインしてください。');
+    if (mine === connectionSeq) signedOutView('common.loginRefresh');
     return;
   }
   if (mine !== connectionSeq) return;
   signedIn = true;
-  el('sttd-account-text').textContent = 'Appleアカウントでログイン中です。';
+  accountKey = 'console.accountSignedIn';
   render();
   try {
     const response = await fetch('/v1/web/connection', { headers: { Authorization: 'Bearer ' + token }, credentials: 'same-origin', cache: 'no-store' });
     const json = response.ok ? await response.json() : null;
     if (mine !== connectionSeq) return;
-    if (json && typeof json.state === 'string' && Object.hasOwn(CONNECTION, json.state)) return showConnection(json.state, CONNECTION[json.state]);
+    if (json && typeof json.state === 'string' && CONNECTION_STATES.includes(json.state)) {
+      return showConnection(json.state, json.state === 'subscribed' ? 'console.state.subscribed' : 'common.state.' + json.state);
+    }
   } catch {
     // 下の固定表示へ（状態不明を未接続・未購読と決め付けない）。
   }
   if (mine !== connectionSeq) return;
-  showConnection(null, '接続状態を確認できませんでした（未接続・未購読とは限りません）。送信はできません。');
+  showConnection(null, 'console.connectionUnavailable');
 }
 
-/** 認証切替・接続の再確認を1つずつ行う（実行中は送信・切替・再確認を封鎖。テスト中は始めない）。 */
+/** 認証切替・接続の再確認・解除を1つずつ行う（実行中は送信・切替・再確認・解除・言語切替を封鎖。送信中は始めない）。 */
 async function exclusive(task) {
   if (accountBusy || test !== null) return;
   accountBusy = true;
@@ -308,12 +380,24 @@ async function exclusive(task) {
 
 function login(switching) {
   return exclusive(async () => {
+    confirming = false;
+    disconnectKey = '';
+    disconnected = false;
     try {
       if (switching) await signOut(auth);
       await signInWithPopup(auth, new OAuthProvider('apple.com'));
     } catch {
-      if (!auth.currentUser) return signedOutView('ログインできませんでした。');
+      if (!auth.currentUser) return signedOutView('common.loginFailed');
     }
+    await refreshConnection();
+  });
+}
+
+/** 本人の明示操作での再確認（解除後の送信封鎖もここで解く。確認済みの現在状態が戻るまでは封鎖のまま）。 */
+function manualRefresh() {
+  return exclusive(async () => {
+    disconnected = false;
+    disconnectKey = '';
     await refreshConnection();
   });
 }
@@ -392,7 +476,7 @@ async function send() {
   // 入力値を一度だけ捕捉し、trim・正規化せずそのまま送る（trimは空白だけの判定に使うだけ）。
   const text = el('sttd-text').value;
   if (typeof text !== 'string' || text.trim() === '' || LONE_SURROGATE.test(text) || new TextEncoder().encode(text).length > MAX_TEXT_BYTES) {
-    note = '送る文は空白以外の文字を含め、4096バイト以内で入力してください（対にならない文字は送れません。送信されていません）。';
+    note = 'console.inputInvalid';
     return render();
   }
   // 最初のawaitの前にこの1件を確定する（二重クリックで2件目を作らない）。
@@ -400,6 +484,7 @@ async function send() {
   const current = { commandId: crypto.randomUUID(), state: null, postDone: false, rejected: null, cancel: 'none', checking: false, checkNote: '' };
   test = current;
   note = '';
+  confirming = false;
   render();
   const payload = JSON.stringify({
     schemaVersion: 2,
@@ -413,8 +498,8 @@ async function send() {
   current.postDone = true;
   const state = stateOf(current, outcome);
   if (state !== null) apply(current, state);
-  else if (outcome.kind === 'not_sent') current.rejected = 'ログイン状態を確認できなかったため送信していません。';
-  else if (outcome.kind === 'response' && Object.hasOwn(ERROR_TEXT, outcome.status)) current.rejected = ERROR_TEXT[outcome.status];
+  else if (outcome.kind === 'not_sent') current.rejected = 'console.notSent';
+  else if (outcome.kind === 'response' && ERROR_STATUSES.includes(outcome.status)) current.rejected = 'console.error.' + outcome.status;
   render();
 }
 
@@ -446,8 +531,8 @@ async function check() {
   current.checking = false;
   const state = stateOf(current, outcome);
   if (state !== null) apply(current, state);
-  else if (outcome.kind === 'response' && outcome.status === 404) current.checkNote = '受付の記録が見つかりませんでした（送信されていない可能性があります）。';
-  else current.checkNote = '結果を確認できませんでした。';
+  else if (outcome.kind === 'response' && outcome.status === 404) current.checkNote = 'console.checkNotFound';
+  else current.checkNote = 'console.checkFailed';
   render();
 }
 
@@ -456,24 +541,93 @@ function newTest() {
   if (current === null || phaseOf(current) === 'sending' || current.cancel === 'pending' || current.checking) return;
   const uncertain = phaseOf(current) === 'unknown' || current.state === 'delivery_unknown' || current.state === 'in_flight' || (current.cancel === 'unconfirmed' && current.state !== 'cancelled');
   test = null;
-  note = uncertain ? DUPLICATE_WARNING : '';
+  note = uncertain ? 'console.duplicateWarning' : '';
   render();
+}
+
+/** 解除の確認を開く（送信中・処理中・未ログイン・未接続では開かない。ここでは何も送らない）。 */
+function askDisconnect() {
+  if (busy() || !signedIn || connection === null || connection === 'unlinked') return;
+  confirming = true;
+  disconnectKey = '';
+  render();
+}
+
+/** 確認の取消（何も送らず、状態も変えない）。 */
+function keepConnection() {
+  if (busy()) return;
+  confirming = false;
+  render();
+}
+
+/**
+ * 本人の確認後に1回だけ解除する（排他。期限10秒に認証取得を含める。tokenはAuthorizationだけ、同originのcookieは送る）。
+ * 失敗・期限切れ・応答不明では成功を装わず、どの結果でも接続状態を再確認し、本人が再確認するまで送信を封鎖する。
+ */
+function disconnect() {
+  if (!confirming) return;
+  return exclusive(async () => {
+    confirming = false;
+    disconnected = true;
+    disconnectKey = 'common.disconnecting';
+    render();
+    const deadline = Date.now() + DISCONNECT_MS;
+    const got = await within(idToken(), DISCONNECT_MS);
+    let ok = false;
+    if (Object.hasOwn(got, 'value') && deadline - Date.now() > 0) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), deadline - Date.now());
+      try {
+        const response = await fetch('/v1/web/disconnect', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + got.value },
+          credentials: 'same-origin',
+          cache: 'no-store',
+          redirect: 'error',
+          signal: controller.signal,
+        });
+        let json = null;
+        try {
+          json = await response.json();
+        } catch {
+          json = null;
+        }
+        ok = response.ok && json !== null && typeof json.state === 'string' && CONNECTION_STATES.includes(json.state);
+      } catch {
+        ok = false;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    disconnectKey = ok ? 'common.disconnectDone' : 'common.disconnectFailed';
+    await refreshConnection();
+  });
 }
 
 async function start() {
   el('sttd-login').onclick = () => login(false);
   el('sttd-switch').onclick = () => login(true);
-  el('sttd-refresh').onclick = () => exclusive(refreshConnection);
+  el('sttd-refresh').onclick = () => manualRefresh();
+  el('sttd-disconnect').onclick = () => askDisconnect();
+  el('sttd-disconnect-yes').onclick = () => disconnect();
+  el('sttd-disconnect-no').onclick = () => keepConnection();
   el('sttd-send').onclick = () => send();
   el('sttd-cancel').onclick = () => cancel();
   el('sttd-check').onclick = () => check();
   el('sttd-new').onclick = () => newTest();
+  for (const code of ['en', 'ja']) {
+    el('sttd-lang-' + code).onclick = (event) => {
+      if (event && typeof event.preventDefault === 'function') event.preventDefault();
+      chooseLanguage(code);
+    };
+  }
+  render();
   await auth.authStateReady();
   if (!auth.currentUser) return signedOutView();
   await exclusive(refreshConnection);
 }
 
-await start().catch(() => signedOutView('ログイン状態を確認できませんでした。'));
+await start().catch(() => signedOutView('common.loginUnknown'));
 `;
 
 /** 固定3 pathのasset（それ以外はundefined）。 */
@@ -483,10 +637,10 @@ export interface ConsoleAsset {
   readonly headers: Record<string, string>;
 }
 
-export function consoleAsset(path: string, web: FirebaseWebConfig, apiOrigin: string): ConsoleAsset | undefined {
+export function consoleAsset(path: string, web: FirebaseWebConfig, apiOrigin: string, language: Language = DEFAULT_LANGUAGE): ConsoleAsset | undefined {
   switch (path) {
     case CONSOLE_PATH:
-      return { type: 'text/html; charset=utf-8', body: renderConsolePage(web, apiOrigin), headers: consoleSecurityHeaders(web, apiOrigin) };
+      return { type: 'text/html; charset=utf-8', body: renderConsolePage(web, apiOrigin, language), headers: consoleSecurityHeaders(web, apiOrigin) };
     case CONSOLE_SCRIPT_PATH:
       return { type: 'text/javascript; charset=utf-8', body: CONSOLE_SCRIPT, headers: {} };
     case CONSOLE_STYLE_PATH:

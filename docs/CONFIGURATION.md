@@ -1,5 +1,7 @@
 # 配置設定
 
+[English](CONFIGURATION_EN.md) | 日本語
+
 設定の正本は `src/config/deployment.ts` の1 fileだけです。配置前に編集してbuildします。実行時にHTTP・環境変数・引数から設定を選んだり上書きしたりする口はありません（MCPのlisten portと、Firebase Web API keyの値を読む環境変数を除く）。
 
 ## 検証

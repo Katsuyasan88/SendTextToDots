@@ -1,5 +1,7 @@
 # Third-party notices
 
+[English](THIRD_PARTY_NOTICES_EN.md) | 日本語
+
 SendTextToDots自身のsource（`LICENSE` のMIT）とは別に、次の第三者の素材を利用します。第三者の著作権・licenseはそれぞれの権利者に帰属し、MITへ置き換えるものではありません。
 
 ## 1. npm package（固定lock）

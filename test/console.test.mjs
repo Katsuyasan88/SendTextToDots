@@ -101,6 +101,8 @@ test('C2 applyConsoleCors writes 204 / fixed 403 itself (caller stops before SDK
 
 test('A1 /console assets: fixed HTML/JS/CSS, empty textarea without direction UI or default text, data attributes escaped, no inline script/style; CSP adds only self CSS + the fixed API connect-src; the OAuth page CSP is unchanged', () => {
   const page = consoleAsset('/console', WEB, API);
+  assert.ok(page.body.startsWith('<!DOCTYPE html>\n<html lang="en">'), 'default language en');
+  assert.ok(consoleAsset('/console', WEB, API, 'ja').body.startsWith('<!DOCTYPE html>\n<html lang="ja">'));
   assert.equal(page.type, 'text/html; charset=utf-8');
   assert.ok(page.body.includes(`data-sttd-api-origin="${API}"`));
   assert.ok(page.body.includes('<script type="module" src="/console/app.js"></script>') && page.body.includes('<link rel="stylesheet" href="/console/app.css">'));
@@ -152,7 +154,7 @@ test('S1 the script builds the 5-field v2 command (no task/direction/revision), 
   for (const needle of ["request('/v2/commands', 'POST'", "request('/v2/commands/' + current.commandId + '/cancel', 'POST'", "request('/v2/commands/' + current.commandId, 'GET'", "'Idempotency-Key': current.commandId", "credentials: 'omit'", "redirect: 'error'", 'const POST_MS = 25000;', 'const CANCEL_MS = 5000;', 'const LIFETIME_MS = 60000;', "new OAuthProvider('apple.com')", 'await auth.authStateReady();', 'const LONE_SURROGATE = /\\p{Cs}/u;']) {
     assert.ok(s.includes(needle), needle);
   }
-  for (const banned of ['/v1/commands', 'TASK_ID', 'TASK_LABEL', 'taskId', 'taskLabel', 'revision', 'direction', 'schemaVersion: 1', 'localStorage', 'sessionStorage', 'indexedDB', 'setInterval', 'location.', 'history.', 'console.log', 'innerHTML', 'document.cookie', 'addScope', '.normalize(']) {
+  for (const banned of ['/v1/commands', 'TASK_ID', 'TASK_LABEL', 'taskId', 'taskLabel', 'revision', 'direction', 'schemaVersion: 1', 'localStorage', 'sessionStorage', 'indexedDB', 'setInterval', 'location.', 'history.', 'console.log', 'innerHTML', 'document.cookie', 'addScope', '.normalize(', 'form.submit', '.submit(']) {
     assert.equal(s.includes(banned), false, `no ${banned}`);
   }
   // trimは空白だけの判定に使うだけで、送る値は捕捉した`text`のまま（上のpayloadの`text,`）。
@@ -204,7 +206,7 @@ function gate() {
   return { promise, release: (value) => release(value) };
 }
 
-/** 実際の/console HTMLのid・hidden・disabled・textareaの初期値と、body.datasetから合成DOMを作る。 */
+/** 実際の/console HTMLのid・hidden・disabled・textareaの初期値・data属性と、body.datasetから合成DOMを作る（言語の差し替えに使うsetAttribute・querySelectorAllも持つ）。 */
 function domFromHtml(html) {
   const elements = new Map();
   const writes = [];
@@ -213,12 +215,18 @@ function domFromHtml(html) {
     let initial = '';
     if (tag === 'textarea') initial = unescapeHtml(html.slice(match.index + match[0].length, html.indexOf('</textarea>', match.index)));
     let textContent = '';
+    const attributes = {};
+    for (const [, name, value] of attrs.matchAll(/\s([a-z0-9-]+)="([^"]*)"/g)) attributes[name] = unescapeHtml(value);
+    const dataset = {};
+    for (const [name, value] of Object.entries(attributes)) if (name.startsWith('data-')) dataset[name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = value;
     const element = {
       id,
       tag,
       hidden: /\shidden(\s|$)/.test(attrs),
       disabled: /\sdisabled(\s|$)/.test(attrs),
       value: initial,
+      placeholder: attributes.placeholder ?? '',
+      dataset,
       onclick: null,
       get textContent() {
         return textContent;
@@ -227,10 +235,16 @@ function domFromHtml(html) {
         textContent = String(value);
         writes.push(textContent);
       },
+      setAttribute(name, value) {
+        attributes[name] = String(value);
+      },
+      getAttribute(name) {
+        return attributes[name] ?? null;
+      },
       /** browserと同じく、disabled・hiddenのbuttonはclickを処理しない。 */
       click() {
         if (this.disabled || this.hidden || typeof this.onclick !== 'function') return false;
-        this.onclick();
+        this.onclick({ preventDefault() {} });
         return true;
       },
     };
@@ -239,13 +253,19 @@ function domFromHtml(html) {
   const bodyAttrs = /<body([^>]*)>/.exec(html)[1];
   const dataset = {};
   for (const [, name, value] of bodyAttrs.matchAll(/\sdata-([a-z0-9-]+)="([^"]*)"/g)) dataset[name.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = unescapeHtml(value);
-  const document = { body: { dataset }, getElementById: (id) => elements.get(id) ?? null };
+  const document = {
+    body: { dataset },
+    documentElement: { lang: /<html lang="([a-z]+)">/.exec(html)[1] },
+    title: /<title>([^<]*)<\/title>/.exec(html)[1],
+    getElementById: (id) => elements.get(id) ?? null,
+    querySelectorAll: () => [...elements.values()].filter((element) => Object.hasOwn(element.dataset, 'sttdI18n')),
+  };
   return { document, elements, writes };
 }
 
-/** CONSOLE_SCRIPTを合成のSDK・fetchで実行する。API originへのfetchはonApi(entry)が返す応答（{status, json}かthrowするPromise）。 */
+/** CONSOLE_SCRIPTを合成のSDK・fetchで実行する（日本語表示）。API originへのfetchはonApi(entry)が返す応答（{status, json}かthrowするPromise）。 */
 async function runConsole(onApi) {
-  const html = consoleAsset('/console', WEB, API).body;
+  const html = consoleAsset('/console', WEB, API, 'ja').body;
   const dom = domFromHtml(html);
   let source = CONSOLE_SCRIPT;
   for (const [line, replacement] of SDK_IMPORTS) {
@@ -281,7 +301,7 @@ async function runConsole(onApi) {
     const entry = { url, method: init.method ?? 'GET', headers: { ...(init.headers ?? {}) }, body: init.body, credentials: init.credentials, redirect: init.redirect, mode: init.mode, cache: init.cache };
     fetches.push(entry);
     if (url === '/v1/web/connection') return { ok: true, status: 200, json: async () => ({ state: 'subscribed' }) };
-    assert.ok(url.startsWith(`${API}/`), 'only the fixed API origin');
+    assert.ok(url.startsWith(`${API}/`), 'only the fixed API origin (no language or disconnect request in this scenario)');
     const { status, json } = await onApi(entry);
     return { ok: status >= 200 && status < 300, status, json: async () => json };
   };

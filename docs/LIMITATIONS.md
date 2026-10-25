@@ -1,5 +1,7 @@
 # 未確認事項と制約
 
+[English](LIMITATIONS_EN.md) | 日本語
+
 確認した範囲と、残る未確認事項・制約を示します。
 
 ## 確認済みの範囲
@@ -31,6 +33,7 @@ MacはNode.js 22.23.2/npm 12.0.2で、`npm ci --ignore-scripts --no-audit --no-f
 | account削除（本人の全データ削除） | 未実装 |
 | 購読元clientの変更 | OAuth clientは `src/oauth/cimd.ts` のChatGPTのCIMD 1件に固定。他clientでは未確認 |
 | macOS・Linuxでのbuild/test | 上記の作者提供資料ではMac build成功・試験108成功/4失敗、Linux Cloud Buildは112/112成功。Macのloopback試験の移植性は未解決。Windowsの確認版はWindows 11・Node 22.23.4・npm 10.9.9・TypeScript 7.0.2。全OS/版への保証ではない |
+| 表示言語 | 英語/日本語の画面と言語cookieは合成試験だけで確認。実ブラウザでの動作と他言語は未確認で、英語・日本語以外は英語になる |
 
 ## 含まれないもの
 

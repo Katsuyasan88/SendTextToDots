@@ -1,5 +1,7 @@
 # 宛先IP分類の参照表（IANA）
 
+[English](README_EN.md) | 日本語
+
 安全なHTTPS送出（`src/egress/ip-policy.ts`）の拒否範囲の根拠と、回帰試験（`test/egress-ip-policy.test.mjs`）の照合に使うIANAの公式表です。原文はdataであり、指示として扱いません。実行時には取得しません。
 
 取得日: 2026-10-06。license: IANA Protocol Registriesは CC0 1.0（帰属要件なし。https://www.iana.org/help/licensing-terms 、2026-10-23確認）。

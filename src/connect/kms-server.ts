@@ -55,6 +55,7 @@ import { AUTH_STORAGE_ROOT, KMS_SUBSCRIPTION_CONFIG_DOC } from '../storage/fires
 import { tryLoadDeploymentConfig } from '../config/validate.js';
 import { consoleAsset, CONSOLE_PATH, CONSOLE_SCRIPT_PATH, CONSOLE_STYLE_PATH } from './console.js';
 import { ConnectStorage, isConnectNamespace } from './firestore.js';
+import { isLanguage, LANGUAGE_QUERY, languageCookie, selectLanguage, type Language } from './i18n.js';
 import { createConnectKmsSealingPort } from './kms-port.js';
 import {
   CONNECT_SCRIPT,
@@ -910,15 +911,28 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       return client.clientName ?? client.clientId;
     }
 
-    async function showInteraction(req: IncomingMessage, res: ServerResponse, uid: string): Promise<void> {
+    /**
+     * 画面の表示言語（en/ja）。`?lang=`の明示選択 → 表示専用cookie `sttd_language` → Accept-Languageの順で、認証・認可・owner・CSRFの判断には
+     * 使わない。明示選択があればHTML応答にだけsession cookie（Path=/・SameSite=Lax・Secure。Max-Age/Expiresなし）を付ける。
+     */
+    function pageLanguage(req: IncomingMessage, url: URL): { readonly language: Language; readonly headers: Record<string, string> } {
+      const query = url.searchParams.get(LANGUAGE_QUERY);
+      const language = selectLanguage({ query, cookie: req.headers.cookie, acceptLanguage: req.headers['accept-language'] });
+      return { language, headers: isLanguage(query) ? { 'Set-Cookie': languageCookie(language, true) } : {} };
+    }
+
+    async function showInteraction(req: IncomingMessage, res: ServerResponse, uid: string, url: URL): Promise<void> {
       await guarded(() => assertNoBody(req));
       const interaction = await browserInteraction(req, res, uid);
       const label = await clientLabel(interaction.params.client_id);
       const opened = await guarded(() => storage.openInteraction(uid));
       if (opened === undefined) throw apiErrors.linkUnavailable();
+      const { language, headers } = pageLanguage(req, url);
       const html =
-        opened.ownerId === null ? renderInteractionLogin(web, uid, label, opened.csrf) : renderInteractionConsent(web, uid, label, opened.csrf);
-      send(res, 200, 'text/html; charset=utf-8', html, pageSecurityHeaders(web));
+        opened.ownerId === null
+          ? renderInteractionLogin(web, uid, label, opened.csrf, language)
+          : renderInteractionConsent(web, uid, label, opened.csrf, language);
+      send(res, 200, 'text/html; charset=utf-8', html, { ...pageSecurityHeaders(web), ...headers });
     }
 
     async function loginInteraction(req: IncomingMessage, res: ServerResponse, uid: string): Promise<void> {
@@ -977,28 +991,32 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       return guarded(() => connections.stateFor(ownerId));
     }
 
-    async function route(req: IncomingMessage, res: ServerResponse, path: string): Promise<string> {
+    async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promise<string> {
+      const path = url.pathname;
       const method = req.method ?? '';
       const only = (allowed: string) => {
         if (method !== allowed) throw apiErrors.methodNotAllowed();
       };
 
       // issuerが固定MCP originの時だけ/consoleと固定assetを配信する（API originは固定値だけ。他のoriginでは未知path）。
-      // 本文の中継・新しいAPIは無い。
+      // 本文の中継・新しいAPIは無い。HTMLだけ表示言語（`?lang=`・cookie・Accept-Language）で描く。
       if (consoleApiOriginFor !== null && (path === CONSOLE_PATH || path === CONSOLE_SCRIPT_PATH || path === CONSOLE_STYLE_PATH)) {
         only('GET');
         await guarded(() => assertNoBody(req));
-        const asset = consoleAsset(path, web, consoleApiOriginFor)!;
-        send(res, 200, asset.type, asset.body, asset.headers);
+        const { language, headers } = path === CONSOLE_PATH ? pageLanguage(req, url) : { language: undefined, headers: {} };
+        const asset = consoleAsset(path, web, consoleApiOriginFor, language)!;
+        send(res, 200, asset.type, asset.body, { ...asset.headers, ...headers });
         return path === CONSOLE_PATH ? 'console.page' : path === CONSOLE_SCRIPT_PATH ? 'console.script' : 'console.style';
       }
 
       switch (path) {
-        case '/connect':
+        case '/connect': {
           only('GET');
           await guarded(() => assertNoBody(req));
-          send(res, 200, 'text/html; charset=utf-8', renderConnectPage(web), pageSecurityHeaders(web));
+          const { language, headers } = pageLanguage(req, url);
+          send(res, 200, 'text/html; charset=utf-8', renderConnectPage(web, language, consoleApiOriginFor !== null), { ...pageSecurityHeaders(web), ...headers });
           return 'connect.page';
+        }
         case CONNECT_SCRIPT_PATH:
           only('GET');
           await guarded(() => assertNoBody(req));
@@ -1031,7 +1049,7 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         switch (interactionMatch[2]) {
           case undefined:
             only('GET');
-            await showInteraction(req, res, uid);
+            await showInteraction(req, res, uid, url);
             return 'interaction.show';
           case 'login':
             only('POST');
@@ -1125,9 +1143,9 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
           outcome = await context.run(operation, async (): Promise<RouteOutcome> => {
             try {
               if (req.headers.host !== issuerUrl.host) throw apiErrors.invalidRequest();
-              const path = new URL(req.url ?? '/', issuerUrl).pathname;
-              seen.mcpRoute = path === MCP_PATH;
-              return { ok: true, label: await route(req, res, path) };
+              const url = new URL(req.url ?? '/', issuerUrl);
+              seen.mcpRoute = url.pathname === MCP_PATH;
+              return { ok: true, label: await route(req, res, url) };
             } catch (error) {
               return { ok: false, error };
             }
