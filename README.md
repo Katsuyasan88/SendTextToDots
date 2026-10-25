@@ -57,6 +57,8 @@ External service eligibility, agreements, permissions, and costs are your respon
 6. Open `/console` on your deployed MCP origin and sign in with Apple (the screen offers English and Japanese). Connect the MCP server from Dots/ChatGPT through OAuth and subscribe to `text.submitted`; the screen shows "Receiving" once the subscription is confirmed.
 7. On the same `/console` screen, send one text from its empty input. Confirm the text on the receiving side. Alternatively, use the API example below after establishing a subscription. "Disconnect" on the same screen revokes the authorization and subscription after a confirmation.
 
+The [Dots receiving and response guide](docs/DOTS_GUIDE_EN.md) provides instructions to paste into your receiving Dots: first for an exact-text delivery check, then for normal replies that quote short messages, summarize long ones, and omit secrets. Both instructions are also available in the send screen's guide, in its selected language.
+
 The distributed configuration is unset (`configured: false`). If built and deployed unchanged, both services stop with a fixed configuration error before SDK creation, credential acquisition, database access, or external HTTP.
 
 ## API at a glance

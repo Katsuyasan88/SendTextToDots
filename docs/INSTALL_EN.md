@@ -205,6 +205,8 @@ The MCP CPU/memory/instance counts are starting examples, not load-tested recomm
 
 ## 6. Connect, send the first message, and plan the shutdown
 
+Follow the [Dots receiving and response guide](DOTS_GUIDE_EN.md): paste the test instructions into the receiving Dots, verify that the received text matches your sent message, and then paste the operational instructions. The send screen's connection guide shows and copies these instructions in its selected language. Copying does not send them to Dots, and the screen does not automatically verify a text match or a completed switch.
+
 1. Open `/console` on the MCP origin and sign in with Apple. The screen is available in English and Japanese (the language links at the top of the page; the initial language follows the browser preference). The MCP server registration target for Dots/ChatGPT is **`/mcp` on the MCP origin**. Do not register `/console`, `/connect` or the API origin.
 2. From Dots/ChatGPT, connect through OAuth and give explicit consent as the same Firebase user. Subscribe to `text.submitted` and confirm that the state is "Receiving". Opening the send screen alone does not create a subscription.
 3. Enter text into the empty input of `/console` on the MCP origin and send one message. Confirm on the receiving side that it is shown exactly as typed. If you want it to be executed as an instruction, instruct the Dots side to treat it that way. STTD itself does not execute the text.

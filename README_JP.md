@@ -57,6 +57,8 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 6. 配置したMCP originの`/console`でAppleログイン（画面はEnglish/日本語を選べます）。Dots/ChatGPT側からMCP serverへOAuth接続し、`text.submitted`を購読すると画面が「受信中」になります。
 7. 同じ`/console`の空欄に本文を入力し、1件送って受信側で確認します。購読後は下のAPI例でも送信できます。同じ画面の「接続を解除」は確認の後に認可と購読を失効させます。
 
+[Dotsの受信テストと応答設定](docs/DOTS_GUIDE.md)に、受信先Dotsへ貼る指示文を用意しています。本文一致の配送確認を行った後、短文は引用・長文は要約・秘密情報は省く通常の応答へ切り替えられます。送信画面の案内でも、選択中の言語で両方の文面を表示・コピーできます。
+
 配布設定は未設定（`configured: false`）です。そのままbuild・配置しても、両serviceはSDK生成・資格取得・DB・外部HTTPの前に固定の設定errorで止まります。
 
 ## APIの最小例
