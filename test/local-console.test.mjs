@@ -49,8 +49,27 @@ function upstream() {
       });
     }
     if (state.mode === 'fail') throw new TypeError('synthetic upstream failure');
-    const body = Buffer.from(state.body, 'utf8');
-    return { status: state.status, headers: { get: (name) => state.headers[name.toLowerCase()] ?? null }, arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) };
+    // 応答本文はstream（chunkごと）。stream modeでは無限に近いchunkを流し、helperが累積上限でcancelすることを観測する。
+    const stream = { pulled: 0, cancelled: false };
+    entry.stream = stream;
+    const bodyBytes = Buffer.from(state.body, 'utf8');
+    const chunk = Buffer.alloc(4096, 0x61);
+    const body = new ReadableStream({
+      pull(controller) {
+        stream.pulled += 1;
+        if (state.mode === 'stream') {
+          if (stream.pulled > 1000) controller.close();
+          else controller.enqueue(new Uint8Array(chunk));
+          return;
+        }
+        if (stream.pulled === 1 && bodyBytes.length > 0) controller.enqueue(new Uint8Array(bodyBytes));
+        else controller.close();
+      },
+      cancel() {
+        stream.cancelled = true;
+      },
+    });
+    return { status: state.status, headers: { get: (name) => state.headers[name.toLowerCase()] ?? null }, body };
   };
   return { calls, state, fetch };
 }
@@ -170,7 +189,7 @@ test('P3 relay protection: every defect is refused before any upstream call', as
     ['commands without idempotency key', { method: 'POST', path: '/v2/commands', headers: { ...good, 'Content-Type': 'application/json' }, body: '{}' }, 400, 'invalid_request'],
     ['commands bad idempotency key', { method: 'POST', path: '/v2/commands', headers: { ...good, 'Content-Type': 'application/json', 'Idempotency-Key': 'x' }, body: '{}' }, 400, 'invalid_request'],
     ['commands empty body', { method: 'POST', path: '/v2/commands', headers: { ...good, 'Content-Type': 'application/json', 'Idempotency-Key': ID } }, 400, 'invalid_request'],
-    ['commands oversized', { method: 'POST', path: '/v2/commands', headers: { ...good, 'Content-Type': 'application/json', 'Idempotency-Key': ID }, body: 'x'.repeat(8193) }, 413, 'payload_too_large'],
+    ['commands oversized (over 32 KiB)', { method: 'POST', path: '/v2/commands', headers: { ...good, 'Content-Type': 'application/json', 'Idempotency-Key': ID }, body: 'x'.repeat(32769) }, 413, 'payload_too_large'],
   ];
   for (const [name, options, status, expectedCode] of cases) {
     const response = await raw(port, options);
@@ -249,4 +268,37 @@ test('P4 relay: each allowed route reaches its fixed upstream with only the fixe
   up.state.mode = 'ok';
   up.state.held = null;
   results.P4 = { upstreamCalls: up.calls.length };
+});
+
+test('P5 bounds: a legitimate 4096-byte text whose JSON escapes to several times that size is relayed (32 KiB JSON limit); an upstream body that streams past 64 KiB is cancelled at the limit and answered with a fixed 502; a lying Content-Length over the limit is refused before reading', async () => {
+  const { server, up } = await start();
+  const port = server.port;
+  const good = { Authorization: TOKEN, [LOCAL_NONCE_HEADER]: server.nonce };
+  // text: 'a' + 4095個の改行 = 4096 UTF-8 byte（空白だけではない）。JSONでは改行が \\n に膨らむ。
+  const text = `a${'\n'.repeat(4095)}`;
+  assert.equal(Buffer.byteLength(text, 'utf8'), 4096);
+  const payload = JSON.stringify({ schemaVersion: 2, commandId: ID, text, createdAt: '2026-10-26T00:00:00Z', expiresAt: '2026-10-26T00:01:00Z' });
+  assert.ok(Buffer.byteLength(payload, 'utf8') > 8192 && Buffer.byteLength(payload, 'utf8') <= 32768, `escaped payload ${Buffer.byteLength(payload, 'utf8')} bytes`);
+  const quoted = JSON.stringify({ schemaVersion: 2, commandId: ID, text: '"'.repeat(4096), createdAt: '2026-10-26T00:00:00Z', expiresAt: '2026-10-26T00:01:00Z' });
+  for (const body of [payload, quoted]) {
+    const response = await raw(port, { method: 'POST', path: '/v2/commands', headers: { ...good, 'Content-Type': 'application/json', 'Idempotency-Key': ID }, body });
+    assert.equal(response.status, 200, 'legitimate payload relayed');
+    assert.equal(Buffer.from(up.calls.at(-1).init.body).toString('utf8'), body, 'body forwarded byte for byte');
+  }
+  // 上流がstreamで64 KiB超を流す → 上限でcancel/abortし、固定502。読み込みは上限付近で止まる（1000 chunk = 4 MiBは読まない）。
+  up.state.mode = 'stream';
+  const flooded = await raw(port, { path: `/v2/commands/${ID}`, headers: good });
+  assert.deepEqual([flooded.status, code(flooded)], [502, 'upstream_unavailable']);
+  const call = up.calls.at(-1);
+  assert.ok(call.stream.cancelled && call.aborted, 'reader cancelled and upstream aborted');
+  assert.ok(call.stream.pulled >= 17 && call.stream.pulled <= 20, `stopped near the limit (${call.stream.pulled} chunks of 4 KiB)`);
+  up.state.mode = 'ok';
+  // Content-Lengthが上限超を宣言 → 読む前に502。
+  Object.assign(up.state, { headers: { ...up.state.headers, 'content-length': String(65537) } });
+  const declared = await raw(port, { path: `/v2/commands/${ID}`, headers: good });
+  assert.deepEqual([declared.status, code(declared)], [502, 'upstream_unavailable']);
+  // ReadableStreamは構築時にpullを1回先読みするため、helperがreaderを取らなくてもpulledは最大1。それ以上読まれず、上流は中止される。
+  assert.ok(up.calls.at(-1).stream.pulled <= 1, `body not consumed when the declared length exceeds the limit (${up.calls.at(-1).stream.pulled})`);
+  assert.equal(up.calls.at(-1).aborted, true, 'upstream aborted on a declared length over the limit');
+  results.P5 = { escapedPayloadBytes: Buffer.byteLength(payload, 'utf8'), floodedChunks: call.stream.pulled };
 });

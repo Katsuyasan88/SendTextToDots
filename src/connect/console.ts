@@ -146,7 +146,7 @@ ${stepHead(4, 'wizard.step4')}
 ${stepHead(5, 'wizard.step5')}
 </ol>
 <p id="sttd-wizard-note" role="status"></p>
-<section id="sttd-panel-1" class="sttd-panel" aria-labelledby="sttd-step-1-head">
+<section id="sttd-panel-1" class="sttd-panel" aria-labelledby="sttd-step-1-head" data-sttd-state="current" tabindex="0">
 <p id="sttd-login-intro"${i18n('wizard.loginIntro')}>${t('wizard.loginIntro')}</p>
 <p id="sttd-account-text" role="status">${t('console.accountSignedOut')}</p>
 <div class="sttd-actions">
@@ -154,7 +154,7 @@ ${stepHead(5, 'wizard.step5')}
 <button type="button" id="sttd-switch" hidden${i18n('common.switchAccount')}>${t('common.switchAccount')}</button>
 </div>
 </section>
-<section id="sttd-panel-2" class="sttd-panel" aria-labelledby="sttd-step-2-head" hidden>
+<section id="sttd-panel-2" class="sttd-panel" aria-labelledby="sttd-step-2-head" data-sttd-state="locked" tabindex="0">
 <p id="sttd-state-intro"${i18n('wizard.stateIntro')}>${t('wizard.stateIntro')}</p>
 <p id="sttd-state-text" role="status"></p>
 <p id="sttd-state-guide"></p>
@@ -169,12 +169,12 @@ ${stepHead(5, 'wizard.step5')}
 </div>
 <p id="sttd-disconnect-result" role="status"></p>
 </section>
-<section id="sttd-panel-3" class="sttd-panel" aria-labelledby="sttd-step-3-head" hidden>
+<section id="sttd-panel-3" class="sttd-panel" aria-labelledby="sttd-step-3-head" data-sttd-state="locked" tabindex="0">
 <p id="sttd-guide-intro"${i18n('guide.intro')}>${t('guide.intro')}</p>
 <p id="sttd-guide-step1"${i18n('guide.step1')}>${t('guide.step1')}</p>
 ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wizard.pastedTestNext')}
 </section>
-<section id="sttd-panel-4" class="sttd-panel" aria-labelledby="sttd-step-4-head" hidden>
+<section id="sttd-panel-4" class="sttd-panel" aria-labelledby="sttd-step-4-head" data-sttd-state="locked" tabindex="0">
 <p id="sttd-send-intro"${i18n('wizard.sendIntro')}>${t('wizard.sendIntro')}</p>
 <label id="sttd-text-label" for="sttd-text"${i18n('console.textLabel')}>${t('console.textLabel')}</label>
 <textarea id="sttd-text" rows="4" maxlength="4096" placeholder="${t('console.textPlaceholder')}" disabled></textarea>
@@ -189,11 +189,11 @@ ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wi
 <button type="button" id="sttd-verify-send" disabled${i18n('wizard.sendVerified')}>${t('wizard.sendVerified')}</button>
 <p id="sttd-verify-hint" class="sttd-note"${i18n('wizard.sendNotVerifiable')}>${t('wizard.sendNotVerifiable')}</p>
 </section>
-<section id="sttd-panel-5" class="sttd-panel" aria-labelledby="sttd-step-5-head" hidden>
+<section id="sttd-panel-5" class="sttd-panel" aria-labelledby="sttd-step-5-head" data-sttd-state="locked" tabindex="0">
 <p id="sttd-guide-step3"${i18n('guide.step3')}>${t('guide.step3')}</p>
 ${instructions('operation', 'guide.showOperation', 'guide.operationText', 'guide.copyOperation', 'wizard.pastedOperationFinish')}
-<p id="sttd-complete" class="sttd-complete" role="status" hidden${i18n('wizard.complete')}>${t('wizard.complete')}</p>
 </section>
+<p id="sttd-complete" class="sttd-complete" role="status" hidden${i18n('wizard.complete')}>${t('wizard.complete')}</p>
 </main>
 </body></html>`;
 }
@@ -229,6 +229,9 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-actions { display: flex; flex-wrap: wrap; }
 #sttd-result, #sttd-disconnect-result, #sttd-wizard-note { font-weight: 600; min-height: 1.5em; overflow-wrap: anywhere; }
 .sttd-note { font-size: 0.85rem; color: #4a5059; }
+.sttd-panel[data-sttd-state="locked"] { opacity: 0.55; background: #eceef1; }
+.sttd-panel[data-sttd-state="done"], .sttd-panel[data-sttd-state="ready"] { opacity: 0.8; background: #f5f6f8; cursor: pointer; }
+.sttd-panel[data-sttd-state="current"] { border: 2px solid #1f5fbf; }
 .sttd-complete { font-weight: 700; border: 2px solid #1f5fbf; border-radius: 8px; padding: 0.75rem; }
 [hidden] { display: none !important; }
 `;
@@ -287,6 +290,11 @@ let disconnectKey = '';
 let copyKey = '';
 let copyFor = '';
 let copying = false;
+// コピー結果の世代（resetごとに進む。古い成功/失敗で新しい手順の完了条件を満たさない）。
+let copyEpoch = 0;
+// ログイン確定時のowner（Firebase uid。RAMだけ。DOM/log/storageへ出さない）と認証observerの登録済み印。
+let ownerUid = null;
+let authObserved = false;
 const copied = { test: false, operation: false };
 const manual = { test: false, operation: false };
 
@@ -309,6 +317,16 @@ function busy() {
 /** 送信中（1件の終端まで）か。 */
 function sending() {
   return test !== null && phaseOf(test) === 'sending';
+}
+
+/** 送信・中止・結果確認のいずれかが進行中か（この間はtestを壊す操作を拒否する）。 */
+function inFlight() {
+  return test !== null && (phaseOf(test) === 'sending' || test.cancel === 'pending' || test.checking);
+}
+
+/** stepの操作（ボタン）を受けるか: 解放済みで、かつ現在activeなpanelであること（非activeのgray panel内のcontrolは誤操作防止で動かさない）。 */
+function canAct(n) {
+  return available(n) && step === n;
 }
 
 /** stepが使えるか（DOMの見た目に頼らず、各handlerもこれで検査する）。確認中は3以降を一時封鎖。 */
@@ -336,8 +354,9 @@ function verifiable() {
   return test.state === null && test.rejected === null;
 }
 
-/** 手順nから後ろの進捗を戻す（nより前の証跡は消さない）。 */
+/** 手順nから後ろの進捗を戻す（nより前の証跡は消さない）。進行中のコピーの結果はこのresetより前の世代として捨てる。 */
 function resetFrom(n) {
+  copyEpoch += 1;
   for (const k of STEPS) if (k >= n) done[k] = false;
   if (n <= 2) {
     connection = null;
@@ -370,49 +389,55 @@ function render() {
   const phase = test === null ? null : phaseOf(test);
   for (const n of STEPS) {
     const state = step === n ? 'current' : done[n] ? 'done' : available(n) ? 'ready' : 'locked';
-    const item = el('sttd-step-' + n);
-    item.setAttribute('data-sttd-state', state);
+    el('sttd-step-' + n).setAttribute('data-sttd-state', state);
     el('sttd-step-' + n + '-head').disabled = !available(n);
     el('sttd-step-' + n + '-badge').textContent = T(state === 'current' ? 'wizard.badgeCurrent' : state === 'done' ? 'wizard.badgeDone' : state === 'ready' ? '' : 'wizard.badgeLocked');
-    el('sttd-panel-' + n).hidden = step !== n;
+    // 全panelを順に表示し、非active/未解放はgray。panel自身（done/ready）はクリック/keyboardで再活性化できる。
+    const panel = el('sttd-panel-' + n);
+    panel.setAttribute('data-sttd-state', state);
+    panel.setAttribute('aria-disabled', state === 'current' ? 'false' : 'true');
   }
   el('sttd-wizard-note').textContent = T(noteKey);
+  // 非activeのpanel内controlは誤操作防止で全て無効（handlerもcanActで拒否する）。
+  const inactive = (n) => step !== n;
   // 1 ログイン
   el('sttd-account-text').textContent = T(accountKey);
   el('sttd-login').hidden = signedIn;
-  el('sttd-login').disabled = busy() || sending();
+  el('sttd-login').disabled = inactive(1) || busy() || inFlight();
   el('sttd-switch').hidden = !signedIn;
-  el('sttd-switch').disabled = busy() || sending() || confirming;
+  el('sttd-switch').disabled = inactive(1) || busy() || inFlight() || confirming;
   // 2 接続確認
   el('sttd-state-text').textContent = checking ? T('wizard.checking') : connection === null ? T(connectionKey) : T(connection === 'subscribed' ? 'console.state.subscribed' : 'common.state.' + connection);
   el('sttd-state-guide').textContent = checking ? '' : T(guideKey);
-  el('sttd-refresh').disabled = !available(2) || busy() || sending() || confirming;
+  el('sttd-refresh').disabled = inactive(2) || !available(2) || busy() || inFlight() || confirming;
   el('sttd-disconnect').hidden = !signedIn || confirming || connection === null || connection === 'unlinked';
-  el('sttd-disconnect').disabled = busy() || sending();
+  el('sttd-disconnect').disabled = inactive(2) || busy() || inFlight();
   el('sttd-disconnect-confirm').hidden = !confirming;
-  el('sttd-disconnect-yes').disabled = busy();
-  el('sttd-disconnect-no').disabled = busy();
+  el('sttd-disconnect-yes').disabled = inactive(2) || busy();
+  el('sttd-disconnect-no').disabled = inactive(2) || busy();
   el('sttd-disconnect-result').textContent = T(disconnectKey);
   // 3/5 プロンプト
   for (const kind of ['test', 'operation']) {
     const n = kind === 'test' ? 3 : 5;
-    el('sttd-copy-' + kind).disabled = copying || !available(n);
+    el('sttd-copy-' + kind).disabled = inactive(n) || copying || !available(n);
     el('sttd-manual-' + kind).hidden = !(copyFor === kind && (copyKey === 'guide.copyUnavailable' || copyKey === 'guide.copyFailed')) || manual[kind];
-    el('sttd-manual-' + kind).disabled = copying || !available(n);
+    el('sttd-manual-' + kind).disabled = inactive(n) || copying || !available(n);
     el('sttd-copy-result-' + kind).textContent = copyFor === kind ? T(copyKey) : '';
-    el('sttd-done-' + kind).disabled = copying || !available(n) || !(copied[kind] || manual[kind]);
+    el('sttd-done-' + kind).disabled = inactive(n) || copying || !available(n) || !(copied[kind] || manual[kind]) || (kind === 'test' && inFlight());
   }
+  // 完了banner（panel5の外、画面下）: done5の間は手順4へ戻っても表示する。
   el('sttd-complete').hidden = !done[5];
   // 4 送信
-  const sendable = sendableNow();
+  const sendable = sendableNow() && !inactive(4);
   el('sttd-text').disabled = !sendable || test !== null;
   el('sttd-send').disabled = !sendable || test !== null;
   el('sttd-cancel').hidden = test === null || (phase !== 'sending' && phase !== 'unknown') || test.cancel === 'answered' || test.cancel === 'unconfirmed';
-  el('sttd-cancel').disabled = test !== null && test.cancel === 'pending';
+  el('sttd-cancel').disabled = inactive(4) || (test !== null && test.cancel === 'pending');
   el('sttd-check').hidden = test === null || !checkable(test);
-  el('sttd-check').disabled = test !== null && test.checking;
+  el('sttd-check').disabled = inactive(4) || (test !== null && test.checking);
   el('sttd-new').hidden = test === null || phase === 'sending' || test.cancel === 'pending' || test.checking;
-  el('sttd-verify-send').disabled = !available(4) || busy() || !verifiable();
+  el('sttd-new').disabled = inactive(4);
+  el('sttd-verify-send').disabled = inactive(4) || !available(4) || busy() || !verifiable();
   for (const code of ['en', 'ja']) {
     const link = el('sttd-lang-' + code);
     link.setAttribute('aria-current', code === lang ? 'true' : 'false');
@@ -457,6 +482,39 @@ function selectStep(n) {
   render();
 }
 
+/** panel自身のクリック/keyboard（Enter/Space）での再活性化。未解放は何もしない。activeなpanel内の操作は妨げない。 */
+function activatePanel(n, event) {
+  if (step === n || !available(n)) return;
+  if (event && typeof event.preventDefault === 'function' && event.key !== undefined) event.preventDefault();
+  selectStep(n);
+}
+
+/** ログイン中accountの変化（別owner・ログアウト・失効）: 以降の要求を止め、2以降を戻してログインからやり直す。古いasync結果は世代で捨てる。 */
+function authLost(key) {
+  loginGeneration += 1;
+  checkGeneration += 1;
+  checking = false;
+  accountBusy = false;
+  resetFrom(2);
+  signedIn = false;
+  done[1] = false;
+  ownerUid = null;
+  step = 1;
+  accountKey = key || 'common.loginRefresh';
+  noteKey = 'wizard.authChanged';
+  render();
+}
+
+/** 明示ログインの後だけ認証observerを1回登録する（owner変更/ログアウトを検知。ログイン前にはSDKも観測も始めない）。 */
+function observeAuth(s) {
+  if (authObserved || typeof s.auth.onAuthStateChanged !== 'function') return;
+  authObserved = true;
+  s.auth.onAuthStateChanged((user) => {
+    if (!signedIn || ownerUid === null) return;
+    if (!user || user.uid !== ownerUid) authLost('common.loginRefresh');
+  });
+}
+
 // ---- 1 ログイン（SDKはここで初めて読む） ----
 
 function ensureSdk() {
@@ -483,12 +541,13 @@ function popupBlocked(error) {
 
 /** 明示ログイン（switchingは別account）。開始時に2以降を戻す。世代が変わった古い結果では何も解放しない。 */
 async function login(switching) {
-  if (busy() || sending()) return;
+  if (!canAct(1) || busy() || inFlight()) return;
   const gen = ++loginGeneration;
   const hadProgress = done[1];
   resetFrom(2);
   signedIn = false;
   done[1] = false;
+  ownerUid = null;
   step = 1;
   noteKey = hadProgress ? 'wizard.loginReset' : '';
   accountBusy = true;
@@ -518,12 +577,20 @@ async function login(switching) {
       }
     }
     if (gen !== loginGeneration) return;
-    await s.auth.currentUser.getIdToken();
-    if (gen !== loginGeneration) return;
+    const user = s.auth.currentUser;
+    if (!user || typeof user.uid !== 'string' || user.uid === '') {
+      accountKey = 'common.loginFailed';
+      return;
+    }
+    await user.getIdToken();
+    if (gen !== loginGeneration || s.auth.currentUser !== user) return;
+    // ログイン確定時のownerへ束縛し、以降の要求はこのownerの現在userからだけtokenを得る。
+    ownerUid = user.uid;
     signedIn = true;
     done[1] = true;
     accountKey = 'wizard.loginDone';
     step = 2;
+    observeAuth(s);
   } catch {
     if (gen === loginGeneration) accountKey = 'common.loginFailed';
   } finally {
@@ -534,9 +601,16 @@ async function login(switching) {
   }
 }
 
+/** 束縛したownerの現在userからだけtokenを得る。取得の前後で同じowner・同じログイン世代でなければ使わない。 */
 async function idToken() {
-  if (sdk === null || !sdk.auth.currentUser) throw new Error('signed_out');
-  return sdk.auth.currentUser.getIdToken();
+  const gen = loginGeneration;
+  const uid = ownerUid;
+  if (sdk === null || uid === null || !signedIn) throw new Error('signed_out');
+  const user = sdk.auth.currentUser;
+  if (!user || user.uid !== uid) throw new Error('owner_changed');
+  const token = await user.getIdToken();
+  if (gen !== loginGeneration || ownerUid !== uid || sdk.auth.currentUser !== user || user.uid !== uid) throw new Error('owner_changed');
+  return token;
 }
 
 function within(promise, ms) {
@@ -561,8 +635,9 @@ function within(promise, ms) {
  */
 async function request(path, method, ms, headers, payload) {
   const deadline = Date.now() + Math.max(0, ms);
+  const gen = loginGeneration;
   const got = await within(idToken(), deadline - Date.now());
-  if (!Object.hasOwn(got, 'value')) return { kind: 'not_sent' };
+  if (gen !== loginGeneration || !Object.hasOwn(got, 'value')) return { kind: 'not_sent' };
   const remaining = deadline - Date.now();
   if (!(remaining > 0)) return { kind: 'not_sent' };
   const token = got.value;
@@ -585,9 +660,12 @@ async function request(path, method, ms, headers, payload) {
     } catch {
       json = null;
     }
+    if (gen !== loginGeneration) return { kind: 'stale' };
+    // 認証失効（401）: 古い進捗を残さずログインからやり直す（呼出し側の続きは世代/testの検査で止まる）。
+    if (response.status === 401) authLost('common.loginRefresh');
     return { kind: 'response', status: response.status, json };
   } catch {
-    return { kind: 'unknown' };
+    return gen === loginGeneration ? { kind: 'unknown' } : { kind: 'stale' };
   } finally {
     clearTimeout(timer);
   }
@@ -595,22 +673,21 @@ async function request(path, method, ms, headers, payload) {
 
 // ---- 2 接続確認（手動1回。確認中は3以降を封鎖。subscribed継続なら進捗保持、他は3以降を戻す） ----
 
-async function checkConnection() {
-  if (!available(2) || busy() || sending() || confirming) return;
+async function checkConnection(internal) {
+  if (!available(2) || busy() || inFlight() || confirming) return;
+  if (!internal && !canAct(2)) return;
   const gen = ++checkGeneration;
+  const login = loginGeneration;
   checking = true;
   render();
   const outcome = await request('/v1/web/connection', 'GET', CONNECTION_MS, {}, undefined);
-  if (gen !== checkGeneration) return;
+  if (gen !== checkGeneration || login !== loginGeneration) return;
   checking = false;
+  if (outcome.kind === 'stale') return render();
   if (outcome.kind === 'not_sent') {
-    // tokenを得られない: ログインからやり直す。
-    resetFrom(2);
-    signedIn = false;
-    done[1] = false;
-    step = 1;
-    accountKey = 'common.loginRefresh';
-    return render();
+    // tokenを得られない（owner変更/失効/未ログイン）: ログインからやり直す。
+    authLost('common.loginRefresh');
+    return;
   }
   const json = outcome.kind === 'response' ? outcome.json : null;
   if (json && typeof json.state === 'string' && CONNECTION_STATES.includes(json.state)) {
@@ -628,11 +705,9 @@ async function checkConnection() {
       step = 2;
     }
   } else if (outcome.kind === 'response' && outcome.status === 401) {
-    resetFrom(2);
-    signedIn = false;
-    done[1] = false;
-    step = 1;
-    accountKey = 'common.loginRefresh';
+    // request()がauthLostを実行済み（世代が進んで上で戻るのが通常。念のため同じ処理）。
+    authLost('common.loginRefresh');
+    return;
   } else {
     connection = null;
     connectionKey = 'console.connectionUnavailable';
@@ -648,26 +723,28 @@ async function checkConnection() {
 // ---- 解除（確認→1回POST→2以降を戻して再確認） ----
 
 function askDisconnect() {
-  if (busy() || sending() || !signedIn || connection === null || connection === 'unlinked') return;
+  if (!canAct(2) || busy() || inFlight() || !signedIn || connection === null || connection === 'unlinked') return;
   confirming = true;
   disconnectKey = '';
   render();
 }
 
 function keepConnection() {
-  if (busy()) return;
+  if (!canAct(2) || busy()) return;
   confirming = false;
   render();
 }
 
 function disconnect() {
-  if (!confirming || busy() || sending()) return;
+  if (!canAct(2) || !confirming || busy() || inFlight()) return;
   confirming = false;
   accountBusy = true;
   disconnectKey = 'common.disconnecting';
   render();
+  const login = loginGeneration;
   return (async () => {
     const outcome = await request('/v1/web/disconnect', 'POST', DISCONNECT_MS, {}, undefined);
+    if (login !== loginGeneration || outcome.kind === 'stale') return;
     const json = outcome.kind === 'response' ? outcome.json : null;
     const ok = outcome.kind === 'response' && outcome.status >= 200 && outcome.status < 300 && json !== null && typeof json.state === 'string' && CONNECTION_STATES.includes(json.state);
     accountBusy = false;
@@ -678,7 +755,7 @@ function disconnect() {
     connectionKey = '';
     guideKey = '';
     render();
-    await checkConnection();
+    await checkConnection(true);
   })();
 }
 
@@ -686,8 +763,10 @@ function disconnect() {
 
 function copyInstructions(kind) {
   const n = kind === 'test' ? 3 : 5;
-  if (copying || !available(n)) return;
+  if (copying || !canAct(n)) return;
   const text = T(kind === 'operation' ? 'guide.operationText' : 'guide.testText');
+  // この結果はこのresetの世代に束縛する（pending中にreset/再ログイン/再確認があれば捨てる）。
+  const epoch = copyEpoch;
   copyFor = kind;
   const clipboard = typeof navigator === 'object' && navigator !== null ? navigator.clipboard : undefined;
   if (!clipboard || typeof clipboard.writeText !== 'function') {
@@ -705,6 +784,7 @@ function copyInstructions(kind) {
   }
   const finish = (result) => {
     copying = false;
+    if (epoch !== copyEpoch) return render();
     copyKey = result;
     if (result === 'guide.copied') copied[kind] = true;
     render();
@@ -717,19 +797,23 @@ function copyInstructions(kind) {
 
 function confirmManualCopy(kind) {
   const n = kind === 'test' ? 3 : 5;
-  if (copying || !available(n)) return;
+  if (copying || !canAct(n)) return;
   manual[kind] = true;
   copyFor = kind;
   copyKey = 'wizard.manualNoted';
   render();
 }
 
-/** 3の完了操作: コピー（または手動確認）済みの時だけ。再適用なら4/5を戻す。 */
+/** 3の完了操作: コピー（または手動確認）済みの時だけ。再適用なら4/5を戻すが、送信・中止・結果確認の進行中は破壊しない（単回送信とcommandIdを保つ）。 */
 function completeTest() {
-  if (copying || !available(3) || busy()) return;
+  if (copying || !canAct(3) || busy()) return;
   if (!(copied.test || manual.test)) {
     copyFor = 'test';
     copyKey = 'wizard.copyRequired';
+    return render();
+  }
+  if (inFlight()) {
+    noteKey = 'wizard.sendPending';
     return render();
   }
   const reapplied = done[3];
@@ -742,7 +826,7 @@ function completeTest() {
 
 /** 4の完了操作: 本人がDotsで一致を確認した明示操作（受領/不明の終端だけ）。 */
 function verifySend() {
-  if (!available(4) || busy() || !verifiable()) return;
+  if (!canAct(4) || busy() || !verifiable()) return;
   done[4] = true;
   step = 5;
   render();
@@ -750,7 +834,7 @@ function verifySend() {
 
 /** 5の完了操作。 */
 function completeOperation() {
-  if (copying || !available(5) || busy()) return;
+  if (copying || !canAct(5) || busy()) return;
   if (!(copied.operation || manual.operation)) {
     copyFor = 'operation';
     copyKey = 'wizard.copyRequired';
@@ -775,7 +859,7 @@ function apply(current, state) {
 }
 
 async function send() {
-  if (!sendableNow() || test !== null) return;
+  if (!sendableNow() || !canAct(4) || test !== null) return;
   const text = el('sttd-text').value;
   if (typeof text !== 'string' || text.trim() === '' || LONE_SURROGATE.test(text) || new TextEncoder().encode(text).length > MAX_TEXT_BYTES) {
     sendNote = 'console.inputInvalid';
@@ -846,7 +930,14 @@ function newTest() {
 }
 
 function start() {
-  for (const n of STEPS) el('sttd-step-' + n + '-head').onclick = () => selectStep(n);
+  for (const n of STEPS) {
+    el('sttd-step-' + n + '-head').onclick = () => selectStep(n);
+    // 前のpanelのどこをクリックしても（Enter/Spaceでも）再活性化できる。未解放は何もしない。
+    el('sttd-panel-' + n).onclick = (event) => activatePanel(n, event);
+    el('sttd-panel-' + n).onkeydown = (event) => {
+      if (event && (event.key === 'Enter' || event.key === ' ')) activatePanel(n, event);
+    };
+  }
   el('sttd-login').onclick = () => login(false);
   el('sttd-switch').onclick = () => login(true);
   el('sttd-refresh').onclick = () => checkConnection();

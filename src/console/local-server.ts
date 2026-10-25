@@ -21,7 +21,8 @@ import { ConsoleConfigFileError, loadLocalConsoleConfig, validateLocalConsoleCon
 
 export const DEFAULT_LOCAL_PORT = 8765;
 const BIND_HOST = '127.0.0.1';
-const MAX_COMMAND_BODY_BYTES = 8192;
+/** POST /v2/commandsの本文上限。本文textは最大4096 UTF-8 byteだがJSON escapeで最大6倍（制御文字）になり、5項目のmetadataも付くので、正規のpayload全体が収まる有限値（32 KiB）。APIの本文上限4096 byte自体は変えない。 */
+const MAX_COMMAND_BODY_BYTES = 32768;
 const MAX_UPSTREAM_BODY_BYTES = 65536;
 const BEARER = /^Bearer [A-Za-z0-9._-]{1,4096}$/;
 const UUID = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
@@ -93,11 +94,40 @@ async function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer>
   return Buffer.concat(chunks);
 }
 
+/** 上流応答のstreamを累積上限まで読む。超過・中止はreaderをcancelして失敗（読み込んだbytesは上限を超えて保持しない）。 */
+async function readUpstreamBody(body: UpstreamResponseBody, maxBytes: number, controller: AbortController): Promise<Buffer> {
+  if (body === null) return Buffer.alloc(0);
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      if (controller.signal.aborted) throw new Error('aborted');
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        controller.abort();
+        throw new Error('too_large');
+      }
+      chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  }
+  return Buffer.concat(chunks);
+}
+
+type UpstreamResponseBody = { getReader(): { read(): Promise<{ done: boolean; value?: Uint8Array | undefined }>; cancel(reason?: unknown): Promise<void> } } | null;
+
 /** 上流fetchの最小の形（試験は合成fetchを注入する）。 */
 export type UpstreamFetch = (url: string, init: { method: string; headers: Record<string, string>; body?: Uint8Array | undefined; redirect: 'error'; signal: AbortSignal; cache: 'no-store'; credentials: 'omit' }) => Promise<{
   readonly status: number;
   readonly headers: { get(name: string): string | null };
-  arrayBuffer(): Promise<ArrayBuffer>;
+  /** 応答本文のstream（null可）。accumulated上限で止めるため全体を一度に読まない。 */
+  readonly body: { getReader(): { read(): Promise<{ done: boolean; value?: Uint8Array | undefined }>; cancel(reason?: unknown): Promise<void> } } | null;
 }>;
 
 export interface LocalConsoleOptions {
@@ -193,14 +223,19 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
         if (controller.signal.aborted && res.destroyed) return;
         return sendError(res, 502, 'upstream_unavailable', true);
       }
+      // Content-Lengthは信用せず、streamを累積上限まで読む。超過・期限・中止ではreaderをcancelして固定502（本文は捨てる）。
+      const declaredLength = response.headers.get('content-length');
+      if (typeof declaredLength === 'string' && !(Number(declaredLength) <= MAX_UPSTREAM_BODY_BYTES)) {
+        controller.abort();
+        return sendError(res, 502, 'upstream_unavailable', true);
+      }
       let payload: Buffer;
       try {
-        payload = Buffer.from(await response.arrayBuffer());
+        payload = await readUpstreamBody(response.body, MAX_UPSTREAM_BODY_BYTES, controller);
       } catch {
         if (controller.signal.aborted && res.destroyed) return;
         return sendError(res, 502, 'upstream_unavailable', true);
       }
-      if (payload.length > MAX_UPSTREAM_BODY_BYTES) return sendError(res, 502, 'upstream_unavailable', true);
       const forwarded: Record<string, string> = {};
       const contentType = response.headers.get('content-type');
       if (typeof contentType === 'string' && /^[\x21-\x7e][\x20-\x7e]{0,126}$/.test(contentType)) forwarded['Content-Type'] = contentType;

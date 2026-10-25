@@ -95,13 +95,20 @@ test('W1 initial page: nothing is fetched and the SDK is not loaded; only step 1
   const { el } = ui;
   assert.deepEqual([ui.fetches.length, sdk.calls.loads, sdk.calls.popups, sdk.calls.tokens], [0, 0, 0, 0], 'no upstream and no SDK on load, even with a restored session');
   assert.deepEqual([1, 2, 3, 4, 5].map(ui.stepState), ['current', 'locked', 'locked', 'locked', 'locked']);
-  assert.equal(el('sttd-panel-1').hidden, false);
+  // 全panelは隠さず順に表示し、非active/未解放はgray（data-sttd-state・aria-disabled）。未解放panelはクリック/keyboard/handlerでも開かず通信しない。
+  for (const n of [1, 2, 3, 4, 5]) assert.equal(el('sttd-panel-' + n).hidden, false, `panel ${n} visible`);
+  assert.deepEqual([1, 2, 3, 4, 5].map(ui.panelState), ['current', 'locked', 'locked', 'locked', 'locked']);
+  assert.equal(el('sttd-panel-1').getAttribute('aria-disabled'), 'false');
   for (const n of [2, 3, 4, 5]) {
-    assert.equal(el('sttd-panel-' + n).hidden, true);
+    assert.equal(el('sttd-panel-' + n).getAttribute('aria-disabled'), 'true');
     assert.equal(el(`sttd-step-${n}-head`).click(), false, `step ${n} head disabled`);
     el(`sttd-step-${n}-head`).onclick();
-    assert.equal(el('sttd-panel-' + n).hidden, true, `step ${n} does not open through the handler either`);
+    ui.clickPanel(n);
+    ui.keyPanel(n, 'Enter');
+    assert.equal(ui.panelState(n), 'locked', `step ${n} does not activate through any handler`);
   }
+  // 非activeのpanel内controlは無効。
+  for (const id of ['sttd-refresh', 'sttd-copy-test', 'sttd-done-test', 'sttd-send', 'sttd-verify-send', 'sttd-copy-operation', 'sttd-done-operation']) assert.equal(el(id).disabled, true, `${id} inert`);
   // 未解放のhandlerを直接呼んでも通信しない。
   el('sttd-refresh').onclick();
   el('sttd-send').onclick();
@@ -164,6 +171,8 @@ test('W2 sign-in: the explicit button loads the SDK once and opens the popup; a 
   await settle();
   assert.equal(ui.stepState(3), 'current');
   sdk.calls.popupMode = 'fail';
+  assert.equal(el('sttd-switch').disabled, true, 'inactive step 1 controls are inert until the panel is re-activated');
+  assert.equal(ui.clickPanel(1), true);
   assert.equal(el('sttd-switch').click(), true);
   await settle();
   assert.deepEqual([ui.stepState(1), ui.stepState(2), ui.stepState(3)], ['current', 'locked', 'locked'], 'retrying resets steps 2+');
@@ -235,8 +244,9 @@ test('W3 connection check: one manual GET; subscribed advances to step 3; each o
   await settle();
   assert.equal(uiB.stepState(4), 'current');
   holdNext = true;
-  assert.equal(uiB.el('sttd-step-2-head').click(), true, 'a done step can be re-selected');
-  assert.equal(uiB.stepState(3), 'done', 're-selecting does not erase the evidence');
+  assert.equal(uiB.keyPanel(2, 'Enter'), true, 'a done panel can be re-activated from the keyboard');
+  assert.deepEqual([uiB.panelState(2), uiB.stepState(3)], ['current', 'done'], 're-selecting does not erase the evidence');
+  assert.equal(uiB.el('sttd-send').disabled, true, 'controls of the now-inactive step 4 are inert');
   uiB.el('sttd-refresh').click();
   await settle();
   assert.equal(uiB.el('sttd-state-text').textContent, JA('wizard.checking'));
@@ -254,7 +264,9 @@ test('W3 connection check: one manual GET; subscribed advances to step 3; each o
   state.connection = 'subscribed';
   uiB.el('sttd-refresh').click();
   await settle();
+  assert.equal(uiB.stepState(3), 'current');
   state.mode = 'webFail';
+  uiB.clickPanel(2);
   uiB.el('sttd-refresh').click();
   await settle();
   assert.equal(uiB.el('sttd-state-guide').textContent, JA('wizard.next.unavailable'));
@@ -315,8 +327,8 @@ test('W4 test instructions: copying (or a manual confirmation) plus "pasted, nex
   el('sttd-verify-send').click();
   await settle();
   assert.deepEqual([ui.stepState(4), ui.stepState(5)], ['done', 'current']);
-  // 3を見直すだけでは何も消えない。
-  assert.equal(el('sttd-step-3-head').click(), true);
+  // 3を見直すだけでは何も消えない（panel内クリックで再活性化）。
+  assert.equal(ui.clickPanel(3), true);
   assert.deepEqual([ui.stepState(3), ui.stepState(4), ui.stepState(5)], ['current', 'done', 'ready']);
   // 再適用（コピー＋次へ）→ 4/5を戻す。
   el('sttd-copy-test').click();
@@ -372,6 +384,14 @@ test('W5 send: empty field with placeholder, "送信", 5-field POST with nonce a
   assert.equal(Date.parse(payload.expiresAt) - Date.parse(payload.createdAt), 60_000);
   assert.equal(el('sttd-verify-send').disabled, true, 'in flight: cannot confirm');
   assert.equal(el('sttd-step-1-head').disabled, false, 'done steps stay viewable while sending');
+  // 送信中にテスト設定を再適用しても、進行中のtest（commandId/中止手段）を失わず、別POSTも始まらない。
+  assert.equal(ui.clickPanel(3), true, 'step 3 can be viewed while sending');
+  assert.equal(el('sttd-done-test').disabled, true, 're-apply is inert while a send is in flight');
+  el('sttd-done-test').onclick();
+  await settle();
+  assert.deepEqual([el('sttd-wizard-note').textContent, ui.stepState(4), state.holds.length], [JA('wizard.sendPending'), 'ready', 1], 'handler also refuses; the pending POST is kept');
+  assert.equal(ui.clickPanel(4), true);
+  assert.equal(el('sttd-cancel').hidden, false, 'the cancel control for the pending command is still there');
   state.holds.shift().hold.release({ status: 200, json: { commandId: payload.commandId, state: 'delivered' } });
   await settle();
   assert.equal(el('sttd-result').textContent, JA('console.state.delivered'));
@@ -448,9 +468,11 @@ test('W6 operational instructions and completion: copy + "pasted, finish" shows 
   assert.deepEqual([1, 2, 3, 4, 5].map(ui.stepState), ['done', 'done', 'done', 'done', 'current']);
   assert.equal(el('sttd-complete').hidden, false);
   assert.equal(el('sttd-complete').textContent, EN('wizard.complete'));
-  // 完了後の通常送信: 4へ戻り、再コピー不要で送れる。
-  assert.equal(el('sttd-step-4-head').click(), true);
-  assert.equal(el('sttd-panel-4').hidden, false);
+  // 完了後の通常送信: 4へ戻り（panel内クリックで再活性化）、再コピー不要で送れる。完了bannerはpanel5の外にあり、手順4に戻っても表示が続く。
+  assert.equal(ui.clickPanel(4), true, 'clicking inside a done panel re-activates it');
+  assert.deepEqual([ui.panelState(4), ui.panelState(5)], ['current', 'done']);
+  assert.equal(el('sttd-complete').hidden, false, 'completion banner stays while step 4 is active');
+  assert.ok(html('en').indexOf('id="sttd-complete"') > html('en').indexOf('</section>', html('en').indexOf('id="sttd-panel-5"')), 'the banner is placed after the last panel (bottom of the page)');
   el('sttd-new').click();
   await settle();
   el('sttd-text').value = 'second message';
@@ -470,6 +492,132 @@ test('W6 operational instructions and completion: copy + "pasted, finish" shows 
   results.W6 = { posts: ui.api().length };
 });
 
+test('W8 owner binding: a sign-in change in another tab (other account or sign-out) resets steps 2 to 5 and sends nothing with the new account; a token obtained while the owner changed is not used; a 401 resets to step 1', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk();
+  const { clipboard, navigator } = clipboardStub();
+  const { state, onFetch } = helper();
+  const ui = await runConsole({ html: html('en'), onFetch, sdk, navigator });
+  const { el } = ui;
+  await reachStep3(ui, sdk);
+  assert.equal(sdk.calls.listeners.length, 1, 'the auth observer is registered once, after the explicit sign-in');
+  el('sttd-copy-test').click();
+  await settle();
+  el('sttd-done-test').click();
+  await settle();
+  assert.equal(ui.stepState(4), 'current');
+  // 別tabでBへ切替 → 2以降を戻し、1へ。以後の操作はBのtokenで送らない。
+  sdk.changeUser('uid-b');
+  await settle();
+  assert.deepEqual([1, 2, 3, 4].map(ui.stepState), ['current', 'locked', 'locked', 'locked']);
+  assert.equal(el('sttd-wizard-note').textContent, EN('wizard.authChanged'));
+  const before = ui.fetches.length;
+  el('sttd-refresh').onclick();
+  el('sttd-send').onclick();
+  await settle();
+  assert.equal(ui.fetches.length, before, 'no request with the other account');
+  // Bとして明示ログイン（復元済み）→ 2から。Aの進捗は戻っている。
+  el('sttd-login').click();
+  await settle();
+  assert.deepEqual([ui.stepState(1), ui.stepState(2), ui.stepState(3)], ['done', 'current', 'locked']);
+  // token取得待ちの間にownerが変わる → そのtokenは使わず、要求は出ない。
+  state.connection = 'subscribed';
+  sdk.calls.tokenGate = gate();
+  const web = ui.web('/v1/web/connection').length;
+  el('sttd-refresh').click();
+  await settle();
+  sdk.changeUser('uid-c');
+  await settle();
+  sdk.calls.tokenGate.release();
+  sdk.calls.tokenGate = null;
+  await settle();
+  assert.equal(ui.web('/v1/web/connection').length, web, 'the token fetched for the previous owner is not sent');
+  assert.equal(ui.stepState(1), 'current');
+  // ログアウト → 1へ。
+  el('sttd-login').click();
+  await settle();
+  assert.equal(ui.stepState(2), 'current');
+  sdk.changeUser(null);
+  await settle();
+  assert.deepEqual([ui.stepState(1), ui.stepState(2)], ['current', 'locked']);
+  assert.equal(el('sttd-account-text').textContent, EN('common.loginRefresh'));
+  // 401 → 1へ戻し、古い進捗を残さない。
+  el('sttd-login').click();
+  await settle();
+  el('sttd-refresh').click();
+  await settle();
+  assert.equal(ui.stepState(3), 'current');
+  state.mode = 'web401';
+  ui.clickPanel(2);
+  el('sttd-refresh').click();
+  await settle();
+  assert.deepEqual([ui.stepState(1), ui.stepState(2), ui.stepState(3)], ['current', 'locked', 'locked']);
+  state.mode = 'deliver';
+  for (const written of ui.writes) assert.equal(/uid-[abc]|synthetic-id-token/.test(written), false, 'no uid or token in the page text');
+  assert.equal(clipboard.writes.length, 1);
+  results.W8 = { listeners: sdk.calls.listeners.length, fetches: ui.fetches.length };
+});
+
+test('W9 stale copy results: a clipboard write that completes after a reset (sign-in again or a failed re-check) does not satisfy the new step 3, and the copy status is not restored', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk();
+  const { clipboard, navigator } = clipboardStub();
+  const { state, onFetch } = helper();
+  const held = gate();
+  navigator.clipboard.writeText = (value) => {
+    clipboard.writes.push(value);
+    return clipboard.mode === 'hold' ? held.promise : Promise.resolve();
+  };
+  const ui = await runConsole({ html: html('ja'), onFetch, sdk, navigator });
+  const { el } = ui;
+  await reachStep3(ui, sdk);
+  clipboard.mode = 'hold';
+  assert.equal(el('sttd-copy-test').click(), true);
+  await settle();
+  assert.equal(el('sttd-copy-test').disabled, true, 'pending');
+  // pending中に再ログイン（別account）→ 2以降reset。
+  assert.equal(ui.clickPanel(1), true);
+  el('sttd-switch').click();
+  await settle();
+  held.release();
+  await settle();
+  assert.deepEqual([ui.stepState(1), ui.stepState(2)], ['done', 'current']);
+  el('sttd-refresh').click();
+  await settle();
+  assert.equal(ui.stepState(3), 'current');
+  assert.equal(el('sttd-done-test').disabled, true, 'the stale success does not count for the new step 3');
+  assert.equal(el('sttd-copy-result-test').textContent, '', 'no stale copied status');
+  el('sttd-done-test').onclick();
+  assert.equal(el('sttd-copy-result-test').textContent, JA('wizard.copyRequired'));
+  // 新しいコピーは有効。pending中の再確認失敗でも同じく捨てる。
+  clipboard.mode = 'ok';
+  el('sttd-copy-test').click();
+  await settle();
+  assert.equal(el('sttd-done-test').disabled, false);
+  const held2 = gate();
+  clipboard.mode = 'hold';
+  navigator.clipboard.writeText = (value) => {
+    clipboard.writes.push(value);
+    return clipboard.mode === 'hold' ? held2.promise : Promise.resolve();
+  };
+  el('sttd-done-test').click();
+  await settle();
+  assert.equal(ui.stepState(4), 'current');
+  ui.clickPanel(3);
+  el('sttd-copy-test').click();
+  await settle();
+  state.mode = 'webFail';
+  ui.clickPanel(2);
+  el('sttd-refresh').click();
+  await settle();
+  assert.equal(ui.stepState(3), 'locked');
+  held2.release();
+  await settle();
+  state.mode = 'deliver';
+  el('sttd-refresh').click();
+  await settle();
+  assert.equal(el('sttd-done-test').disabled, true, 'copy completed after the reset does not count');
+  results.W9 = { clipboardWrites: clipboard.writes.length };
+});
+
 test('W7 disconnect from step 2: confirm first, one POST, steps 2+ reset and the state re-checked; nothing sent on cancel', { timeout: 20_000 }, async () => {
   const sdk = syntheticSdk();
   const { navigator } = clipboardStub();
@@ -481,7 +629,7 @@ test('W7 disconnect from step 2: confirm first, one POST, steps 2+ reset and the
   await settle();
   el('sttd-done-test').click();
   await settle();
-  assert.equal(el('sttd-step-2-head').click(), true);
+  assert.equal(ui.clickPanel(2), true);
   assert.equal(el('sttd-disconnect').hidden, false);
   el('sttd-disconnect').click();
   await settle();

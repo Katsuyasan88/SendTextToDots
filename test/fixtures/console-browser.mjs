@@ -49,6 +49,7 @@ export function domFromHtml(html) {
       placeholder: attributes.placeholder ?? '',
       dataset,
       onclick: null,
+      onkeydown: null,
       get textContent() {
         return textContent;
       },
@@ -104,18 +105,30 @@ export function domFromHtml(html) {
  * 合成Firebase SDK。load()がscriptの動的importの代わりに呼ばれる（回数を数える。modeで失敗を合成）。
  * auth.currentUserはsignIn後に合成userになる。popupはmodeに従う（ok / blocked / fail）。
  */
-export function syntheticSdk({ restoredUser = false, token = 'synthetic-id-token' } = {}) {
-  const calls = { loads: 0, loadMode: 'ok', popups: 0, popupMode: 'ok', signOuts: 0, tokens: 0, tokenMode: 'ok', providers: [], initialized: [] };
-  const user = {
+export function syntheticSdk({ restoredUser = false, token = 'synthetic-id-token', uid = 'uid-a' } = {}) {
+  const calls = { loads: 0, loadMode: 'ok', popups: 0, popupMode: 'ok', signOuts: 0, tokens: 0, tokenMode: 'ok', providers: [], initialized: [], listeners: [], tokenGate: null };
+  const makeUser = (id, value) => ({
+    uid: id,
     async getIdToken() {
       calls.tokens += 1;
       if (calls.tokenMode === 'fail') throw new Error('synthetic token failure');
-      return token;
+      if (calls.tokenGate) await calls.tokenGate.promise;
+      return value;
     },
-  };
+  });
+  const user = makeUser(uid, token);
   const auth = {
     currentUser: restoredUser ? user : null,
     async authStateReady() {},
+    onAuthStateChanged(listener) {
+      calls.listeners.push(listener);
+      return () => {};
+    },
+  };
+  /** 別tab等での認証変化を合成する（別ownerへ切替 / null = ログアウト）。observerへ通知する。 */
+  const changeUser = (id, value = 'synthetic-id-token-' + id) => {
+    auth.currentUser = id === null ? null : makeUser(id, value);
+    for (const listener of calls.listeners) listener(auth.currentUser);
   };
   const authModule = {
     getAuth: () => auth,
@@ -141,6 +154,7 @@ export function syntheticSdk({ restoredUser = false, token = 'synthetic-id-token
     calls,
     auth,
     user,
+    changeUser,
     load: async () => {
       calls.loads += 1;
       if (calls.loadMode === 'fail') throw new TypeError('synthetic import failure');
@@ -183,5 +197,14 @@ export async function runConsole({ html, onFetch, sdk, navigator }) {
   const api = () => fetches.filter((entry) => entry.url.startsWith('/v2/'));
   const web = (path) => fetches.filter((entry) => entry.url === path);
   const stepState = (n) => dom.elements.get(`sttd-step-${n}`).getAttribute('data-sttd-state');
-  return { ...dom, fetches, api, web, stepState, el: (id) => dom.elements.get(id) };
+  const panelState = (n) => dom.elements.get(`sttd-panel-${n}`).getAttribute('data-sttd-state');
+  /** panel内のクリック（panelのonclickへbubbleする合成）。 */
+  const clickPanel = (n) => dom.elements.get(`sttd-panel-${n}`).click();
+  const keyPanel = (n, key) => {
+    const panel = dom.elements.get(`sttd-panel-${n}`);
+    let prevented = false;
+    if (typeof panel.onkeydown === 'function') panel.onkeydown({ key, preventDefault: () => (prevented = true) });
+    return prevented;
+  };
+  return { ...dom, fetches, api, web, stepState, panelState, clickPanel, keyPanel, el: (id) => dom.elements.get(id) };
 }
