@@ -10,9 +10,14 @@
 
 ### MacでのGitHub取得sourceの使用実績（本人報告）
 
-2026-10-25、作者がMacでGitHubから取得した構成を使い、本人管理のサーバー向けの環境設定を行った後、実Dotsへの到達を確認したと報告しています。GitHub配布sourceを別の端末から導入して使用した本人の実績として記録します。
+2026-10-25付の作者提供資料で、MacでGitHubのcommit `ad276fccc504bc367df209edb694809570496c3e`（0.3.0）を取得し、製品コード・試験・依存を変更せずに配置できたと報告しています。変更は`src/config/deployment.ts`の配置値と、追加の`.firebaserc`・`firebase.json`という配置設定です。未設定のplaceholderのまま動くという意味ではありません。
 
-これは第三者による独立検証ではありません。MacのOS/CPU/Node/npm版、取得commit、環境設定以外のsource変更の有無、実行したbuild/testコマンドと結果、送信経路/件数は詳細未確認です。自動試験の全件合格や全導入手順の無修正再現、本番運用全般の検証済みを意味しません。
+MacはNode.js 22.23.2/npm 12.0.2で、`npm ci --ignore-scripts --no-audit --no-fund`とTypeScript buildに成功。`npm test`は108件成功・4件失敗で、失敗はmacOSで`127.0.0.2`へlistenする際の`EADDRNOTAVAIL`と報告されています。TLS試験には一時フォルダに用意したOpenSSL 3.6.4を使用し、sourceや試験を弱める変更はしていません。同じsourceのLinux Cloud Build（`node:22.23.3-trixie`、Node.js 22.23.3、OpenSSL 3.5.7）では合成設定・SDKとloopbackによる112件すべてが成功したとの報告です。
+
+作者がAppleログイン・OAuth接続・Events購読後に`/console`から1件を送信し、日本語・改行を含む2行が本人の実Dotsに入力どおり届いたことを確認しています。該当command IDとAPIの`delivered`状態のログによる突き合わせは資料にありません。
+
+これらは作者の別端末での導入・使用実績で、第三者による独立検証ではありません。MacのOS版/CPUは未記録です。Mac自動試験の全件合格、掲載した全導入コマンドの無修正再現、長期運転・負荷・費用上限を含む本番運用全般の検証済みを意味しません。
+
 ## 未確認
 
 | 項目 | 状態 |
@@ -25,7 +30,7 @@
 | 保持期限後の物理削除 | 期限後は利用不可にするが、期限切れデータを物理削除する処理は含まれていない。Firestore TTL等の設定は導入者の判断 |
 | account削除（本人の全データ削除） | 未実装 |
 | 購読元clientの変更 | OAuth clientは `src/oauth/cimd.ts` のChatGPTのCIMD 1件に固定。他clientでは未確認 |
-| macOS・Linuxでのbuild/test | MacでGitHub取得sourceの設定後に実Dotsへ到達したとの本人報告あり。Macのbuild/testコマンド・結果と環境版は詳細未確認。Windowsの確認版はWindows 11・Node 22.23.4・npm 10.9.9・TypeScript 7.0.2。Linuxは未確認 |
+| macOS・Linuxでのbuild/test | 上記の作者提供資料ではMac build成功・試験108成功/4失敗、Linux Cloud Buildは112/112成功。Macのloopback試験の移植性は未解決。Windowsの確認版はWindows 11・Node 22.23.4・npm 10.9.9・TypeScript 7.0.2。全OS/版への保証ではない |
 
 ## 含まれないもの
 
