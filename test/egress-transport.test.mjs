@@ -75,7 +75,9 @@ function countNetworkAttempts(t) {
 }
 
 test('正: DNS名のcallbackへ、固定したIP・元hostnameのSNI/Host・許可した見出しだけでPOSTし、2xxの本文を受け取る', async (t) => {
-  const { receiver, connector, egress } = await setup(t, { host: '127.0.0.2' });
+  // 受信機はIPv6 loopback（::1）だけで待つ。既定の127.0.0.1ではなく、fixtureのDNSが返したIPへ接続したことを観測する
+  // （OSの通常のloopbackだけを使い、127.0.0.2等の追加aliasに依存しない）。
+  const { receiver, connector, egress } = await setup(t, { host: '::1' });
   const response = await egress.postCallback(URL_, {
     headers: { 'Content-Type': 'application/json', 'webhook-id': 'msg_1', 'webhook-timestamp': '1', 'webhook-signature': 'v1,sig', 'x-mcp-subscription-id': 'sub_1' },
     body: POST.body,
@@ -89,7 +91,7 @@ test('正: DNS名のcallbackへ、固定したIP・元hostnameのSNI/Host・許�
   assert.equal(seen.body, POST.body);
   assert.equal(seen.servername, CALLBACK_HOST, 'SNIは元hostname');
   assert.equal(seen.headers.host, CALLBACK_HOST, 'Hostはcanonical hostname（試験用portを含めない）');
-  assert.equal(seen.localAddress, '127.0.0.2', 'fixtureのDNSが返したIPへ接続した');
+  assert.equal(seen.localAddress, '::1', 'fixtureのDNSが返したIPへ接続した');
   // 外へ出た見出しは、許可した5つと送出が自分で付ける4つだけ。
   assert.deepEqual(Object.keys(seen.headers).sort(), [
     'accept-encoding', 'connection', 'content-length', 'content-type', 'host',
@@ -180,12 +182,14 @@ test('URL: HTTPS・443以外、userinfo、fragment、制御文字、非正規の
 });
 
 test('DNS: 空・失敗・不正IP・混合回答を拒否し、試行ごとに再解決して、検証した1つのIPだけへ接続する', async (t) => {
-  const a = await startReceiver(t, tls.good, { host: '127.0.0.2' });
-  const b = await startReceiver(t, tls.good, { host: '127.0.0.3', port: a.port });
+  // 独立した2受信機: IPv4 loopback（127.0.0.1）とIPv6 loopback（::1）を同じportで待つ（OSの通常loopbackだけ。IPv6が使えなければ失敗する）。
+  const a = await startReceiver(t, tls.good, { host: '127.0.0.1' });
+  const b = await startReceiver(t, tls.good, { host: '::1', port: a.port });
   let answers = [];
+  // 127.0.0.9は「許可されているが誰も待たないIPv4」。選択の観測だけに使い、実際の接続は始めさせない（下のhttps.requestの代替）。
   const connector = fixtureConnector({
     dns: (hostname) => (hostname === CALLBACK_HOST ? answers : undefined),
-    allowed: ['127.0.0.2', '127.0.0.3'],
+    allowed: ['127.0.0.1', '::1', '127.0.0.9'],
     port: a.port,
     ca: tls.ca,
   });
@@ -196,41 +200,73 @@ test('DNS: 空・失敗・不正IP・混合回答を拒否し、試行ごとに�
   await assertEgressFailure(send(), 'dns_failed', '空回答');
   await assertEgressFailure(egress.postCallback(`https://${OTHER_HOST}/hook`, POST), 'dns_failed', '解決の失敗');
   for (const bad of [
-    ['127.0.0.2', '10.0.0.5'],
-    ['10.0.0.5', '127.0.0.2'],
-    ['127.0.0.2', '8.8.8.8'],
-    ['127.0.0.2', '::1'],
-    ['127.0.0.2', '::ffff:127.0.0.2'],
-    ['127.0.0.2', 'fe80::1%eth0'],
-    ['127.0.0.2', 'not-an-ip'],
-    ['127.0.0.2', ''],
-    ['127.0.0.2', '127.0.0.3.'],
-    ['127.0.0.2', { address: undefined, family: 4 }],
-    ['127.0.0.2', null],
-    ['0x7f.0.0.2'],
-    ['2130706434'],
+    ['127.0.0.1', '10.0.0.5'],
+    ['10.0.0.5', '127.0.0.1'],
+    ['127.0.0.1', '8.8.8.8'],
+    // 許可したIPv6（::1）と禁止IPv6の混合。以前の「許可IPv4＋未許可の::1」の意味を、::1を許可した今は別の禁止IPv6で保つ。
+    ['127.0.0.1', '2001:db8::1'],
+    ['::1', '2001:db8::1'],
+    ['::1', '10.0.0.5'],
+    // IPv4-mapped（許可IPv4の別表記）・zone付き・不正文字列・空・末尾dot・形の違う回答。
+    ['127.0.0.1', '::ffff:127.0.0.1'],
+    ['127.0.0.1', 'fe80::1%eth0'],
+    ['127.0.0.1', 'not-an-ip'],
+    ['127.0.0.1', ''],
+    ['127.0.0.1', '127.0.0.1.'],
+    ['127.0.0.1', { address: undefined, family: 4 }],
+    ['127.0.0.1', null],
+    // 許可IPv4の16進・整数の別表記（正規の文字列としてしか許可しない）。
+    ['0x7f.0.0.1'],
+    ['2130706433'],
   ]) {
     answers = bad;
     await assertEgressFailure(send(), 'destination_forbidden', `混合・不正な回答 ${JSON.stringify(bad)}`);
   }
   assert.equal(a.connections + b.connections, 0, '許可IPを含む回答でも、一つでも禁止・不正なら接続しない');
 
-  // 選択: 全回答が許可IPなら、最初のIPv4だけへ接続する（別の回答へは接続しない）。
-  answers = ['127.0.0.3', '127.0.0.2'];
-  assert.equal((await send()).status, 200);
-  assert.deepEqual([a.connections, b.connections], [0, 1]);
-  assert.equal(b.requests[0].localAddress, '127.0.0.3');
+  // 選択: 全回答が許可IPなら、IPv4の回答があれば最初のIPv4、なければ最初のIPv6の1つだけへ接続する（別の回答へは切り替えない）。
+  answers = ['::1', '127.0.0.1'];
+  assert.equal((await send()).status, 200, 'IPv6が先でもIPv4を選ぶ');
+  assert.deepEqual([a.connections, b.connections], [1, 0]);
+  assert.equal(a.requests[0].localAddress, '127.0.0.1');
+  answers = ['::1'];
+  assert.equal((await send()).status, 200, 'IPv4が無ければIPv6');
+  assert.deepEqual([a.connections, b.connections], [1, 1]);
+  assert.equal(b.requests[0].localAddress, '::1');
+  // 複数のIPv4では最初のIPv4（127.0.0.9）を選び、後ろの127.0.0.1や::1へ切り替えない。選んだpinはhttps.requestのlookupから観測し、
+  // 127.0.0.9への実接続は始めずに打ち切る（追加のloopback aliasが無いOSでも待たない）。
+  const pins = [];
+  const original = https.request;
+  https.request = function observed(options, ...rest) {
+    let address;
+    options.lookup(options.host, {}, (_error, value) => {
+      address = value;
+    });
+    pins.push(address);
+    if (address === '127.0.0.9') throw new Error('synthetic: not connecting to the unreachable allowed address');
+    return original.call(this, options, ...rest);
+  };
+  syncBuiltinESMExports();
+  try {
+    answers = ['127.0.0.9', '::1', '127.0.0.1'];
+    await assertEgressFailure(send(), 'invalid_request', '最初のIPv4へ固定し、他の回答へ切り替えない');
+  } finally {
+    https.request = original;
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(pins, ['127.0.0.9']);
+  assert.deepEqual([a.connections, b.connections], [1, 1], '後ろの許可IPへ接続していない');
 
   // rebinding: 試行ごとに解決し直し、前回の許可を持ち越さない。接続中に解決し直すこともしない。
   const before = connector.calls.length;
-  answers = ['127.0.0.2'];
+  answers = ['127.0.0.1'];
   assert.equal((await send()).status, 200);
-  assert.deepEqual([a.connections, b.connections], [1, 1]);
+  assert.deepEqual([a.connections, b.connections], [2, 1]);
   answers = ['169.254.169.254'];
   await assertEgressFailure(send(), 'destination_forbidden', '2回目の解決が禁止IP');
-  answers = ['127.0.0.2', '192.168.0.10'];
+  answers = ['127.0.0.1', '192.168.0.10'];
   await assertEgressFailure(send(), 'destination_forbidden', '2回目の解決が混合');
-  assert.deepEqual([a.connections, b.connections], [1, 1]);
+  assert.deepEqual([a.connections, b.connections], [2, 1]);
   assert.equal(connector.calls.length - before, 3, '1試行につき解決は1回');
 
   // 解決の例外の内容（hostnameを含む）は、エラーへ出ない。
@@ -239,9 +275,10 @@ test('DNS: 空・失敗・不正IP・混合回答を拒否し、試行ごとに�
 });
 
 test('接続先の照合: 接続したIPが選択したIPと違えば、要求を流さずに破棄する', async (t) => {
-  const pinned = await startReceiver(t, tls.good, { host: '127.0.0.2' });
-  const elsewhere = await startReceiver(t, tls.good, { host: '127.0.0.3', port: pinned.port });
-  const pin = { address: '127.0.0.2', family: 4 };
+  // 独立した2受信機（127.0.0.1と::1、同じport）。pinは127.0.0.1、lookupだけが別のIP（::1）を返す場合を作る。
+  const pinned = await startReceiver(t, tls.good, { host: '127.0.0.1' });
+  const elsewhere = await startReceiver(t, tls.good, { host: '::1', port: pinned.port });
+  const pin = { address: '127.0.0.1', family: 4 };
   const request = (lookup) => ({
     method: 'POST', hostname: CALLBACK_HOST, hostHeader: CALLBACK_HOST, ipLiteral: false, path: '/hook',
     headers: POST.headers, body: POST.body, pin, lookup, port: pinned.port, ca: tls.ca, maxResponseBytes: EGRESS_MAX_RESPONSE_BYTES,
@@ -253,7 +290,7 @@ test('接続先の照合: 接続したIPが選択したIPと違えば、要求�
   assert.equal(pinned.requests.length, 1);
 
   // 負: lookupが別のIP（証明書もhostnameも正しい受信機）を返した場合。TLSは成立し得るが、要求は届かない。
-  await assertEgressFailure(sendPinned(request(pinnedLookup({ address: '127.0.0.3', family: 4 })), never), 'connect_failed');
+  await assertEgressFailure(sendPinned(request(pinnedLookup({ address: '::1', family: 6 })), never), 'connect_failed');
   await delay(50);
   assert.equal(elsewhere.connections, 1, '別のIPへ実際に接続が起きた');
   assert.equal(elsewhere.requests.length, 0, 'HTTP要求は流れていない');
@@ -261,9 +298,9 @@ test('接続先の照合: 接続したIPが選択したIPと違えば、要求�
 
   // pinnedLookupは、単一・all指定のどちらでもpinだけを返す。
   const single = await new Promise((resolve) => pinnedLookup(pin)('ignored.example', {}, (...args) => resolve(args)));
-  assert.deepEqual(single, [null, '127.0.0.2', 4]);
+  assert.deepEqual(single, [null, '127.0.0.1', 4]);
   const all = await new Promise((resolve) => pinnedLookup(pin)('ignored.example', { all: true }, (...args) => resolve(args)));
-  assert.deepEqual(all, [null, [{ address: '127.0.0.2', family: 4 }]]);
+  assert.deepEqual(all, [null, [{ address: '127.0.0.1', family: 4 }]]);
 });
 
 test('TLS: hostname不一致・未信頼CA・期限切れ・IP証明書の不一致・平文の相手はtls_failedで、HTTP要求を流さない', async (t) => {
@@ -543,12 +580,13 @@ test('中断: 呼び出し元のAbortSignalで、開始前は何もせず、名�
 
 test('応答: redirectは追わず、圧縮と8192バイト超を拒否し、4xx/5xxはstatusだけを返す', async (t) => {
   const { receiver, egress } = await setup(t);
-  const elsewhere = await startReceiver(t, tls.good, { host: '127.0.0.2' });
+  // Locationの先の別受信機（IPv6 loopback ::1）。redirectを追わないので接続されないことを観測する。
+  const elsewhere = await startReceiver(t, tls.good, { host: '::1' });
   const send = () => egress.postCallback(URL_, POST);
   assert.equal(EGRESS_MAX_RESPONSE_BYTES, 8192);
 
   for (const status of [300, 301, 302, 303, 307, 308, 399]) {
-    for (const location of [`https://${CALLBACK_HOST}/next`, `https://127.0.0.2:${elsewhere.port}/next`, '/next', 'http://169.254.169.254/latest']) {
+    for (const location of [`https://${CALLBACK_HOST}/next`, `https://[::1]:${elsewhere.port}/next`, '/next', 'http://169.254.169.254/latest']) {
       receiver.handle = reply(status, { location }, '{"challenge":"c-1"}');
       await assertEgressFailure(send(), 'redirect', `${status} → ${location}`);
     }

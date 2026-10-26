@@ -41,7 +41,7 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 
 ## 前提条件
 
-- ローカルの確認版はNode.js 22.23.4・npm 10.9.9です。互換性のある新しい22.x patchを使ってください。初期22.xには使用APIがないため、[INSTALL](docs/INSTALL.md)の版の条件を確認してください。
+- ローカルの確認版はNode.js 22.23.4・npm 10.9.9です。同じ22系列の新しいpatchを使ってください（packageの宣言は使用APIに必要な`>=22.2.0 <23`で、全22.xの検証済みではありません）。初期22.xには使用APIがないため、[INSTALL](docs/INSTALL.md)の版の条件を確認してください。
 - 請求先が有効な自分のGoogle Cloud projectと、同じprojectのFirebase。[INSTALL](docs/INSTALL.md)記載のFirestore・Cloud KMS・Secret Manager・Cloud Functions・Cloud Build・Cloud Run資源。
 - Firebase AuthenticationのApple provider。Sign in with AppleとApple Developer Program側の設定、authorized domainへのMCP originのhostの追加。
 - 必要なEvents購読に対応したDots/ChatGPTの利用資格。許可するOAuth clientは`src/oauth/cimd.ts`のChatGPT CIMDに固定され、任意clientにはソース変更なしでは対応しません。

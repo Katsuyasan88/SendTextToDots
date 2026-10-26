@@ -6,7 +6,7 @@
 
 ## 1. 用意するもの
 
-- ローカルのNode.jsは**22.23.4を推奨**（作者の確認版）、npmは10.9.9が確認版です。単に22系なら全て対応するという意味ではありません。`node --version`・`npm --version`で確認してください。`zlib.crc32`は22.2.0、`URL.parse`は22.1.0で追加されており、初期22.xは使えません。その他の版の全機能は未検証です。
+- ローカルのNode.jsは**22.23.4を推奨**（作者の確認版）、npmは10.9.9が確認版です。単に22系なら全て対応するという意味ではありません。`node --version`・`npm --version`で確認してください。`zlib.crc32`は22.2.0、`URL.parse`は22.1.0で追加されており、初期22.xは使えません。packageの`engines`はこの使用APIの必要条件として`>=22.2.0 <23`（22系列だけ）を宣言しますが、22.2.0での全試験合格や全22.xの動作を保証するものではありません。実測した版は上の22.23.4で、他の22.x patchの全機能は未検証です。Cloud Functionsの管理されたNode.js 22 runtime、包装で作るarchiveのengines（`22`）、MCPの固定base image（Node.js 22.23.3）はローカルの版と役割が別で、同じ環境ではありません。
 - このrepositoryのsourceだけでbuild/testできます。開発者の私有folder、Git hook、AI設定は不要です。`node_modules`・`dist`を他環境からコピーせず、lockから取得してください。TypeScriptのプラットフォーム別依存があるため`--omit=optional`は付けません。
 - 請求先が有効な、自分のGoogle Cloud projectと同じprojectのFirebase。既存の他アプリのDB・鍵・購読を流用しない新規導入にします。
 - Firebase Webアプリ、AuthenticationのApple provider、Apple Developer Program側のSign in with Apple設定。[公式のApple設定手順](https://firebase.google.com/docs/auth/web/apple)に沿いServices ID・Team ID・key等を設定し、認証redirect先をApple側に登録します。Appleの秘密鍵はこのsourceへ入れません。

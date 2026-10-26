@@ -41,7 +41,7 @@ See [API](docs/API_EN.md), [configuration](docs/CONFIGURATION_EN.md), and [secur
 
 ## Prerequisites
 
-- Node.js 22.23.4 and npm 10.9.9 are the tested local versions. Use a current compatible 22.x patch; early 22.x releases lack APIs this project uses. See [INSTALL](docs/INSTALL_EN.md) for version limits.
+- Node.js 22.23.4 and npm 10.9.9 are the tested local versions. Use a newer patch of the same 22 line (the package declares `>=22.2.0 <23`, the requirement of the APIs used, not a verification of every 22.x); early 22.x releases lack APIs this project uses. See [INSTALL](docs/INSTALL_EN.md) for version limits.
 - Your own Google Cloud project with billing enabled and Firebase in the same project, plus Firestore, Cloud KMS, Secret Manager, Cloud Functions, Cloud Build, and Cloud Run resources described in [INSTALL](docs/INSTALL_EN.md).
 - Firebase Authentication with the Apple provider, configured through Sign in with Apple and the Apple Developer Program; add the MCP origin's host to authorized domains.
 - Access to a receiving Dots/ChatGPT client that supports the required Events subscription. The allowed OAuth client is fixed to the ChatGPT CIMD in `src/oauth/cimd.ts`; arbitrary clients are not supported without source changes.

@@ -32,7 +32,7 @@ MacはNode.js 22.23.2/npm 12.0.2で、`npm ci --ignore-scripts --no-audit --no-f
 | 保持期限後の物理削除 | 期限後は利用不可にするが、期限切れデータを物理削除する処理は含まれていない。Firestore TTL等の設定は導入者の判断 |
 | account削除（本人の全データ削除） | 未実装 |
 | 購読元clientの変更 | OAuth clientは `src/oauth/cimd.ts` のChatGPTのCIMD 1件に固定。他clientでは未確認 |
-| macOS・Linuxでのbuild/test | 上記の作者提供資料ではMac build成功・試験108成功/4失敗、Linux Cloud Buildは112/112成功。Macのloopback試験の移植性は未解決。Windowsの確認版はWindows 11・Node 22.23.4・npm 10.9.9・TypeScript 7.0.2。全OS/版への保証ではない |
+| macOS・Linuxでのbuild/test | 上記の作者提供資料ではMac build成功・試験108成功/4失敗、Linux Cloud Buildは112/112成功。その4件（`127.0.0.2`・`127.0.0.3`へのlisten）は、OSの通常loopbackの`127.0.0.1`と`::1`を別々の受信機に使う形へ試験を置き換えた（接続pinと違うIPへの実TLS接続・HTTP要求0・破棄を引き続き観測）。この変更後のsourceのMacでの実行結果は未確認。Windowsの確認版はWindows 11・Node 22.23.4・npm 10.9.9・TypeScript 7.0.2。全OS/版への保証ではない |
 | 表示言語 | 英語/日本語の画面と言語cookieは合成試験だけで確認。実ブラウザでの動作と他言語は未確認で、英語・日本語以外は英語になる |
 | 利用許可（明示登録） | 判定・同意/購読/送信の拒否・管理CLIの期待版/期限/後始末は合成のSDK・DBだけで確認。管理CLIの実起動（運営者のADC・実Firestore・Secret Manager）、実IAM権限、既存配置の更新時の再同意・再購読の流れは未確認 |
 | 手順2のプラグイン追加ガイド | 表示・展開・言語切替で通信しないことは合成DOMだけで確認。ChatGPTのPlugins画面の項目名・利用可否（account/workspaceによる）・実際の追加とOAuth接続は未確認 |
@@ -58,6 +58,6 @@ MacはNode.js 22.23.2/npm 12.0.2で、`npm ci --ignore-scripts --no-audit --no-f
 
 [INSTALL.md](INSTALL.md)の配置コマンド例は、公開sourceの契約とGoogle Cloud公式資料に照らした手順です。第三者projectでのfresh setup全体、掲載した鍵生成・API例の実行、組織policyごとのIAM/公開到達の成立は未確認です。MacでのGitHub取得sourceの使用・実Dots到達は上記の本人報告を記録しましたが、掲載コマンドを全てそのまま実行した証明にはしません。
 
-ローカルの確認版はNode.js 22.23.4/npm 10.9.9です。packageの`engines: >=22`は全ての22.xや上位majorの動作保証ではありません。使用する`URL.parse`は22.1.0、`zlib.crc32`は22.2.0追加のため、初期22.xは対象にできません。最低版の全機能検証やNode23以降の検証はしていません。Cloud管理のNode22 runtimeとMCPの固定base imageのpatchもローカル版と別で、同一環境ではありません。
+ローカルの確認版はNode.js 22.23.4/npm 10.9.9です。packageの`engines: >=22.2.0 <23`は使用APIの必要条件と22系列への限定で、全ての22.xの動作保証や22.2.0での全試験合格を意味しません。使用する`URL.parse`は22.1.0、`zlib.crc32`は22.2.0追加のため、初期22.xは対象にできません。最低版の全機能検証やNode23以降の検証はしていません。Cloud管理のNode22 runtimeとMCPの固定base imageのpatchもローカル版と別で、同一環境ではありません。
 
 `npm run package`は同じdigestの出力を上書きせず`output_exists`で停止します。archiveは依存を含まず配置先buildでregistryへ接続します。ローカル包装が成功しても、image取得/依存取得/Cloud Build/IAM/サービス起動を保証しません。

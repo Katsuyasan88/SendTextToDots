@@ -6,7 +6,7 @@ The send screen is not served by Cloud Run. A small helper running on your own c
 
 ## What you need
 
-- Node.js 22 (the same version conditions as in [INSTALL](INSTALL_EN.md)) and the built source of this repository (`npm ci --ignore-scripts --no-audit --no-fund` and `npm run build`). No new dependency.
+- Node.js 22 (`>=22.2.0 <23`; measured with 22.23.4; the same version conditions as in [INSTALL](INSTALL_EN.md)) and the built source of this repository (`npm ci --ignore-scripts --no-audit --no-fund` and `npm run build`). No new dependency.
 - The https origins of your deployed API and MCP services and the public Firebase Web configuration (`apiKey`, `authDomain`, `projectId`). These values reach the browser and are not secrets, but the configuration file is not committed (`console.local.json` and `*.local.json` are ignored by Git).
 - `localhost` in the authorized domains of Firebase Authentication (required for the Apple sign-in popup).
 

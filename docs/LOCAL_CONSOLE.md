@@ -6,7 +6,7 @@
 
 ## 必要なもの
 
-- Node.js 22（[INSTALL](INSTALL.md)の版の条件と同じ）と、このリポジトリのbuild済みsource（`npm ci --ignore-scripts --no-audit --no-fund` と `npm run build`）。新しい依存はありません。
+- Node.js 22（`>=22.2.0 <23`。実測は22.23.4。[INSTALL](INSTALL.md)の版の条件と同じ）と、このリポジトリのbuild済みsource（`npm ci --ignore-scripts --no-audit --no-fund` と `npm run build`）。新しい依存はありません。
 - 配置済みのAPI/MCPサービスのhttps originと、Firebase Webアプリの公開設定（`apiKey`・`authDomain`・`projectId`）。いずれも秘密ではなくブラウザに渡る値ですが、設定fileはcommitしません（`console.local.json` と `*.local.json` は `.gitignore` 済み）。
 - Firebase Authenticationのauthorized domainsに `localhost` が入っていること（Appleログインのpopupに必要）。
 
