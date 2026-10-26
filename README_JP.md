@@ -62,39 +62,11 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 
 配布設定は未設定（`configured: false`）です。そのままbuild・配置しても、両serviceはSDK生成・資格取得・DB・外部HTTPの前に固定の設定errorで止まります。
 
-## APIの最小例
+## 自分のアプリやスクリプトから送る
 
-配置・購読後、次を手元の`.mjs`ファイルに保存し、Node.js 22で実行します。`STTD_API_ORIGIN`へ配置済みHTTPS API origin、`STTD_FIREBASE_ID_TOKEN`へApple providerで認証した有効なFirebase ID tokenを設定してください。この環境変数は例のclient用で、server設定ではありません。tokenをGitや共有ログへ残さないでください。実行すると実メッセージ1件を送り、サービス費用が生じる可能性があります。
-```js
-// Node.js 22; set STTD_API_ORIGIN and STTD_FIREBASE_ID_TOKEN locally.
-const origin = process.env.STTD_API_ORIGIN;
-const token = process.env.STTD_FIREBASE_ID_TOKEN;
-if (!origin || !token) throw new Error('Set the API origin and Firebase ID token');
-const commandId = crypto.randomUUID();
-console.log('commandId:', commandId); // Keep this ID even if the request fails.
-const now = Date.now();
-const response = await fetch(new URL('/v2/commands', origin), {
-  method: 'POST',
-  headers: {
-    Authorization: `Bearer ${token}`,
-    'Content-Type': 'application/json',
-    'Idempotency-Key': commandId,
-  },
-  body: JSON.stringify({
-    schemaVersion: 2,
-    commandId,
-    text: 'Hello Dots',
-    createdAt: new Date(now).toISOString(),
-    expiresAt: new Date(now + 60_000).toISOString(),
-  }),
-});
-console.log(response.status, await response.json());
-```
-要求は5項目ちょうどです。`Idempotency-Key`は`commandId`と一致させ、`expiresAt`は`createdAt`のちょうど60秒後、受付時に残り10秒以上とします。本文はUTF-8で4096 byteまで。例は実行ごとに現在時刻とUUIDを作るため、再実行は新しいcommandの送信になります。
+[1件送信するNode.js例とAPI契約](docs/API.md#direct-client-example)を使えます。Dotsを接続した利用者と同じproject・Apple認証の有効なFirebase ID tokenを渡します。例は実行するたびに実メッセージを1件送るため、結果不明時の照会に使うcommandIdを控えてください。
 
-応答の一例は`{"commandId":"d8d32ec5-9531-4b12-841a-b809ab45d3ef","state":"delivered","expiresAt":"2026-10-25T00:01:00.000Z","acknowledgedAt":"2026-10-25T00:00:01.000Z"}`です。実際のID・時刻は異なります。新規POSTは通常HTTP 200で`delivered`・`failed`・`cancelled`・`expired`・`delivery_unknown`のいずれかを返します。同一commandの再POSTは処理中なら202 `in_flight`の場合があります。HTTP 2xxだけで配送成功とせず`state`を確認してください。`delivered`はcallback受領で、Dotsの処理完了ではありません。
-
-要求や応答の解析に失敗してもIDを使えるよう、送信前に表示します。結果不明時に自動再送せず、同じ認証で`GET /v2/commands/{commandId}`を照会してください。error・中止・件数枠・冪等性の詳細は[API](docs/API.md)を参照してください。
+Firebase ID tokenの寿命は約1時間です。Firebase clientの認証sessionを使う入力元はSDKで有効なtokenを取得でき、通常は毎時間Appleへ手動で再ログインする必要はありません。API例自体は渡されたtokenを使うだけで、ログインや更新は行いません。[sessionと自動送信の範囲](docs/API.md#firebase-sessions)を参照してください。
 
 ## 互換性
 

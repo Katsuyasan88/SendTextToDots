@@ -4,6 +4,8 @@
 
 設定の正本は `src/config/deployment.ts` の1 fileだけです。配置前に編集してbuildします。実行時にHTTP・環境変数・引数から設定を選んだり上書きしたりする口はありません（MCPのlisten portと、Firebase Web API keyの値を読む環境変数を除く）。
 
+下の表は配置値の意味と条件をまとめたものです。入力元は汎用のアプリやスクリプトで、入力元のログイン/session管理とserver配置設定は別です（[API](API.md#firebase-sessions)）。本人認証は現在Apple providerのFirebaseだけに対応します。入力元のtokenや実ユーザー識別子を配置設定へ入れないでください。
+
 ## 検証
 
 `src/config/validate.ts` が次を全て確かめ、1つでも外れると固定のerror（`deployment_config_unconfigured` / `deployment_config_invalid`）で起動を止めます。値・path・元の例外はerrorに含めません。

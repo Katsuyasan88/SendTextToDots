@@ -4,6 +4,8 @@ English | [日本語](CONFIGURATION.md)
 
 The single source of configuration is the file `src/config/deployment.ts`. Edit it before deployment and build. There is no way to choose or override configuration at run time through HTTP, environment variables or arguments (except the MCP listen port and the environment variable that holds the Firebase Web API key value).
 
+The English table below covers the deployment values independently of the source comments. This is a self-hosted relay for a generic app or script; sender sign-in/session handling is separate from these server settings ([API](API_EN.md#firebase-sessions)). Only Apple-backed Firebase user authentication is currently accepted. Do not put sender tokens or real user identifiers into this configuration.
+
 ## Validation
 
 `src/config/validate.ts` checks all of the following and stops startup with a fixed error (`deployment_config_unconfigured` / `deployment_config_invalid`) if any one fails. Values, paths and the original exception are not included in the error.

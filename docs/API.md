@@ -103,3 +103,50 @@ payload（`data`）は `schemaVersion`(2)・`commandId`・`text`・`expiresAt` �
 `timestamp` はserverの受信時刻、`expiresAt` はserverが決めた有効期限（min(expiresAt, 受信＋60秒)）で、どちらもISO 8601（ミリ秒付きUTC）です。`events/list` の `payloadSchema` はJSON Schemaで上の4項目を `required`、`additionalProperties: false` とします。schemaの `text` の `minLength` 1・`maxLength` 4096は文字数の粗い上限で、4096 UTF-8 byte・空白だけ・対にならないsurrogateの厳密な検査は送信APIの入力検証が行います。
 
 eventIdは識別子鍵＋owner/commandIdのHMACから作るUUIDv8で、同じowner・同じcommandIdでは同じ値、別ownerでは別の値です。署名はStandard Webhooks形式で、送るbytesそのものに署名します。secret回転中の5分は新旧両方で署名します。`expiresAt` を含めても受信側が期限を守る保証にはなりません。
+
+
+<a id="firebase-sessions"></a>
+
+## Firebaseのsessionと自動送信
+
+現在の認証はFirebase AuthenticationのApple providerだけに対応し、Dotsを接続した本人と同じFirebase project・UIDを使います。このAPI契約を満たすアプリやスクリプトが入力元になり、特定のスマートフォン・時計・入力元アプリは必須ではありません。受信側MCPのOAuth接続と、入力元のFirebase sessionは別です。
+
+Firebase ID tokenは約1時間で期限切れになります。Firebase clientの認証sessionを使うアプリは、送信前にSDKで有効なtokenを取得してください。ローカル送信画面では認証が必要な操作ごとに`user.getIdToken()`を呼び、期限切れまたは期限間近なら更新できます。通常は毎時間Appleへ手動で再ログインする必要はありません。サインアウト・失効・認証上の問題があれば再ログインが必要になることはあります。[Firebaseのsession寿命](https://firebase.google.com/docs/auth/admin/manage-sessions)と[getIdToken](https://firebase.google.com/docs/reference/js/auth.user.md#usergetidtoken)も参照してください。
+
+下のNode.js例は渡されたID tokenを使うだけで、ログインやtoken更新を行いません。長時間・無人で動く入力元は、対応する認証/session管理を自分で用意する必要があります。headlessのAppleログイン、token書出しtool、常駐送信process、長期の送信専用キー、自動再送は同梱していません。ブラウザからrefresh tokenを抽出する代わりに、SDKのsession用APIを使ってください。Firebase Web API keyは設定を識別するもので、本人のID tokenの代わりにはなりません。
+
+<a id="direct-client-example"></a>
+
+## 直接APIを使うclient例
+
+配置・購読後、次を手元の`.mjs`ファイルに保存し、Node.js 22で実行します。`STTD_API_ORIGIN`へ配置済みHTTPS API origin、`STTD_FIREBASE_ID_TOKEN`へApple providerで認証した有効なFirebase ID tokenを設定してください。この環境変数は例のclient用で、server設定ではありません。tokenをGitや共有ログへ残さないでください。実行すると実メッセージ1件を送り、サービス費用が生じる可能性があります。
+```js
+// Node.js 22; set STTD_API_ORIGIN and STTD_FIREBASE_ID_TOKEN locally.
+const origin = process.env.STTD_API_ORIGIN;
+const token = process.env.STTD_FIREBASE_ID_TOKEN;
+if (!origin || !token) throw new Error('Set the API origin and Firebase ID token');
+const commandId = crypto.randomUUID();
+console.log('commandId:', commandId); // Keep this ID even if the request fails.
+const now = Date.now();
+const response = await fetch(new URL('/v2/commands', origin), {
+  method: 'POST',
+  headers: {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+    'Idempotency-Key': commandId,
+  },
+  body: JSON.stringify({
+    schemaVersion: 2,
+    commandId,
+    text: 'Hello Dots',
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + 60_000).toISOString(),
+  }),
+});
+console.log(response.status, await response.json());
+```
+要求は5項目ちょうどです。`Idempotency-Key`は`commandId`と一致させ、`expiresAt`は`createdAt`のちょうど60秒後、受付時に残り10秒以上とします。本文はUTF-8で4096 byteまで。例は実行ごとに現在時刻とUUIDを作るため、再実行は新しいcommandの送信になります。
+
+応答の一例は`{"commandId":"d8d32ec5-9531-4b12-841a-b809ab45d3ef","state":"delivered","expiresAt":"2026-10-25T00:01:00.000Z","acknowledgedAt":"2026-10-25T00:00:01.000Z"}`です。実際のID・時刻は異なります。新規POSTは通常HTTP 200で`delivered`・`failed`・`cancelled`・`expired`・`delivery_unknown`のいずれかを返します。同一commandの再POSTは処理中なら202 `in_flight`の場合があります。HTTP 2xxだけで配送成功とせず`state`を確認してください。`delivered`はcallback受領で、Dotsの処理完了ではありません。
+
+要求や応答の解析に失敗してもIDを使えるよう、送信前に表示します。結果不明時に自動再送せず、同じ認証で`GET /v2/commands/{commandId}`を照会してください。error・中止・件数枠・冪等性の詳細は[API](API.md)を参照してください。

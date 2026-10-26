@@ -42,6 +42,10 @@ All five steps are always shown in order; at first only step 1 is active and ste
 
 After completion, re-select step 4 to send ordinary messages (no re-copy of steps 3/5 is required). Signing in again, losing the receiving state, or re-applying the test instructions resets the steps that depend on it.
 
+## Sign-in session and token refresh
+
+Each authenticated button action obtains a current Firebase ID token through `user.getIdToken()` before the helper relays it. The SDK can refresh the short-lived token using its existing sign-in session, so the one-hour token lifetime does not mean you must manually sign in every hour. Signing out or a revoked/invalid session can require signing in again. This page's in-memory setup progress remains separate from Firebase's browser session. It adds no background polling or sending. See [session and automated-sender details](API_EN.md#firebase-sessions).
+
 ## What the helper relays
 
 The helper relays only the requests behind the buttons, to the fixed origins in the configuration. The browser never talks to the production origins directly, and the CORS and permissions of the Cloud Run side are unchanged.

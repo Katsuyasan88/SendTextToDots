@@ -210,7 +210,7 @@ MCPのCPU/memory/instance数は上記の開始例であり、負荷試験済み�
 1. 自分のパソコンでローカル送信画面を起動します（[LOCAL_CONSOLE.md](LOCAL_CONSOLE.md)）: `console.config.example.json`を`console.local.json`へコピーしてAPI/MCPのoriginとFirebase Webの公開設定を入れ、`npm run console -- --config console.local.json`を実行し、`http://localhost:8765/console`を開きます（English/日本語。ボタンを押すまで読み込みも送信もしません）。Firebaseのauthorized domainsへ`localhost`を追加します。手順1でAppleログインします。Dots/ChatGPTのMCP server登録先は**MCP originの`/mcp`**です。ローカル画面やAPI originを登録先にしません。
 2. Dots/ChatGPT側からOAuth接続し、同じFirebase利用者として明示同意します。`text.submitted`を購読したら、手順2の「接続を確認」で「受信中」になることを確認します（他の状態では次にすることを画面が案内します）。送信画面を開くだけでは購読は作られません。
 3. 手順3でテスト用の指示文を受信先Dotsへ貼り付けて確認します。手順4で空欄に短い本文を入力して「送信」を押し、受信側で入力どおりの表示を確認してから画面で一致を確認します。手順5で運用用の指示文を貼り付けます。STTD自身は本文を実行しません。
-4. 直接APIを使う場合はREADMEの例を参照。Apple providerで認証した同じproject/UIDのFirebase ID tokenが必要です。Web画面のtokenを表示する管理toolは同梱しません。最初の確認とその後の通常送信（手順4）にはローカル画面を使えます。
+4. 直接APIを使う場合は[1件送信するclient例](API.md#direct-client-example)と[sessionの条件](API.md#firebase-sessions)を参照。Apple providerで認証した同じproject/UIDのFirebase ID tokenが必要です。Web画面のtokenを表示する管理toolは同梱しません。最初の確認とその後の通常送信（手順4）にはローカル画面を使えます。
 5. `delivered`はcallbackの2xx受領で、受信側の処理完了ではありません。結果不明なら送信前に控えた同じcommandIdで状態照会し、新IDで自動再送しません。
 6. このaccountからの送信を止めるにはローカル画面の手順2の「接続を解除」を使います（画面で確認してから実行）。認可と購読が失効し、再開はChatGPTからの再接続です。Cloud Runは送信画面も別の接続画面も配信しません。
 

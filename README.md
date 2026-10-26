@@ -62,39 +62,11 @@ The [Dots receiving and response guide](docs/DOTS_GUIDE_EN.md) provides instruct
 
 The distributed configuration is unset (`configured: false`). If built and deployed unchanged, both services stop with a fixed configuration error before SDK creation, credential acquisition, database access, or external HTTP.
 
-## API at a glance
+## Sending from your app or script
 
-After deployment and subscription, save this example as a local `.mjs` file and run it with Node.js 22. Set `STTD_API_ORIGIN` to your deployed HTTPS API origin and `STTD_FIREBASE_ID_TOKEN` to a current Firebase ID token authenticated with the Apple provider. These variables are for this client example, not server configuration. Keep tokens out of source control and shared logs. Running it sends one real message and may incur service costs.
-```js
-// Node.js 22; set STTD_API_ORIGIN and STTD_FIREBASE_ID_TOKEN locally.
-const origin = process.env.STTD_API_ORIGIN;
-const token = process.env.STTD_FIREBASE_ID_TOKEN;
-if (!origin || !token) throw new Error('Set the API origin and Firebase ID token');
-const commandId = crypto.randomUUID();
-console.log('commandId:', commandId); // Keep this ID even if the request fails.
-const now = Date.now();
-const response = await fetch(new URL('/v2/commands', origin), {
-  method: 'POST',
-  headers: {
-    Authorization: `Bearer ${token}`,
-    'Content-Type': 'application/json',
-    'Idempotency-Key': commandId,
-  },
-  body: JSON.stringify({
-    schemaVersion: 2,
-    commandId,
-    text: 'Hello Dots',
-    createdAt: new Date(now).toISOString(),
-    expiresAt: new Date(now + 60_000).toISOString(),
-  }),
-});
-console.log(response.status, await response.json());
-```
-The request has exactly five fields. `Idempotency-Key` must match `commandId`; `expiresAt` must be exactly 60 seconds after `createdAt`, with at least 10 seconds remaining at acceptance. Text is limited to 4096 UTF-8 bytes. The example generates fresh timestamps and a UUID for each run, so rerunning it sends a new command.
+Use the [one-message Node.js example and API contract](docs/API_EN.md#direct-client-example). Supply a current Firebase ID token for the same project and Apple-authenticated user connected to Dots. The example sends one real message per run; keep its commandId to look up an uncertain result.
 
-An illustrative response is `{"commandId":"d8d32ec5-9531-4b12-841a-b809ab45d3ef","state":"delivered","expiresAt":"2026-10-25T00:01:00.000Z","acknowledgedAt":"2026-10-25T00:00:01.000Z"}`; actual identifiers and times vary. A new POST normally returns HTTP 200 with `delivered`, `failed`, `cancelled`, `expired`, or `delivery_unknown`. A repeated identical command may return 202 `in_flight` while processing. HTTP 2xx alone does not prove delivery: inspect `state`. `delivered` means callback acceptance, not completion of Dots processing.
-
-The ID is printed before sending so it remains available if the request or response parsing fails. Do not resend automatically after an uncertain result. Query `GET /v2/commands/{commandId}` with the same authentication instead. See [API](docs/API_EN.md) for errors, cancellation, rate limits, and idempotency rules.
+Firebase ID tokens last about an hour. A sender that uses a Firebase client session should obtain a current token through the SDK; it does not normally require a manual Apple sign-in every hour. The API example consumes a supplied token and does not manage sign-in or refresh. See [sessions and automation limits](docs/API_EN.md#firebase-sessions).
 
 ## Compatibility
 

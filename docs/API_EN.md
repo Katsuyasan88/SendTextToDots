@@ -103,3 +103,50 @@ The payload (`data`) is exactly the four fields `schemaVersion`(2), `commandId`,
 `timestamp` is the server's receipt time and `expiresAt` is the lifetime the server decided (min(expiresAt, receipt + 60 seconds)); both are ISO 8601 in UTC with milliseconds. The `payloadSchema` of `events/list` is a JSON Schema that marks the four fields above as `required` with `additionalProperties: false`. The `minLength` 1 and `maxLength` 4096 of `text` in the schema are a rough character-count bound; the strict checks for 4096 UTF-8 bytes, whitespace-only text and unpaired surrogates are done by the send API's input validation.
 
 The eventId is a UUIDv8 derived from the identifier key and an HMAC of owner/commandId, so it is the same for the same owner and commandId and different for a different owner. Signatures use the Standard Webhooks format over the exact bytes sent. During the 5 minutes of a secret rotation both the old and the new secret sign. Including `expiresAt` does not guarantee that the receiver honours the lifetime.
+
+
+<a id="firebase-sessions"></a>
+
+## Firebase sessions and automated senders
+
+Authentication currently accepts only Firebase Authentication with the Apple provider, for the same Firebase project and UID as the user's Dots connection. Any app or script can be the input source if it meets this API contract; a particular phone, watch or source app is not required. The receiving MCP OAuth connection is separate from the sender's Firebase session.
+
+Firebase ID tokens expire after about one hour. An app using a Firebase client session should obtain a current token with the SDK before sending. In the local send screen, each authenticated action calls `user.getIdToken()`, which can refresh an expired or soon-to-expire token. This does not normally require manual Apple sign-in every hour. Signing out, revocation or another authentication problem can still require signing in again. See [Firebase session lifetimes](https://firebase.google.com/docs/auth/admin/manage-sessions) and [getIdToken](https://firebase.google.com/docs/reference/js/auth.user.md#usergetidtoken).
+
+The Node.js example below uses the supplied ID token only; it performs no sign-in or token refresh. A long-running or unattended sender must provide its own supported authentication/session handling. This repository does not bundle a headless Apple sign-in flow, a token-export tool, a sender daemon, a long-lived send-only key or automatic resend. Use SDK session APIs instead of extracting a refresh token from the browser. A Firebase Web API key identifies the Firebase configuration and cannot replace a user's ID token.
+
+<a id="direct-client-example"></a>
+
+## Direct client example
+
+After deployment and subscription, save this example as a local `.mjs` file and run it with Node.js 22. Set `STTD_API_ORIGIN` to your deployed HTTPS API origin and `STTD_FIREBASE_ID_TOKEN` to a current Firebase ID token authenticated with the Apple provider. These variables are for this client example, not server configuration. Keep tokens out of source control and shared logs. Running it sends one real message and may incur service costs.
+```js
+// Node.js 22; set STTD_API_ORIGIN and STTD_FIREBASE_ID_TOKEN locally.
+const origin = process.env.STTD_API_ORIGIN;
+const token = process.env.STTD_FIREBASE_ID_TOKEN;
+if (!origin || !token) throw new Error('Set the API origin and Firebase ID token');
+const commandId = crypto.randomUUID();
+console.log('commandId:', commandId); // Keep this ID even if the request fails.
+const now = Date.now();
+const response = await fetch(new URL('/v2/commands', origin), {
+  method: 'POST',
+  headers: {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+    'Idempotency-Key': commandId,
+  },
+  body: JSON.stringify({
+    schemaVersion: 2,
+    commandId,
+    text: 'Hello Dots',
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + 60_000).toISOString(),
+  }),
+});
+console.log(response.status, await response.json());
+```
+The request has exactly five fields. `Idempotency-Key` must match `commandId`; `expiresAt` must be exactly 60 seconds after `createdAt`, with at least 10 seconds remaining at acceptance. Text is limited to 4096 UTF-8 bytes. The example generates fresh timestamps and a UUID for each run, so rerunning it sends a new command.
+
+An illustrative response is `{"commandId":"d8d32ec5-9531-4b12-841a-b809ab45d3ef","state":"delivered","expiresAt":"2026-10-25T00:01:00.000Z","acknowledgedAt":"2026-10-25T00:00:01.000Z"}`; actual identifiers and times vary. A new POST normally returns HTTP 200 with `delivered`, `failed`, `cancelled`, `expired`, or `delivery_unknown`. A repeated identical command may return 202 `in_flight` while processing. HTTP 2xx alone does not prove delivery: inspect `state`. `delivered` means callback acceptance, not completion of Dots processing.
+
+The ID is printed before sending so it remains available if the request or response parsing fails. Do not resend automatically after an uncertain result. Query `GET /v2/commands/{commandId}` with the same authentication instead. See [API](API_EN.md) for errors, cancellation, rate limits, and idempotency rules.
