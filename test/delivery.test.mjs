@@ -654,13 +654,13 @@ function decisionFixture() {
   const calls = { prepare: 0, dispatch: 0, finish: 0, abandon: 0, read: 0, cancel: 0, open: 0, attempts: 0, sent: [], owned: [], responses: [] };
   const control = { afterOpen: null, sendHold: null, sendResult: null };
   const addOwner = (overrides = {}, ownerId = `owner-${randomUUID()}`) => {
-    owners.set(ownerId, { ownerActive: true, grantLive: true, pending: false, subscription: true, subscriptionExpiresAt: null, previousUntil: null, ...overrides });
+    owners.set(ownerId, { ownerActive: true, grantLive: true, access: 'allowed', pending: false, subscription: true, subscriptionExpiresAt: null, previousUntil: null, ...overrides });
     return ownerId;
   };
   const subscriptionOf = (ownerId) => `sub_${hash('subscription', ownerId)}`;
   const viewOf = (ownerId) => {
     const owner = owners.get(ownerId);
-    if (owner === undefined) return { ownerActive: false, subscription: undefined, grantLive: false };
+    if (owner === undefined) return { ownerActive: false, subscription: undefined, grantLive: false, access: 'denied' };
     const active = owner.subscription
       ? {
           id: subscriptionOf(ownerId),
@@ -676,6 +676,7 @@ function decisionFixture() {
     return {
       ownerActive: owner.ownerActive,
       grantLive: owner.grantLive,
+      access: owner.access,
       subscription: { active, knownDestinationId: active?.id ?? null, pending: owner.pending ? { id: 'sub_pending', grantId: 'grant-pending', requestedAt: BASE } : null, lastEnded: null },
     };
   };
@@ -1351,4 +1352,47 @@ test('V07 privacy detector positive control: a synthetic text with newline / quo
   const cyclic = { a: [] };
   cyclic.a.push(cyclic, text);
   assert.equal(containsText(cyclic, text), true);
+});
+test('V08 explicit access with the production decisions: not permitted -> 403 access_denied (not connection_revoked) before open/send/document; same-ID re-POST refused while stopped but GET/cancel by the owner still work; a stop after prepare sends nothing; a stop after the send right keeps the single send', { timeout: 20_000 }, async () => {
+  clockState.value = BASE;
+  const fx = decisionFixture();
+  const denied = fx.addOwner({ access: 'denied' });
+  const refused = await fx.post(denied, v2());
+  assert.deepEqual([refused.status, refused.body], [403, { error: { code: 'access_denied', retryable: false } }]);
+  // 失効したowner（接続の失効）は従来どおりconnection_revokedを優先する。
+  const revoked = await fx.post(fx.addOwner({ ownerActive: false, access: 'denied' }), v2());
+  assert.deepEqual([revoked.status, revoked.body.error.code], [403, 'connection_revoked']);
+  assert.deepEqual([fx.calls.sent.length, fx.calls.open, fx.docs.size], [0, 0, 0], 'refused before any open/send/document');
+
+  // 受付済みの同IDは、停止中の再POSTでは拒否し、本人のGET・取消は利用許可を条件にしない。
+  const owner = fx.addOwner();
+  const hold = gate();
+  fx.control.sendHold = hold;
+  const commandId = randomUUID();
+  const pending = fx.post(owner, v2({ commandId }));
+  await hold.whenReached;
+  fx.owners.get(owner).access = 'denied';
+  const again = await fx.post(owner, v2({ commandId }));
+  assert.deepEqual([again.status, again.body.error.code], [403, 'access_denied']);
+  const during = await fx.service.get(owner, commandId, BASE);
+  assert.deepEqual([during.status, during.body.state], [200, 'in_flight']);
+  hold.release();
+  // 送出権の後の停止: 既に始めた単回の送出はそのまま（再送・取消の偽装なし）。
+  const delivered = await pending;
+  assert.deepEqual([delivered.status, delivered.body.state], [200, 'delivered']);
+  assert.equal(fx.calls.sent.length, 1);
+  const status = await fx.service.get(owner, commandId, BASE);
+  assert.deepEqual([status.status, status.body.state], [200, 'delivered']);
+  assert.equal((await fx.service.cancel(owner, commandId, BASE)).status, 200, 'the owner can still ask to cancel (observed state)');
+
+  // 準備の後（開封の後）に停止: 送出権の再照合で拒否し、送らずに失敗（authorization_lost）。
+  const late = fx.addOwner();
+  fx.control.afterOpen = async () => {
+    fx.owners.get(late).access = 'denied';
+  };
+  const lateId = randomUUID();
+  const lost = await fx.post(late, v2({ commandId: lateId }));
+  assert.deepEqual([lost.status, lost.body.state], [200, 'failed']);
+  assert.deepEqual([fx.docOf(late, lateId).state, fx.docOf(late, lateId).reason], ['failed', 'authorization_lost']);
+  assert.equal(fx.calls.sent.length, 1, 'no send after the stop');
 });

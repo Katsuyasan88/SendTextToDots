@@ -52,13 +52,14 @@ import type { KmsDecryptRequest, KmsDecryptResponse, KmsEncryptRequest, KmsEncry
 import { createHmacHasher, OPAQUE_VALUE_PATTERN } from '../secrets.js';
 import { createKmsSubscriptionPolicy, requireKmsMarker, type KmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
 import { AUTH_STORAGE_ROOT, KMS_SUBSCRIPTION_CONFIG_DOC } from '../storage/firestore/kms-subscription-format.js';
-import { ConnectStorage, isConnectNamespace } from './firestore.js';
+import { AccessUnavailableError, ConnectStorage, isConnectNamespace } from './firestore.js';
 import { isLanguage, LANGUAGE_QUERY, languageCookie, selectLanguage, type Language } from './i18n.js';
 import { createConnectKmsSealingPort } from './kms-port.js';
 import {
   INTERACTION_SCRIPT,
   INTERACTION_SCRIPT_PATH,
   pageSecurityHeaders,
+  renderInteractionAccessDenied,
   renderInteractionConsent,
   renderInteractionLogin,
   type FirebaseWebConfig,
@@ -728,6 +729,19 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       const grantId: string = grantIdInput;
       const meta = await guarded(() => storage.grantMeta(grantId));
       if (meta === undefined || meta.ownerId !== ownerId) return false;
+      // 利用許可: owner→許可recordがactiveで、grantMetaの世代が現在の世代と一致する時だけ新規利用（token消費の前に判定）。
+      let usable: boolean;
+      try {
+        usable = await guarded(() => storage.grantUsable(ownerId, grantId));
+      } catch (error) {
+        if (!(error instanceof AccessUnavailableError)) throw error;
+        log({ event: 'access.unavailable' });
+        throw apiErrors.temporarilyUnavailable();
+      }
+      if (!usable) {
+        log({ event: 'access.refused' });
+        return false;
+      }
       const uid = await guarded(() => storage.uidOf(ownerId));
       if (uid === undefined) return false;
       let status: unknown;
@@ -849,6 +863,12 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       send(res, status, 'application/json; charset=utf-8', JSON.stringify(body), headers);
     }
 
+    /** 利用許可の拒否（login）。既存のforbidden（origin違い・owner失効）と区別する固定code。 */
+    function accessDenied(): ApiError {
+      log({ event: 'interaction.access_denied' });
+      return new ApiError(403, 'access_denied');
+    }
+
     function requireSameOrigin(req: IncomingMessage): void {
       if (req.headers.origin !== issuerUrl.origin) throw apiErrors.forbidden();
     }
@@ -936,10 +956,14 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       // CSRFが現行でない要求では、本人確認・owner作成へ進まない。
       if (!(await guarded(() => storage.interactionAccepts(uid, body.csrf)))) throw apiErrors.linkUnavailable();
       const verified = await verifyIdentity(body.idToken);
-      const ownerId = await guarded(() => storage.resolveOwner(verified));
-      if (ownerId === undefined) throw apiErrors.forbidden();
-      const bound = await guarded(() => storage.bindInteraction(uid, body.csrf, ownerId, verified.authTimeSec));
+      // 利用許可（運営者の明示登録）がactiveの本人だけownerを解決・作成する。未許可は専用の403 access_denied（ownerを作らない）。
+      const admission = await guarded(() => storage.resolveOwner(verified));
+      if (admission.kind === 'denied') throw accessDenied();
+      if (admission.kind !== 'admitted') throw apiErrors.forbidden();
+      const { ownerId } = admission;
+      const bound = await guarded(() => storage.bindInteraction(uid, body.csrf, ownerId, verified.authTimeSec, admission.accessGeneration));
       if (bound === 'other_owner') throw new ApiError(409, 'owner_mismatch');
+      if (bound === 'denied') throw accessDenied();
       if (bound !== 'ok') throw apiErrors.linkUnavailable();
       log({ event: 'interaction.login' });
       alive();
@@ -947,18 +971,27 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       res.end();
     }
 
-    async function consentInteraction(req: IncomingMessage, res: ServerResponse, uid: string): Promise<void> {
+    /** 同意の利用許可の拒否: 固定の日英案内（403。owner・UID・Grant・世代を出さない）。 */
+    function sendAccessDenied(req: IncomingMessage, res: ServerResponse, uid: string, url: URL): void {
+      log({ event: 'interaction.access_denied' });
+      const { language, headers } = pageLanguage(req, url);
+      send(res, 403, 'text/html; charset=utf-8', renderInteractionAccessDenied(web, uid, language), { ...pageSecurityHeaders(web), ...headers });
+    }
+
+    async function consentInteraction(req: IncomingMessage, res: ServerResponse, uid: string, url: URL): Promise<void> {
       requireSameOrigin(req);
       const form = await guarded(() => readForm(req, ['csrf']));
       const interaction = await browserInteraction(req, res, uid);
       const consent = await guarded(() => storage.consumeInteraction(uid, form.get('csrf') ?? ''));
       if (consent === undefined) throw apiErrors.linkUnavailable();
+      if (consent === 'denied') return sendAccessDenied(req, res, uid, url);
       if (!(await guarded(() => storage.isOwnerActive(consent.ownerId)))) throw apiErrors.linkUnavailable();
-      // 同意は同ownerと元interactionへ単回で束縛し、Grantのresource scopeとgrantMetaを保存する。
+      // 同意は同ownerと元interactionへ単回で束縛し、Grantのresource scopeとgrantMetaを保存する。grantMetaは同じtransactionで
+      // 利用許可の世代を再確認し、停止を跨いだら作らない（metadataの無いGrantは新規利用に使えず、成功応答もしない）。
       const grant = new provider.Grant({ accountId: consent.ownerId, clientId: String(interaction.params.client_id) });
       grant.addResourceScope(resource, STTD_SCOPE);
       const grantId = await guarded(() => grant.save());
-      await guarded(() => storage.putGrantMeta(grantId, consent));
+      if ((await guarded(() => storage.putGrantMeta(grantId, consent))) !== 'created') return sendAccessDenied(req, res, uid, url);
       log({ event: 'interaction.consented' });
       alive();
       await provider.interactionFinished(
@@ -1005,7 +1038,10 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
           const verified = await bearerIdentity(req);
           await guarded(() => assertNoBody(req));
           const ownerId = await guarded(() => storage.findOwner(verified));
-          sendJson(res, 200, { state: await webState(ownerId) });
+          const state = await webState(ownerId);
+          // 利用許可は購読stateと分けて返す（読めなければunavailable。stateの照会はこれに依存しない）。UID・世代・一覧は返さない。
+          const access = await guarded(() => storage.accessDisplay(verified));
+          sendJson(res, 200, { state, access });
           return 'web.connection';
         }
         case '/v1/web/disconnect': {
@@ -1035,7 +1071,7 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
             return 'interaction.login';
           case 'consent':
             only('POST');
-            await consentInteraction(req, res, uid);
+            await consentInteraction(req, res, uid, url);
             return 'interaction.consent';
           default:
             only('POST');
@@ -1085,6 +1121,7 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
     function failureOf(error: unknown): { readonly error: ApiError; readonly category: string } {
       if (error instanceof ApiError) return { error, category: 'api' };
       if (error instanceof RequestAuthContextError) return { error: apiErrors.temporarilyUnavailable(), category: 'context' };
+      if (error instanceof AccessUnavailableError) return { error: apiErrors.temporarilyUnavailable(), category: 'access' };
       if (error instanceof KmsConnectionSubscriptionViewError && error.code !== 'invalid_input') {
         return { error: apiErrors.temporarilyUnavailable(), category: 'subscription_view' };
       }

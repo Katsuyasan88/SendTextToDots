@@ -218,9 +218,14 @@ export interface AuthorizationView {
   readonly subscription: OwnerSubscriptionStateOf<SubscriptionExpiry> | undefined;
   /** 有効な購読が束縛したGrantが、同じownerの期限内のものか（無ければfalse）。 */
   readonly grantLive: boolean;
+  /**
+   * 利用許可（運営者の明示登録）。allowedは許可recordがactiveで、有効な購読が束縛したGrantの同意記録が現在の世代と一致する
+   * （購読が無ければ許可recordだけ）。読取り不能・不正はここへ来る前に一時障害として扱う（allowedへ読み替えない）。
+   */
+  readonly access: 'allowed' | 'denied';
 }
 
-export type AuthorizationDenial = 'connection_revoked' | 'subscription_required' | 'destination_change_pending';
+export type AuthorizationDenial = 'connection_revoked' | 'access_denied' | 'subscription_required' | 'destination_change_pending';
 
 /** 有効な購読（期限・旧secretの猶予をnowで判定済み）。無ければ拒否の理由。 */
 export function authorize(
@@ -230,6 +235,7 @@ export function authorize(
   | { readonly ok: true; readonly destination: DestinationVersion; readonly sealedUrl: string; readonly sealedSecret: string; readonly previous: { readonly sealed: string; readonly until: number } | null }
   | { readonly ok: false; readonly denial: AuthorizationDenial } {
   if (!view.ownerActive) return { ok: false, denial: 'connection_revoked' };
+  if (view.access !== 'allowed') return { ok: false, denial: 'access_denied' };
   const state = view.subscription;
   if (state?.pending) return { ok: false, denial: 'destination_change_pending' };
   const active = state?.active ?? null;
@@ -285,6 +291,8 @@ export function decidePrepare(
 ): PrepareDecision {
   if (existing !== undefined) {
     if (!view.ownerActive) return { kind: 'denied', denial: 'connection_revoked' };
+    // 同じIDの再POSTも新規利用の入口なので、利用許可が無ければ拒否する（結果は本人のGETで照会する）。
+    if (view.access !== 'allowed') return { kind: 'denied', denial: 'access_denied' };
     if (existing.tombstone) return { kind: 'existing', doc: existing };
     if (existing.digest === null || !hashesEqual(existing.digest, request.digest)) return { kind: 'conflict' };
     return { kind: 'existing', doc: existing };

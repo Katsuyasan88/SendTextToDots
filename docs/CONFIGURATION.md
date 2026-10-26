@@ -21,6 +21,7 @@ Functions entryはimport時（discovery時）に、MCP entryと各起動口はen
 | key | 形式・条件 |
 | --- | --- |
 | `configured` | `true` |
+| `accessPolicy` | `explicit-allow-v1` だけ（運営者が明示登録した利用者だけが使える。欠落・他の値は設定error。全員許可の方式は無い） |
 | `projectId` | Google Cloud project ID（英小文字始まり6〜30文字） |
 | `projectNumber` | 同じprojectの数値project number |
 | `databaseId` | `(default)` 又は名前付きFirestore database ID |
@@ -45,6 +46,24 @@ Functions entryはimport時（discovery時）に、MCP entryと各起動口はen
 | `web.apiKeyEnv` | MCP processでFirebase Web API keyの値を読む環境変数名（英大文字・数字・`_`）。`GOOGLE_`・`FIREBASE_`・`NODE_`・`K_` 等の既存の名前空間と `PORT` は不可 |
 
 UUIDは例えば `node -e "console.log(crypto.randomUUID())"` で作れます（Node 22のrandomUUIDはversion 4）。
+
+<a id="access-admin"></a>
+
+## 利用者の明示登録（管理CLI）
+
+本人1名で使う場合も、使う人ごとに運営者が利用許可を登録します。初回ログイン・Apple認証の成功・既存のowner/Grant/購読だけでは使えません。許可は既存DBの `sttdConnect/{connectNamespace}/access/{identityHash}`（UIDの平文は保存しない）に置き、active/disabledと世代を持ちます。停止（disabled）や再登録で世代が変わると、それより前の同意で作ったGrant・購読からは新しい送信・購読・token交換ができず、本人のOAuth再同意と再購読が必要です。状態の照会・取消・購読解除・接続解除は停止中も使えます。
+
+登録・停止は運営者のパソコンやCloud Shellで、buildした同じ配置設定に対して明示的に実行します（`npm run build`の後）。対象のFirebase UIDは正規のFirebase利用者管理（Firebase consoleのAuthentication等）で本人のものを確認し、標準入力から1件だけ渡します（引数・履歴・fileへ書かない）。
+
+```bash
+node scripts/manage-access.mjs status --project <projectId> --database <databaseId> --namespace <connectNamespace>
+node scripts/manage-access.mjs grant  --project <projectId> --database <databaseId> --namespace <connectNamespace> --expect <statusのversion（初回はabsent）>
+node scripts/manage-access.mjs revoke --project <projectId> --database <databaseId> --namespace <connectNamespace> --expect <statusのversion>
+```
+
+- `--project`・`--database`・`--namespace`は配置設定と完全一致が必要です（不一致・未設定ならSDKを作らずに止めます）。資格は運営者のApplication Default Credentialsだけで、資格file・接続先・emulator・proxyを指定する口はありません（それらの環境変数があれば止めます）。必要な権限は対象DBの読書きと`identifierKey`の固定版の読取りだけです。
+- 出力は1行JSONの固定codeと状態・版だけ（`status`・`changed`・`unchanged`・`conflict`等）で、UID・鍵・hashは出しません。`grant`/`revoke`はstatusで得た版と一致した時だけ1件を書き、版が違えば`conflict`で何も書きません。結果が不明（`timed_out`・`unavailable`）の時は同じ操作を繰り返さず、`status`で確かめてから判断します。
+- 既存の配置から更新する場合、新しい版へ切り替えるまで許可は効きません。更新後は旧Grantを使えないため、許可した本人がOAuth同意と購読をやり直します。
 
 ## ローカル送信画面の設定
 

@@ -21,6 +21,7 @@ The Functions entry validates at import (discovery) time; the MCP entry and each
 | key | Format and conditions |
 | --- | --- |
 | `configured` | `true` |
+| `accessPolicy` | `explicit-allow-v1` only (only users the operator has explicitly registered can use the service; missing or any other value is a configuration error; there is no allow-everyone mode) |
 | `projectId` | Google Cloud project ID (6 to 30 characters starting with a lower-case letter) |
 | `projectNumber` | The numeric project number of the same project |
 | `databaseId` | `(default)` or a named Firestore database ID |
@@ -45,6 +46,24 @@ The Functions entry validates at import (discovery) time; the MCP entry and each
 | `web.apiKeyEnv` | The name of the environment variable from which the MCP process reads the Firebase Web API key value (upper-case letters, digits and `_`). Existing namespaces such as `GOOGLE_`, `FIREBASE_`, `NODE_`, `K_` and `PORT` are not allowed |
 
 A UUID can be generated with, for example, `node -e "console.log(crypto.randomUUID())"` (randomUUID in Node 22 is version 4).
+
+<a id="access-admin"></a>
+
+## Explicit user registration (admin CLI)
+
+Even for a single self-hosting user, the operator registers each person who may use the service. A first sign-in, a successful Apple sign-in, or an existing owner/Grant/subscription alone does not grant use. The permission lives in the existing database at `sttdConnect/{connectNamespace}/access/{identityHash}` (no plaintext UID) with an active/disabled state and a generation. A stop (disabled) or a re-registration changes the generation; Grants and subscriptions consented before that can no longer be used for new sends, subscriptions or token exchanges, and the person must consent through OAuth again and subscribe again. Looking up and cancelling commands, unsubscribing and disconnecting keep working while stopped.
+
+Run registration and stops explicitly from the operator's computer or Cloud Shell against the same built deployment configuration (after `npm run build`). Confirm the person's Firebase UID in the regular Firebase user management (for example Authentication in the Firebase console) and pass exactly one UID on standard input (never as an argument, in history or in a file).
+
+```bash
+node scripts/manage-access.mjs status --project <projectId> --database <databaseId> --namespace <connectNamespace>
+node scripts/manage-access.mjs grant  --project <projectId> --database <databaseId> --namespace <connectNamespace> --expect <version from status (absent the first time)>
+node scripts/manage-access.mjs revoke --project <projectId> --database <databaseId> --namespace <connectNamespace> --expect <version from status>
+```
+
+- `--project`, `--database` and `--namespace` must exactly match the deployment configuration (a mismatch or an unconfigured build stops before any SDK is created). Credentials are the operator's Application Default Credentials only; there is no way to pass a credential file, endpoint, emulator or proxy (such environment variables stop the command). The only permissions needed are read/write on the target database and reading the fixed `identifierKey` version.
+- The output is one line of JSON with a fixed code and state/version only (`status`, `changed`, `unchanged`, `conflict` and so on); no UID, key or hash is printed. `grant`/`revoke` write the single record only when the version from status still matches; otherwise they print `conflict` and write nothing. If the result is unknown (`timed_out`, `unavailable`), do not repeat the operation; check with `status` first.
+- When updating an existing deployment, the permission takes effect only after switching to the new version. Old Grants cannot be used after the update, so each permitted person consents through OAuth and subscribes again.
 
 ## Local send screen configuration
 

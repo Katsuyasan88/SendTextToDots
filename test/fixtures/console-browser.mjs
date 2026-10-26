@@ -241,7 +241,7 @@ export function syntheticSdk({ restoredUser = false, token = 'synthetic-id-token
 
 /**
  * CONSOLE_SCRIPTを合成DOM/fetch/SDKで実行する。fetchは同origin（localhost helper）への要求だけを受け、onFetch(entry)が応答
- * （{status, json}かthrowするPromise）を返す。navigatorは任意（無ければclipboard未対応）。
+ * （{status, json, headers?}かthrowするPromise）を返す。navigatorは任意（無ければclipboard未対応）。
  */
 export async function runConsole({ html, onFetch, sdk, navigator }) {
   const dom = domFromHtml(html);
@@ -255,10 +255,12 @@ export async function runConsole({ html, onFetch, sdk, navigator }) {
     const entry = { url, method: init.method ?? 'GET', headers: { ...(init.headers ?? {}) }, body: init.body, credentials: init.credentials, redirect: init.redirect, cache: init.cache, signal: init.signal };
     fetches.push(entry);
     assert.ok(url.startsWith('/'), 'only same-origin relative requests');
-    const { status, json } = await onFetch(entry);
+    const { status, json, headers = {} } = await onFetch(entry);
     return {
       ok: status >= 200 && status < 300,
       status,
+      // 応答header（名前は小文字。onFetchが返したものだけ）。
+      headers: { get: (name) => (Object.hasOwn(headers, String(name).toLowerCase()) ? headers[String(name).toLowerCase()] : null) },
       json: async () => {
         if (json === undefined) throw new SyntaxError('not json');
         return json;

@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
-import { consoleAsset, LOCAL_NONCE_HEADER } from '../dist/connect/console.js';
+import { consoleAsset, LOCAL_NONCE_HEADER, LOCAL_REFUSAL_HEADER } from '../dist/connect/console.js';
 import { MESSAGES } from '../dist/connect/i18n.js';
 import { loadDeploymentConfig } from '../dist/config/validate.js';
 import { gate, runConsole, settle, syntheticSdk } from './fixtures/console-browser.mjs';
@@ -36,15 +36,22 @@ const html = (language) => consoleAsset('/console', WEB, { language, nonce: NONC
 
 /** 合成helper: 接続状態と配送結果を返す。holdでPOSTを保留できる。 */
 function helper(initialState = 'subscribed') {
-  const state = { connection: initialState, mode: 'deliver', holds: [], disconnects: 0 };
+  // accessは接続確認の応答の利用許可（undefinedは旧サービス＝fieldなし）。localは次の要求1件をhelperの送出前拒否にする。
+  const state = { connection: initialState, access: 'allowed', mode: 'deliver', holds: [], disconnects: 0, local: null, upstream: 0 };
   const onFetch = async (entry) => {
     assert.equal(entry.headers[LOCAL_NONCE_HEADER], NONCE, 'every relayed request carries the local nonce');
     assert.match(entry.headers.Authorization ?? '', /^Bearer synthetic-id-token$/, 'every relayed request carries the Bearer token');
     assert.deepEqual([entry.credentials, entry.redirect, entry.cache], ['omit', 'error', 'no-store']);
+    if (state.local !== null) {
+      const { status, code } = state.local;
+      state.local = null;
+      return { status, json: { error: { code, retryable: false } }, headers: { [LOCAL_REFUSAL_HEADER.toLowerCase()]: '1' } };
+    }
+    state.upstream += 1;
     if (entry.url === '/v1/web/connection') {
       if (state.mode === 'webFail') return { status: 503, json: { error: { code: 'temporarily_unavailable', retryable: true } } };
       if (state.mode === 'web401') return { status: 401, json: { error: { code: 'authentication_required', retryable: false } } };
-      return { status: 200, json: { state: state.connection } };
+      return { status: 200, json: { state: state.connection, ...(state.access === undefined ? {} : { access: state.access }) } };
     }
     if (entry.url === '/v1/web/disconnect') {
       state.disconnects += 1;
@@ -58,6 +65,10 @@ function helper(initialState = 'subscribed') {
     }
     if (state.mode === 'fail') throw new TypeError('synthetic network failure');
     if (state.mode === 'reject') return { status: 409, json: { error: { code: 'subscription_required', retryable: false } } };
+    if (state.mode === 'accessDenied') return { status: 403, json: { error: { code: 'access_denied', retryable: false } } };
+    // 上流が同名のcode・headerを返しても、helperはheaderを転送しない（ここでは上流の応答としてheaderなしで返す）。
+    if (state.mode === 'spoof') return { status: 403, json: { error: { code: 'local_reload_required', retryable: false } } };
+    if (state.mode === 'unknown') return { status: 502, json: { error: { code: 'upstream_unavailable', retryable: true } } };
     const commandId = entry.method === 'POST' && entry.url === '/v2/commands' ? JSON.parse(entry.body).commandId : entry.url.split('/')[3];
     return { status: 200, json: { commandId, state: entry.url.endsWith('/cancel') ? 'cancelled' : 'delivered' } };
   };
@@ -551,6 +562,8 @@ test('W8 owner binding: a sign-in change in another tab (other account or sign-o
   el('sttd-refresh').click();
   await settle();
   assert.deepEqual([ui.stepState(1), ui.stepState(2), ui.stepState(3)], ['current', 'locked', 'locked']);
+  // 401はaccountの変化を確かめていないので、変化したとは断定せず再ログインを案内する。
+  assert.equal(el('sttd-wizard-note').textContent, EN('wizard.signInAgain'));
   state.mode = 'deliver';
   for (const written of ui.writes) assert.equal(/uid-[abc]|synthetic-id-token/.test(written), false, 'no uid or token in the page text');
   assert.equal(clipboard.writes.length, 1);
@@ -699,4 +712,227 @@ test('W7 disconnect from step 2: confirm first, one POST, steps 2+ reset and the
   assert.equal(el('sttd-state-guide').textContent, JA('wizard.next.unlinked'), 're-checked after the disconnect');
   assert.equal(el('sttd-wizard-note').textContent, JA('wizard.stateReset'));
   results.W7 = { disconnects: state.disconnects };
+});
+
+/** 手順4まで進める（コピー＋「貼り付けて次へ」）。 */
+async function reachStep4(ui, sdk) {
+  await reachStep3(ui, sdk);
+  ui.el('sttd-copy-test').click();
+  await settle();
+  // clipboardの無い合成browserでは手動コピーの確認で代える。
+  if (!ui.el('sttd-manual-test').hidden) ui.el('sttd-manual-test').click();
+  ui.el('sttd-done-test').click();
+  await settle();
+  assert.equal(ui.stepState(4), 'current');
+}
+
+test('W11 access: allowed unlocks; denied / unavailable / an old service without the field keep steps 3+ locked with distinct guidance; a later stop keeps status/cancel but blocks new sends; 403 access_denied is distinct from 403 connection_revoked', { timeout: 20_000 }, async () => {
+  for (const [access, key] of [['denied', 'wizard.access.denied'], ['unavailable', 'wizard.access.unavailable'], [undefined, 'wizard.access.outdated'], ['something-else', 'wizard.access.unavailable']]) {
+    const sdk = syntheticSdk();
+    const { state, onFetch } = helper();
+    state.access = access;
+    const ui = await runConsole({ html: html('ja'), onFetch, sdk });
+    ui.el('sttd-login').click();
+    await settle();
+    ui.el('sttd-refresh').click();
+    await settle();
+    assert.deepEqual([ui.stepState(2), ui.stepState(3)], ['current', 'locked'], `${access}: not unlocked`);
+    assert.equal(ui.el('sttd-state-guide').textContent, JA(key));
+    // 本人の接続解除は残す。
+    assert.equal(ui.el('sttd-disconnect').hidden, false, `${access}: disconnect stays available`);
+    assert.equal(ui.api().length, 0);
+  }
+  // 許可→手順4で送信（不明）→停止を確認: 新しい送信は不可、前の送信の照会・取消は残る。
+  const sdk = syntheticSdk();
+  const { state, onFetch } = helper();
+  const ui = await runConsole({ html: html('en'), onFetch, sdk });
+  const { el } = ui;
+  await reachStep4(ui, sdk);
+  state.mode = 'fail';
+  el('sttd-text').value = 'before the stop';
+  el('sttd-send').click();
+  await settle();
+  assert.equal(el('sttd-result').textContent, EN('console.unknown'));
+  state.mode = 'deliver';
+  state.access = 'denied';
+  ui.clickPanel(2);
+  el('sttd-refresh').click();
+  await settle();
+  assert.equal(el('sttd-state-guide').textContent, EN('wizard.access.denied'));
+  ui.clickPanel(4);
+  assert.equal(ui.stepState(4), 'current', 'progress kept');
+  assert.equal(el('sttd-check').hidden, false);
+  el('sttd-check').click();
+  await settle();
+  assert.equal(el('sttd-result').textContent, EN('console.state.delivered'), 'the owner can still check the earlier send');
+  el('sttd-new').click();
+  await settle();
+  assert.deepEqual([el('sttd-send').disabled, el('sttd-text').disabled], [true, true], 'no new send while not permitted');
+  assert.ok(el('sttd-result').textContent.includes(EN('wizard.access.denied')));
+  const posts = ui.api().filter((entry) => entry.url === '/v2/commands').length;
+  el('sttd-send').onclick();
+  await settle();
+  assert.equal(ui.api().filter((entry) => entry.url === '/v2/commands').length, posts);
+
+  // 403 access_denied（利用許可）は接続の失効（403）と別の文言。どちらも未送信で確認不可。
+  const sdk2 = syntheticSdk();
+  const h2 = helper();
+  const ui2 = await runConsole({ html: html('ja'), onFetch: h2.onFetch, sdk: sdk2 });
+  await reachStep4(ui2, sdk2);
+  h2.state.mode = 'accessDenied';
+  ui2.el('sttd-text').value = 'refused';
+  ui2.el('sttd-send').click();
+  await settle();
+  assert.equal(ui2.el('sttd-result').textContent, JA('console.error.access_denied'));
+  assert.notEqual(JA('console.error.access_denied'), JA('console.error.403'));
+  assert.equal(ui2.el('sttd-verify-send').disabled, true);
+  results.W11 = { fetches: ui.fetches.length };
+});
+
+test('W12 helper refusals: a stale-nonce refusal before upstream is "not sent" with reload guidance and cannot be confirmed; 404/405/413 from the helper are not sent; the same code from upstream without the helper header is not treated as local; an upstream/network unknown stays unknown', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk();
+  const { state, onFetch } = helper();
+  const ui = await runConsole({ html: html('en'), onFetch, sdk });
+  const { el } = ui;
+  await reachStep4(ui, sdk);
+  for (const [status, code] of [[403, 'local_reload_required'], [404, 'not_found'], [405, 'method_not_allowed'], [413, 'payload_too_large'], [401, 'authentication_required']]) {
+    const upstream = state.upstream;
+    state.local = { status, code };
+    el('sttd-text').value = `local ${status}`;
+    el('sttd-send').click();
+    await settle();
+    assert.equal(state.upstream, upstream, `${status}: nothing reached upstream`);
+    assert.equal(el('sttd-result').textContent, EN('console.localRefused'), `${status}: not sent, reload guidance`);
+    assert.equal(el('sttd-verify-send').disabled, true, `${status}: cannot be confirmed`);
+    assert.equal(el('sttd-check').hidden, true, `${status}: settled as not sent`);
+    assert.equal(ui.stepState(1), 'done', `${status}: a helper 401 is not a sign-in loss`);
+    el('sttd-new').click();
+    await settle();
+    assert.equal(el('sttd-wizard-note').textContent, '', 'no duplicate warning for a send that never left');
+  }
+  // 上流が同じcodeを返しただけ（helperのheaderなし）: 未送信にしない（403の既存文言）。
+  state.mode = 'spoof';
+  el('sttd-text').value = 'spoof';
+  el('sttd-send').click();
+  await settle();
+  assert.equal(el('sttd-result').textContent, EN('console.error.403'));
+  el('sttd-new').click();
+  await settle();
+  // helperの502（上流不明）とnetwork失敗は結果不明のまま（確認・照会できる）。
+  for (const mode of ['unknown', 'fail']) {
+    state.mode = mode;
+    el('sttd-text').value = mode;
+    el('sttd-send').click();
+    await settle();
+    assert.equal(el('sttd-result').textContent, EN('console.unknown'), mode);
+    assert.equal(el('sttd-verify-send').disabled, false, `${mode}: the user may confirm`);
+    assert.equal(el('sttd-check').hidden, false);
+    state.mode = 'deliver';
+    el('sttd-new').click();
+    await settle();
+  }
+  // 接続確認のhelper拒否も未送信として再読込みを案内する（ログインは失わない）。
+  ui.clickPanel(2);
+  state.local = { status: 403, code: 'local_reload_required' };
+  el('sttd-refresh').click();
+  await settle();
+  assert.deepEqual([el('sttd-state-guide').textContent, ui.stepState(1)], [EN('console.localRefused'), 'done']);
+  results.W12 = { upstream: state.upstream };
+});
+
+test('W13 duplicate warning survives resets that drop an unsettled send: sign-in change during a pending POST, 401, re-applying the test after an unknown result; not overwritten by the reset note; a fresh send clears it', { timeout: 20_000 }, async () => {
+  // POST保留中に別accountへ切替 → 1へ戻すが、重複注意を残す（自動の照会・取消・再送なし）。
+  {
+    const sdk = syntheticSdk();
+    const { state, onFetch } = helper();
+    const ui = await runConsole({ html: html('ja'), onFetch, sdk });
+    await reachStep4(ui, sdk);
+    state.mode = 'hold';
+    ui.el('sttd-text').value = 'pending';
+    ui.el('sttd-send').click();
+    await settle();
+    const before = ui.fetches.length;
+    sdk.changeUser('uid-b');
+    await settle();
+    assert.equal(ui.stepState(1), 'current');
+    assert.equal(ui.el('sttd-wizard-note').textContent, `${JA('wizard.authChanged')} ${JA('console.duplicateWarning')}`);
+    state.holds.shift().hold.release({ status: 200, json: { state: 'delivered' } });
+    await settle();
+    assert.equal(ui.fetches.length, before, 'no automatic check/cancel/resend');
+    assert.ok(ui.el('sttd-wizard-note').textContent.includes(JA('console.duplicateWarning')));
+  }
+  // 結果不明の後の401 → 再ログイン案内（変化と断定しない）＋重複注意。
+  {
+    const sdk = syntheticSdk();
+    const { state, onFetch } = helper();
+    const ui = await runConsole({ html: html('en'), onFetch, sdk });
+    await reachStep4(ui, sdk);
+    state.mode = 'fail';
+    ui.el('sttd-text').value = 'unknown then 401';
+    ui.el('sttd-send').click();
+    await settle();
+    state.mode = 'web401';
+    ui.clickPanel(2);
+    ui.el('sttd-refresh').click();
+    await settle();
+    assert.equal(ui.el('sttd-wizard-note').textContent, `${EN('wizard.signInAgain')} ${EN('console.duplicateWarning')}`);
+  }
+  // 結果不明の後にテスト指示を再適用 → 4/5を戻すが重複注意を残し、次の送信の開始で消す。確定した送信は注意しない。
+  {
+    const sdk = syntheticSdk();
+    const { clipboard, navigator } = clipboardStub();
+    const { state, onFetch } = helper();
+    const ui = await runConsole({ html: html('en'), onFetch, sdk, navigator });
+    await reachStep4(ui, sdk);
+    state.mode = 'fail';
+    ui.el('sttd-text').value = 'unknown then re-apply';
+    ui.el('sttd-send').click();
+    await settle();
+    ui.clickPanel(3);
+    ui.el('sttd-copy-test').click();
+    await settle();
+    ui.el('sttd-done-test').click();
+    await settle();
+    assert.equal(ui.el('sttd-wizard-note').textContent, `${EN('wizard.testReapplied')} ${EN('console.duplicateWarning')}`);
+    assert.equal(ui.el('sttd-result').textContent, EN('console.duplicateWarning'));
+    state.mode = 'deliver';
+    ui.el('sttd-text').value = 'fresh';
+    ui.el('sttd-send').click();
+    await settle();
+    assert.equal(ui.el('sttd-wizard-note').textContent, EN('wizard.testReapplied'), 'cleared by the next send');
+    ui.clickPanel(3);
+    ui.el('sttd-done-test').click();
+    await settle();
+    assert.equal(ui.el('sttd-wizard-note').textContent, EN('wizard.testReapplied'), 'a settled delivery is not uncertain');
+    assert.equal(clipboard.writes.length, 2, 'copied in step 3 twice');
+  }
+  results.W13 = true;
+});
+
+test('W14 cancel / check / new message also require the active step 4: direct handler calls while another step is active send nothing and change nothing; after re-selecting step 4 they work', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk();
+  const { state, onFetch } = helper();
+  const ui = await runConsole({ html: html('en'), onFetch, sdk });
+  const { el } = ui;
+  await reachStep4(ui, sdk);
+  state.mode = 'fail';
+  el('sttd-text').value = 'unknown result';
+  el('sttd-send').click();
+  await settle();
+  state.mode = 'deliver';
+  ui.clickPanel(3);
+  assert.equal(ui.stepState(3), 'current');
+  const fetches = ui.fetches.length;
+  const result = el('sttd-result').textContent;
+  el('sttd-cancel').onclick();
+  el('sttd-check').onclick();
+  el('sttd-new').onclick();
+  await settle();
+  assert.deepEqual([ui.fetches.length, el('sttd-result').textContent, el('sttd-check').hidden], [fetches, result, false], 'no request and no state change');
+  ui.clickPanel(4);
+  el('sttd-check').click();
+  await settle();
+  assert.equal(el('sttd-result').textContent, EN('console.state.delivered'));
+  assert.equal(ui.fetches.length, fetches + 1);
+  results.W14 = { fetches: ui.fetches.length };
 });

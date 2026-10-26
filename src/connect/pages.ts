@@ -117,6 +117,15 @@ export function renderInteractionConsent(web: FirebaseWebConfig, uid: string, cl
 }
 
 /**
+ * 利用許可の拒否（同意の時点で運営者の明示許可が無い・停止された）の固定案内。403で返し、owner・UID・Grant・世代・CSRFを含めない。
+ * 操作（ログイン・同意・拒否）を持たない。
+ */
+export function renderInteractionAccessDenied(web: FirebaseWebConfig, uid: string, language: Language = DEFAULT_LANGUAGE): string {
+  const lang = languageOf(language);
+  return shell(web, 'interaction-access-denied', lang, `/interaction/${escapeHtml(uid)}`, `<p role="alert">${escapeHtml(text(lang, 'interaction.accessDenied'))}</p>`, {});
+}
+
+/**
  * interaction画面のscript（login画面だけが操作を持つ。consent画面はnative formで、scriptは何もしない）。SDKの復元を待ち、復元済みsessionが
  * あればそのtokenを使ってpopupを開かない（本人の「続ける」操作だけで同じinteractionへ進む）。popupは未ログインか、本人の明示のaccount切替
  * （signOut後）の時だけ。復元済みsessionのtoken更新に失敗した時は、自動でpopupを開かず、ログインの操作へ戻す。
@@ -177,7 +186,18 @@ async function interactionLogin(idToken) {
     body: JSON.stringify({ csrf: body.dataset.sttdCsrf, idToken }),
   });
   if (response.status === 204) location.reload();
-  else say(T('interaction.loginConfirmFailed'));
+  else say(T((await accessRefused(response)) ? 'interaction.accessDenied' : 'interaction.loginConfirmFailed'));
+}
+
+// 利用許可の拒否は固定の403 access_deniedだけ（他の403・失敗を利用許可の拒否として表示しない）。
+async function accessRefused(response) {
+  if (response.status !== 403) return false;
+  try {
+    const parsed = await response.json();
+    return parsed !== null && typeof parsed === 'object' && parsed.error !== null && typeof parsed.error === 'object' && parsed.error.code === 'access_denied';
+  } catch {
+    return false;
+  }
 }
 
 async function start() {

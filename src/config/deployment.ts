@@ -7,6 +7,8 @@
 export const DEPLOYMENT_CONFIG = {
   /** 全項目を自分の値へ置き換えた後にだけtrueにする。 */
   configured: false,
+  /** 利用許可の方式。運営者が明示登録した利用者だけを許す`explicit-allow-v1`だけを受け付ける（全員許可modeは無い）。 */
+  accessPolicy: 'explicit-allow-v1',
   /** Google Cloud / Firebaseのproject ID（6〜30文字）。 */
   projectId: 'your-project-id',
   /** 同じprojectの数値project number。 */

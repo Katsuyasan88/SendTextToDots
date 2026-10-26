@@ -36,6 +36,11 @@ export const CONSOLE_STYLE_PATH = '/console/app.css';
 export const CONSOLE_SDK_BASE = `https://www.gstatic.com/firebasejs/${FIREBASE_WEB_SDK_VERSION}/`;
 /** helperへの中継要求に必須のlocal nonce header（起動ごとの乱数。Cloudへは転送しない）。 */
 export const LOCAL_NONCE_HEADER = 'X-Sttd-Local-Nonce';
+/**
+ * helperが上流を呼ぶ前に自分で拒否した応答にだけ付ける固定header（値は`1`）。helperは上流応答のこの名前のheaderを転送しないので、
+ * 画面はこれがある時だけ「未送信（helperの拒否）」と扱う（上流の同名codeでは未送信にしない）。
+ */
+export const LOCAL_REFUSAL_HEADER = 'X-Sttd-Local-Refusal';
 
 /** 渡された設定の不正（固定message・値を持たない）。 */
 export class ConsoleConfigError extends Error {
@@ -252,6 +257,7 @@ const SDK_BASE = '${CONSOLE_SDK_BASE}';
 const FIREBASE = JSON.parse(body.dataset.sttdFirebase);
 const NONCE = body.dataset.sttdLocalNonce;
 const NONCE_HEADER = '${LOCAL_NONCE_HEADER}';
+const LOCAL_REFUSAL_HEADER = '${LOCAL_REFUSAL_HEADER}';
 const TEXT = ${messagesJson()};
 const LANGUAGE_COOKIE = '${LANGUAGE_COOKIE}';
 const COOKIE_ATTRIBUTES = body.dataset.sttdCookieAttributes;
@@ -264,6 +270,7 @@ const LIFETIME_MS = 60000;
 const MAX_TEXT_BYTES = 4096;
 const LONE_SURROGATE = /\\p{Cs}/u;
 const CONNECTION_STATES = ['unlinked', 'linked', 'subscribed', 'expired', 'change_pending'];
+const ACCESS_STATES = ['allowed', 'denied', 'unavailable'];
 const ERROR_STATUSES = [400, 401, 403, 409, 422, 429];
 const TERMINAL = ['delivered', 'failed', 'cancelled', 'expired', 'delivery_unknown'];
 const RANK = { in_flight: 1, delivery_unknown: 2, failed: 3, expired: 3, cancelled: 3, delivered: 4 };
@@ -284,6 +291,8 @@ let signedIn = false;
 let accountBusy = false;
 let accountKey = 'console.accountSignedOut';
 let connection = null;
+// 利用許可（接続確認の応答のaccess。allowed/denied/unavailable、欠落は旧サービスのoutdated）。allowedの時だけ新しい送信を解放する。
+let access = null;
 let connectionKey = '';
 let guideKey = '';
 let checking = false;
@@ -292,6 +301,9 @@ const done = { 1: false, 2: false, 3: false, 4: false, 5: false };
 let noteKey = '';
 let test = null;
 let sendNote = '';
+// 結果が確定していない送信をreset（再ログイン・認証喪失・状態の再確認・テスト指示の再適用）で画面から消した時の重複注意（RAMだけ）。
+// 次の送信を始めるまで表示し、resetの一般noteで上書きしない。
+let duplicateWarning = false;
 let confirming = false;
 let disconnectKey = '';
 let copyKey = '';
@@ -314,6 +326,20 @@ function phaseOf(current) {
 
 function checkable(current) {
   return phaseOf(current) === 'unknown' || current.state === 'delivery_unknown';
+}
+
+/** 結果が確定していない（届いた可能性がある）送信か。送信中・結果不明・処理中・不明・中止未確認・確認中を保守的に含める。 */
+function uncertain(current) {
+  const phase = phaseOf(current);
+  return (
+    phase === 'sending' ||
+    phase === 'unknown' ||
+    current.state === 'in_flight' ||
+    current.state === 'delivery_unknown' ||
+    current.cancel === 'pending' ||
+    current.checking ||
+    (current.cancel === 'unconfirmed' && current.state !== 'cancelled')
+  );
 }
 
 /** 認証処理・接続確認・解除の処理中。 */
@@ -347,7 +373,7 @@ function available(n) {
 }
 
 function sendableNow() {
-  return available(4) && signedIn && connection === 'subscribed' && !busy();
+  return available(4) && signedIn && connection === 'subscribed' && access === 'allowed' && !busy();
 }
 
 function languageLocked() {
@@ -367,6 +393,7 @@ function resetFrom(n) {
   for (const k of STEPS) if (k >= n) done[k] = false;
   if (n <= 2) {
     connection = null;
+    access = null;
     connectionKey = '';
     guideKey = '';
     confirming = false;
@@ -377,6 +404,8 @@ function resetFrom(n) {
     manual.test = false;
   }
   if (n <= 4) {
+    // 未確定の送信を消す時は重複注意を残す（同IDの自動照会・取消・再送はしない）。
+    if (test !== null && uncertain(test)) duplicateWarning = true;
     test = null;
     sendNote = '';
     el('sttd-text').value = '';
@@ -404,7 +433,7 @@ function render() {
     panel.setAttribute('data-sttd-state', state);
     panel.setAttribute('aria-disabled', state === 'current' ? 'false' : 'true');
   }
-  el('sttd-wizard-note').textContent = T(noteKey);
+  el('sttd-wizard-note').textContent = [T(noteKey), duplicateWarning ? T('console.duplicateWarning') : ''].filter((line) => line !== '').join(' ');
   // 非activeのpanel内controlは誤操作防止で全て無効（handlerもcanActで拒否する）。
   const inactive = (n) => step !== n;
   // 1 ログイン
@@ -459,8 +488,10 @@ function render() {
     if (test.cancel === 'pending') lines.push(T('console.cancelPending'));
     if (test.cancel === 'unconfirmed' && test.state !== 'cancelled') lines.push(T('console.cancelUnconfirmed'));
     if (test.checkNote) lines.push(T(test.checkNote));
-  } else if (sendNote) {
-    lines.push(T(sendNote));
+  } else {
+    if (sendNote) lines.push(T(sendNote));
+    else if (duplicateWarning) lines.push(T('console.duplicateWarning'));
+    if (signedIn && connection === 'subscribed' && access !== null && access !== 'allowed') lines.push(T('wizard.access.' + access));
   }
   el('sttd-result').textContent = lines.join(' ');
 }
@@ -509,8 +540,11 @@ function panelKeyCapture(n, event) {
   panelCapture(n, event);
 }
 
-/** ログイン中accountの変化（別owner・ログアウト・失効）: 以降の要求を止め、2以降を戻してログインからやり直す。古いasync結果は世代で捨てる。 */
-function authLost(key) {
+/**
+ * ログイン中accountの変化（別owner・ログアウト）やログインを確認できない時（401・token取得不能）: 以降の要求を止め、2以降を戻して
+ * ログインからやり直す。古いasync結果は世代で捨てる。note省略時はaccountの変化を断定しない再ログイン案内。
+ */
+function authLost(key, note) {
   loginGeneration += 1;
   checkGeneration += 1;
   checking = false;
@@ -521,7 +555,7 @@ function authLost(key) {
   ownerUid = null;
   step = 1;
   accountKey = key || 'common.loginRefresh';
-  noteKey = 'wizard.authChanged';
+  noteKey = note || 'wizard.signInAgain';
   render();
 }
 
@@ -531,7 +565,7 @@ function observeAuth(s) {
   authObserved = true;
   s.auth.onAuthStateChanged((user) => {
     if (!signedIn || ownerUid === null) return;
-    if (!user || user.uid !== ownerUid) authLost('common.loginRefresh');
+    if (!user || user.uid !== ownerUid) authLost('common.loginRefresh', 'wizard.authChanged');
   });
 }
 
@@ -649,9 +683,19 @@ function within(promise, ms) {
   });
 }
 
+/** helperが上流を呼ぶ前に拒否した応答か（helperだけが付ける固定headerで判定。codeやstatusだけでは判定しない）。 */
+function localRefusal(response) {
+  try {
+    return response.headers !== null && typeof response.headers === 'object' && typeof response.headers.get === 'function' && response.headers.get(LOCAL_REFUSAL_HEADER) === '1';
+  } catch {
+    return false;
+  }
+}
+
 /**
  * 同origin helperへの1要求（Bearer＋local nonce、credentials omit、redirectを辿らない）。元期限は認証取得・HTTP・JSON待ちを全て含む。
- * 期限内にtokenが無ければHTTPを始めずnot_sent。HTTPを始めた後の失敗・timeoutはunknown。
+ * 期限内にtokenが無ければHTTPを始めずnot_sent。helperが上流の前に拒否した応答はlocal（未送信。古い画面なら再読込みの案内）。
+ * HTTPを始めた後の失敗・timeoutはunknown。
  */
 async function request(path, method, ms, headers, payload) {
   const deadline = Date.now() + Math.max(0, ms);
@@ -681,7 +725,8 @@ async function request(path, method, ms, headers, payload) {
       json = null;
     }
     if (gen !== loginGeneration) return { kind: 'stale' };
-    // 認証失効（401）: 古い進捗を残さずログインからやり直す（呼出し側の続きは世代/testの検査で止まる）。
+    if (localRefusal(response)) return { kind: 'local', status: response.status };
+    // 認証失効（401）: 古い進捗を残さずログインからやり直す（呼出し側の続きは世代/testの検査で止まる）。accountの変化とは断定しない。
     if (response.status === 401) authLost('common.loginRefresh');
     return { kind: 'response', status: response.status, json };
   } catch {
@@ -709,15 +754,31 @@ async function checkConnection(internal) {
     authLost('common.loginRefresh');
     return;
   }
+  if (outcome.kind === 'local') {
+    // helperが送信前に拒否（古い画面等）: 状態は不明のまま。再読込みを案内する。
+    connection = null;
+    access = null;
+    connectionKey = 'console.connectionUnavailable';
+    guideKey = 'console.localRefused';
+    if (done[3] || done[4] || done[5]) noteKey = 'wizard.stateReset';
+    resetFrom(3);
+    done[2] = false;
+    step = 2;
+    return render();
+  }
   const json = outcome.kind === 'response' ? outcome.json : null;
   if (json && typeof json.state === 'string' && CONNECTION_STATES.includes(json.state)) {
     connection = json.state;
-    guideKey = 'wizard.next.' + json.state;
-    if (json.state === 'subscribed') {
+    // accessの欠落は利用許可に未対応の旧サービス（更新が必要）。未知の値は確認できないものとして扱う。どちらも新しい送信を解放しない。
+    access = !Object.hasOwn(json, 'access') ? 'outdated' : ACCESS_STATES.includes(json.access) ? json.access : 'unavailable';
+    guideKey = access === 'allowed' ? 'wizard.next.' + json.state : 'wizard.access.' + access;
+    if (json.state === 'subscribed' && access === 'allowed') {
       const first = !done[2];
       done[2] = true;
       noteKey = '';
       if (first) step = 3;
+    } else if (json.state === 'subscribed' && done[2]) {
+      // 受信中のまま利用許可だけが無い: 進捗（前の送信の確認・中止を含む）は残し、新しい送信だけを止める（sendableNowがallowedを要求）。
     } else {
       if (done[3] || done[4] || done[5]) noteKey = 'wizard.stateReset';
       resetFrom(3);
@@ -771,7 +832,7 @@ function disconnect() {
     if (done[3] || done[4] || done[5]) noteKey = 'wizard.stateReset';
     resetFrom(2);
     step = 2;
-    disconnectKey = ok ? 'common.disconnectDone' : 'common.disconnectFailed';
+    disconnectKey = ok ? 'common.disconnectDone' : outcome.kind === 'local' ? 'console.localRefused' : 'common.disconnectFailed';
     connectionKey = '';
     guideKey = '';
     render();
@@ -889,6 +950,7 @@ async function send() {
   const current = { commandId: crypto.randomUUID(), state: null, postDone: false, rejected: null, cancel: 'none', checking: false, checkNote: '' };
   test = current;
   sendNote = '';
+  duplicateWarning = false;
   render();
   const payload = JSON.stringify({
     schemaVersion: 2,
@@ -903,13 +965,20 @@ async function send() {
   const state = stateOf(current, outcome);
   if (state !== null) apply(current, state);
   else if (outcome.kind === 'not_sent') current.rejected = 'console.notSent';
+  else if (outcome.kind === 'local') current.rejected = 'console.localRefused';
+  else if (outcome.kind === 'response' && outcome.status === 403 && errorCode(outcome.json) === 'access_denied') current.rejected = 'console.error.access_denied';
   else if (outcome.kind === 'response' && ERROR_STATUSES.includes(outcome.status)) current.rejected = 'console.error.' + outcome.status;
   render();
 }
 
+/** 上流の固定error codeだけを読む（無い・形違いは空）。 */
+function errorCode(json) {
+  return json !== null && typeof json === 'object' && json.error !== null && typeof json.error === 'object' && typeof json.error.code === 'string' ? json.error.code : '';
+}
+
 async function cancel() {
   const current = test;
-  if (current === null || current.cancel !== 'none' || phaseOf(current) === 'settled') return;
+  if (!canAct(4) || current === null || current.cancel !== 'none' || phaseOf(current) === 'settled') return;
   current.cancel = 'pending';
   render();
   const outcome = await request('/v2/commands/' + current.commandId + '/cancel', 'POST', CANCEL_MS, {}, undefined);
@@ -920,13 +989,14 @@ async function cancel() {
     apply(current, state);
   } else {
     current.cancel = 'unconfirmed';
+    if (outcome.kind === 'local') current.checkNote = 'console.localRefused';
   }
   render();
 }
 
 async function check() {
   const current = test;
-  if (current === null || current.checking || !checkable(current)) return;
+  if (!canAct(4) || current === null || current.checking || !checkable(current)) return;
   current.checking = true;
   current.checkNote = '';
   render();
@@ -935,6 +1005,7 @@ async function check() {
   current.checking = false;
   const state = stateOf(current, outcome);
   if (state !== null) apply(current, state);
+  else if (outcome.kind === 'local') current.checkNote = 'console.localRefused';
   else if (outcome.kind === 'response' && outcome.status === 404) current.checkNote = 'console.checkNotFound';
   else current.checkNote = 'console.checkFailed';
   render();
@@ -942,10 +1013,10 @@ async function check() {
 
 function newTest() {
   const current = test;
-  if (current === null || phaseOf(current) === 'sending' || current.cancel === 'pending' || current.checking) return;
-  const uncertain = phaseOf(current) === 'unknown' || current.state === 'delivery_unknown' || current.state === 'in_flight' || (current.cancel === 'unconfirmed' && current.state !== 'cancelled');
+  if (!canAct(4) || current === null || phaseOf(current) === 'sending' || current.cancel === 'pending' || current.checking) return;
+  const warn = uncertain(current);
   test = null;
-  sendNote = uncertain ? 'console.duplicateWarning' : '';
+  sendNote = warn ? 'console.duplicateWarning' : '';
   render();
 }
 

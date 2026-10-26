@@ -43,7 +43,10 @@ export interface KmsRequestDeliveryRuntimeOptions {
   /** 借用するFirestore instance（terminateしない）。Command・購読marker/owner文書の参照は全てここから作る。 */
   readonly db: Firestore;
   /** 接続保存（ConnectStorage）。owner・Grantの参照は毎回ref.firestore===dbを要求する。 */
-  readonly connect: Pick<ConnectStorage, 'ownerDocRef' | 'grantDocRef' | 'ownerDocActive' | 'grantDocLive'>;
+  readonly connect: Pick<
+    ConnectStorage,
+    'ownerDocRef' | 'grantDocRef' | 'ownerDocActive' | 'grantDocLive' | 'accessDocRefForOwner' | 'grantMetaDocRef' | 'accessUseDecision' | 'grantUseDecision'
+  >;
   /** `t270_<小文字UUID>`（sttdDelivery配下）。 */
   readonly namespace: string;
   /** 識別子HMAC（接続側と同じ値）。 */
@@ -146,12 +149,23 @@ export function createKmsRequestDeliveryRuntime(options: KmsRequestDeliveryRunti
   const grantDocRef = methodOf(connectTarget, 'grantDocRef');
   const ownerDocActive = methodOf(connectTarget, 'ownerDocActive');
   const grantDocLive = methodOf(connectTarget, 'grantDocLive');
+  const accessDocRefForOwner = methodOf(connectTarget, 'accessDocRefForOwner');
+  const grantMetaDocRef = methodOf(connectTarget, 'grantMetaDocRef');
+  const accessUseDecision = methodOf(connectTarget, 'accessUseDecision');
+  const grantUseDecision = methodOf(connectTarget, 'grantUseDecision');
+  /** 利用許可の判定は既知の3値だけを採用し、他は一時障害（unavailable）へ閉じる。 */
+  const decisionOf = (value: unknown): 'allowed' | 'denied' | 'unavailable' => (value === 'allowed' || value === 'denied' ? value : 'unavailable');
   const connect: KmsDeliveryConnect = Object.freeze({
     ownerDocRef: (ownerId: string) => ownerDocRef(ownerId) as ReturnType<KmsDeliveryConnect['ownerDocRef']>,
     grantDocRef: (grantId: string) => grantDocRef(grantId) as ReturnType<KmsDeliveryConnect['grantDocRef']>,
     ownerDocActive: (data: Record<string, unknown> | undefined, now: number) => ownerDocActive(data, now) === true,
     grantDocLive: (data: Record<string, unknown> | undefined, ownerId: string, grantId: string, now: number) =>
       grantDocLive(data, ownerId, grantId, now) === true,
+    accessDocRefForOwner: (data: Record<string, unknown> | undefined) => accessDocRefForOwner(data) as ReturnType<KmsDeliveryConnect['accessDocRefForOwner']>,
+    grantMetaDocRef: (grantId: string) => grantMetaDocRef(grantId) as ReturnType<KmsDeliveryConnect['grantMetaDocRef']>,
+    accessUseDecision: (access: { readonly exists: boolean; readonly data: unknown }) => decisionOf(accessUseDecision(access)),
+    grantUseDecision: (access: { readonly exists: boolean; readonly data: unknown }, meta: { readonly exists: boolean; readonly data: unknown }, ownerId: string) =>
+      decisionOf(grantUseDecision(access, meta, ownerId)),
   });
 
   const hashMethod = methodOf(fields.get('hasher'), 'hash');

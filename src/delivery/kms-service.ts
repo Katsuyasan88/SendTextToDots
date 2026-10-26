@@ -258,6 +258,8 @@ export class KmsRequestDeliveryService {
         case 'conflict':
           return errorResponse(409, 'idempotency_conflict');
         case 'denied':
+          // 利用許可の拒否は接続の失効と区別する固定403（retryable false）。
+          if (decision.denial === 'access_denied') return errorResponse(403, 'access_denied');
           return decision.denial === 'connection_revoked' ? errorResponse(403, 'connection_revoked') : errorResponse(409, decision.denial);
         case 'rate_limited':
           return errorResponse(429, 'rate_limited', true, { 'Retry-After': String(decision.retryAfterSec) });

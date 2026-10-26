@@ -29,6 +29,8 @@ const TOP_KEYS = [
   'secretVersions',
   'web',
 ] as const;
+/** 利用許可の唯一の方式（運営者が明示登録した利用者だけ）。欠落・未知値は設定error（全員許可・旧版へのfallbackなし）。 */
+export const ACCESS_POLICY = 'explicit-allow-v1';
 const API_KEYS = ['functionName', 'serviceName', 'serviceAccount', 'invoker', 'publicOrigin'] as const;
 const CONNECT_KEYS = ['serviceName', 'serviceAccount', 'publicOrigin', 'invoker'] as const;
 const KMS_KEYS = ['environment', 'projectId', 'databaseId', 'namespace', 'cryptoKey', 'writeVersion', 'readVersions'] as const;
@@ -64,6 +66,7 @@ export class DeploymentConfigError extends Error {
 }
 
 export interface DeploymentConfig {
+  readonly accessPolicy: typeof ACCESS_POLICY;
   readonly projectId: string;
   readonly projectNumber: string;
   readonly databaseId: string;
@@ -164,12 +167,14 @@ function deepFreeze<T>(value: T): T {
 export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
   let top: Map<string, unknown>;
   try {
-    top = dataFields(raw, TOP_KEYS);
+    // accessPolicyは配布placeholder（未設定）の判定を先に保つため存在だけ任意で読み、設定済みの時は下で必須にする。
+    top = dataFields(raw, TOP_KEYS, ['accessPolicy']);
   } catch {
     throw invalid();
   }
   if (top.get('configured') !== true) throw new DeploymentConfigError('deployment_config_unconfigured');
   try {
+    requireThat(top.get('accessPolicy') === ACCESS_POLICY);
     const projectId = str(top, 'projectId');
     const projectNumber = str(top, 'projectNumber');
     const databaseId = str(top, 'databaseId');
@@ -241,6 +246,7 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
     requireThat(web.projectId === projectId && isDnsHost(web.authDomain) && isApiKeyEnvName(web.apiKeyEnv));
 
     return deepFreeze({
+      accessPolicy: ACCESS_POLICY,
       projectId,
       projectNumber,
       databaseId,

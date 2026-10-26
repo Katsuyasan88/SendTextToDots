@@ -51,7 +51,9 @@ A callback 2xx is delivered; 5xx and an unknown response after dispatch are deli
 
 The old v1 routes (`/v1/commands`, `/v1/commands/{commandId}`, `/v1/commands/{commandId}/cancel`) are 404 not_found and perform no processing. A wrong method on a v2 route is 405 method_not_allowed; sending `schemaVersion` 1 or old fields to v2 is 400 invalid_request. There is no conversion or redirect between old and new.
 
-Errors are `{"error":{"code":"…","retryable":<boolean>}}`. Main codes: invalid_request(400), authentication_required(401), connection_revoked(403), not_found(404), method_not_allowed(405), subscription_required / destination_change_pending / idempotency_conflict(409), command_expired / clock_skew(422), rate_limited(429, Retry-After), temporarily_unavailable(503). Even when retryable is true, do not resend the text automatically; look up the state of the same ID instead.
+Errors are `{"error":{"code":"…","retryable":<boolean>}}`. Main codes: invalid_request(400), authentication_required(401), connection_revoked / access_denied(403), not_found(404), method_not_allowed(405), subscription_required / destination_change_pending / idempotency_conflict(409), command_expired / clock_skew(422), rate_limited(429, Retry-After), temporarily_unavailable(503). Even when retryable is true, do not resend the text automatically; look up the state of the same ID instead.
+
+Access permission: a new POST (including a repeated POST of the same ID) is accepted only while the operator's explicit access record ([CONFIGURATION](CONFIGURATION_EN.md#access-admin)) is active and the destination subscription is bound to a Grant consented under the current access generation. Not registered, stopped, or an older-generation Grant gives 403 `access_denied` (retryable false; distinct from `connection_revoked`); when the permission cannot be checked the response is 503 `temporarily_unavailable`. If a stop is confirmed after acceptance, the send right is re-checked and the command ends as `failed` without sending (a command that already holds its send right settles under the existing contract). Looking up and cancelling commands does not require the permission.
 
 Deadlines: the processing budget is the shorter of 20 seconds from receipt and the original lifetime, external HTTP takes at most 10 seconds, and the Functions timeout is 30 seconds.
 
@@ -63,7 +65,7 @@ The send screen is served by the local helper on your computer ([LOCAL_CONSOLE_E
 
 | Endpoint | Content |
 | --- | --- |
-| `GET /v1/web/connection` | Bearer Firebase ID token. `{state}` |
+| `GET /v1/web/connection` | Bearer Firebase ID token. `{state, access}` (access is `allowed`, `denied` or `unavailable`; no UID, list or generation is returned) |
 | `POST /v1/web/disconnect` | Revokes the same owner's Grant and subscription. `{state}` |
 | `/interaction/{uid}`, `…/login`, `…/consent`, `…/deny`, `/interaction/app.js` | OAuth authorization interaction (same origin, CSRF, explicit consent every time) and its fixed script |
 | `/mcp` | MCP (Bearer access token, scope `sttd:events`) |
@@ -74,6 +76,8 @@ The `/v1/web/*` routes, the OAuth routes and the scope are separate from the sen
 Display language: the HTML pages (`/console`, the OAuth interaction and the user-facing OAuth error page) are rendered in English or Japanese. An explicit choice through `?lang=en` or `?lang=ja` is stored in the display-only session cookie `sttd_language` (Path=/, SameSite=Lax, Secure, no expiry); the send screen writes the same cookie in the browser when you switch its language, so the last choice is kept; without it the `Accept-Language` preference decides (Japanese when preferred, otherwise English). The cookie is never used for authentication or authorization, and machine codes, fields, scopes, routes and the text being sent are never translated.
 
 State priority: no valid Grant → unlinked, a destination replacement awaiting approval → change_pending, a valid subscription → subscribed, the most recent subscription expired → expired, otherwise (no subscription or subscription cancelled) → linked.
+
+The access permission (`access`) is returned separately from the subscription `state`. When it cannot be read, the response is still HTTP 200 with `state` and `access: "unavailable"`, and new use is not possible. At the OAuth interaction login, a person who is not registered or is stopped gets 403 `access_denied` (the page says "This account is not permitted to use this service. Please check with the operator.") and no owner is created. If a stop or re-registration happens before consent completes, the same notice is shown with 403 and the Grant is not made usable. Code exchange and refresh accept only a Grant of the same generation; otherwise the existing `invalid_grant` applies. MCP `events/subscribe` (including extension and secret rotation) returns the existing Forbidden (`data.reason` = `access_revoked`), checked both before the challenge and at the final save. `events/unsubscribe`, disconnect, status lookups and cancellation do not require the permission.
 
 ## 4. MCP Events
 

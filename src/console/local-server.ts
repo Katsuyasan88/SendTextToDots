@@ -7,6 +7,9 @@
 //   - 保護: Host（localhost:<実port>の完全一致・1件）、request-target（origin-form）、Origin（有れば http://localhost:<port> の完全一致）、起動ごとの
 //     local nonce header（1件・完全一致。HTMLへescapeして渡す）、Authorization（Bearer 1件）、Content-Type/Idempotency-Key（POST /v2/commandsだけ）、
 //     本文上限（8192 byte。他のrouteは本文なし）を上流呼出しの前に検査する。CORS header・Set-Cookie転送・Origin/Cookie/Forwarded/nonceの上流転送は無い。
+//   - 上流を呼ぶ前のhelper自身の拒否（Host・未知route/method・nonce/Origin・認証header・本文）には固定header X-Sttd-Local-Refusal: 1 を付け、
+//     画面が「未送信」と判定できるようにする（nonce/Origin不一致は古い画面として固定code local_reload_required）。上流応答の同名headerは
+//     転送しない（転送はContent-Type/Retry-Afterだけ）。上流呼出し後の失敗（502・500）には付けない（結果不明のまま）。
 //   - 有限: 上流の期限（route別）、応答本文の上限、browser切断/中止の上流への伝播。正常終了のcloseを中止と誤認しない。token・本文・秘密を保存/記録しない。
 //   - CLI: node dist/console/local-server.js --config <public-client-config.json> [--port 8765]。設定の読取りはconfig.ts。本番配置設定は読まない。
 
@@ -15,7 +18,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { consoleAsset, CONSOLE_PATH, CONSOLE_SCRIPT_PATH, CONSOLE_STYLE_PATH, LOCAL_NONCE_HEADER } from '../connect/console.js';
+import { consoleAsset, CONSOLE_PATH, CONSOLE_SCRIPT_PATH, CONSOLE_STYLE_PATH, LOCAL_NONCE_HEADER, LOCAL_REFUSAL_HEADER } from '../connect/console.js';
 import { isLanguage, LANGUAGE_QUERY, languageCookie, selectLanguage } from '../connect/i18n.js';
 import { ConsoleConfigFileError, loadLocalConsoleConfig, validateLocalConsoleConfig, type LocalConsoleConfig } from './config.js';
 
@@ -179,13 +182,23 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
     send(res, status, JSON_TYPE, JSON.stringify({ error: { code, retryable } }), { Connection: 'close' });
   }
 
+  /** 上流を呼ぶ前のhelper自身の拒否（固定header付き。上流へは何も送っていない）。 */
+  function sendLocalRefusal(res: ServerResponse, status: number, code: string): void {
+    if (res.writableEnded) return;
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    send(res, status, JSON_TYPE, JSON.stringify({ error: { code, retryable: false } }), { Connection: 'close', [LOCAL_REFUSAL_HEADER]: '1' });
+  }
+
   async function relay(req: IncomingMessage, res: ServerResponse, path: string, route: RelayRoute): Promise<void> {
     const raw = req.rawHeaders;
     // local nonce（1件・完全一致）とOrigin（有れば同origin）。CORSは無いので他originのscriptは応答を読めず、nonceも知らない。
     const presented = single(raw, LOCAL_NONCE_HEADER.toLowerCase());
-    if (presented !== nonce) refuse(403, 'forbidden');
+    if (presented !== nonce) refuse(403, 'local_reload_required');
     const originHeader = single(raw, 'origin');
-    if (originHeader !== undefined && originHeader !== origin) refuse(403, 'forbidden');
+    if (originHeader !== undefined && originHeader !== origin) refuse(403, 'local_reload_required');
     const authorization = single(raw, 'authorization');
     if (authorization === undefined) refuse(401, 'authentication_required');
     if (!BEARER.test(authorization)) refuse(401, 'authentication_required');
@@ -258,7 +271,7 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
     const hosts = headerValues(raw, 'host');
     if (hosts.length !== 1 || hosts[0] !== authority || typeof target !== 'string' || !ORIGIN_FORM_TARGET.test(target)) {
       log({ event: 'local.rejected' });
-      return sendError(res, 400, 'invalid_request');
+      return sendLocalRefusal(res, 400, 'invalid_request');
     }
     const url = new URL(target, origin);
     const path = url.pathname;
@@ -274,15 +287,15 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
       return send(res, 200, asset.type, asset.body, { ...asset.headers, ...extra });
     }
     const route = relayRouteFor(method, path);
-    if (route === null) return sendError(res, 404, 'not_found');
-    if (route === 'method') return sendError(res, 405, 'method_not_allowed');
+    if (route === null) return sendLocalRefusal(res, 404, 'not_found');
+    if (route === 'method') return sendLocalRefusal(res, 405, 'method_not_allowed');
     try {
       await relay(req, res, path, route);
       log({ event: 'local.relay', route: path, status: res.statusCode });
     } catch (error) {
       if (error instanceof RelayRefusal) {
         log({ event: 'local.refused', route: path, status: error.status });
-        return sendError(res, error.status, error.code);
+        return sendLocalRefusal(res, error.status, error.code);
       }
       log({ event: 'local.failure', route: path });
       return sendError(res, 500, 'internal_error');

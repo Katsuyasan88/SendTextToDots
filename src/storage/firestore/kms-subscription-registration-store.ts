@@ -2,6 +2,9 @@
 // 同じtransactionで認可して原子的に保存する保存口（events/kms-subscription-runtime.tsが使う）。
 // 借用したdb（terminateしない）の同じinstanceだけで、sttdAuth/{t268}/config/kms-subscription（既存の明示setup済みmarker）・
 // sttdAuth/{t268}/subscriptions/{ownerId}（既存version2）・sttdConnect/{t256}/owners/{ownerId}・sttdConnect/{t256}/oidc/Grant_<64hex>を読む。
+// 登録（prepareのchallenge前と最終activate）は同じtransactionでsttdConnect/{t256}/access/{identityHash}（運営者の明示許可）と
+// sttdConnect/{t256}/grantMeta/{64hex}（要求Grantの利用許可の世代）も読み、activeかつ世代一致の時だけ進める（不許可は既存grant_inactive、
+// 不正・読取り不能はunavailable）。取消（cancel）は利用許可を条件にしない。
 // 全transactionの閉包は、全読取り→最新時計→同期の検査・投影→書込みだけで、暗号・開封・HTTP・乱数・ログを入れない（SDKが再実行しても同じ）。
 // Grantの開封（decryptだけ）は閉包の外で、同じ元operationの期限・中止を渡す。各callは元の{deadlineAt, signal}を1回捕捉して延長せず、
 // 開始前・各await後・新しいI/O前・閉包の更新前・返却前にsignal→時計→signalで検査する。期限・中止の後は新しいSDK呼出し・更新・遅い成功の
@@ -64,6 +67,8 @@ const OPTION_KEYS = ['db', 'connect', 'connectNamespace', 'resource', 'kms', 'cl
 const KMS_KEYS = ['environment', 'projectId', 'databaseId', 'namespace', 'cryptoKey', 'writeVersion', 'readVersions', 'transport'] as const;
 const OPERATION_KEYS = ['deadlineAt', 'signal'] as const;
 const GRANT_DOC_ID = /^Grant_[0-9a-f]{64}$/;
+/** 許可record（identityHash）・同意記録（grantHash）の文書ID。 */
+const HEX_DOC_ID = /^[0-9a-f]{64}$/;
 
 /** 接続保存のうち、この保存口が使う同期の参照・判定だけ（prototypeのdata methodを束縛して1回捕捉する）。 */
 export interface KmsSubscriptionRegistrationConnect {
@@ -71,6 +76,13 @@ export interface KmsSubscriptionRegistrationConnect {
   grantDocRef(grantId: string): DocumentReference;
   ownerDocActive(data: Record<string, unknown> | undefined, now: number): boolean;
   grantDocLive(data: Record<string, unknown> | undefined, ownerId: string, grantId: string, now: number): boolean;
+  accessDocRefForOwner(data: Record<string, unknown> | undefined): DocumentReference | null;
+  grantMetaDocRef(grantId: string): DocumentReference;
+  grantUseDecision(
+    access: { readonly exists: boolean; readonly data: unknown },
+    meta: { readonly exists: boolean; readonly data: unknown },
+    ownerId: string,
+  ): 'allowed' | 'denied' | 'unavailable';
 }
 
 export interface KmsSubscriptionRegistrationOptions {
@@ -194,11 +206,19 @@ interface PlanRecord {
   readonly operation: Captured;
   readonly ownerRef: DocumentReference;
   readonly subscriptionRef: DocumentReference;
+  /** 要求Grantの同意記録（利用許可の世代）の参照。 */
+  readonly metaRef: DocumentReference;
   /** 初回snapshotの購読の精密版とowner世代。 */
   readonly subscription: DocVersion;
   readonly generation: number;
   /** 要求Grant（先頭）と、初回snapshotのactive/pendingが束縛したGrant（重複なし・最大3）の証拠。 */
   readonly grants: readonly ProvenGrant[];
+}
+
+/** 同じtransactionで読んだ利用許可recordと要求Grantの同意記録。 */
+interface AccessSnapshots {
+  readonly access: DocumentSnapshot;
+  readonly meta: DocumentSnapshot;
 }
 
 interface ProvenGrant {
@@ -226,6 +246,9 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
   const grantDocRef = methodOf(connectTarget, 'grantDocRef');
   const ownerDocActive = methodOf(connectTarget, 'ownerDocActive');
   const grantDocLive = methodOf(connectTarget, 'grantDocLive');
+  const accessDocRefForOwner = methodOf(connectTarget, 'accessDocRefForOwner');
+  const grantMetaDocRef = methodOf(connectTarget, 'grantMetaDocRef');
+  const grantUseDecision = methodOf(connectTarget, 'grantUseDecision');
 
   const connectNamespace = fields.get('connectNamespace');
   if (!isConnectNamespace(connectNamespace)) fail();
@@ -385,7 +408,7 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
    * 接続保存の参照は、借用した同じinstance・同じt256 namespaceの決まったpathだけを使う（別instanceは同じproject文字列でも、
    * そのrefを使うI/Oの前に拒否）。実target・IAMの証明とはしない。
    */
-  function ownConnectRef(make: () => unknown, collection: 'owners' | 'oidc', accept: (id: string) => boolean): DocumentReference {
+  function ownConnectRef(make: () => unknown, collection: 'owners' | 'oidc' | 'access' | 'grantMeta', accept: (id: string) => boolean): DocumentReference {
     let ref: unknown;
     let firestore: unknown;
     let path: unknown;
@@ -410,6 +433,46 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
 
   function grantRefOf(grantId: string): DocumentReference {
     return ownConnectRef(() => grantDocRef(grantId), 'oidc', (id) => GRANT_DOC_ID.test(id));
+  }
+
+  function grantMetaRefOf(grantId: string): DocumentReference {
+    return ownConnectRef(() => grantMetaDocRef(grantId), 'grantMeta', (id) => HEX_DOC_ID.test(id));
+  }
+
+  /** owner文書のidentityHashから許可recordの参照（無い・形違い・別instance/pathはunavailable）。 */
+  function accessRefOf(owner: DocumentSnapshot): DocumentReference {
+    let made: unknown;
+    try {
+      made = accessDocRefForOwner(owner.data());
+    } catch {
+      throw registrationError('unavailable');
+    }
+    if (made === null) throw registrationError('unavailable');
+    try {
+      return ownConnectRef(() => made, 'access', (id) => HEX_DOC_ID.test(id));
+    } catch {
+      throw registrationError('unavailable');
+    }
+  }
+
+  /**
+   * 同じtransactionで、owner文書のidentityHashから許可recordを、要求Grantの同意記録と一緒に読む（ownerを読んだ後の追加の読取り）。
+   * 判定は全ての読取りの後にrequireAccessで行う。
+   */
+  async function readAccess(tx: Transaction, operation: Captured, owner: DocumentSnapshot, metaRef: DocumentReference): Promise<AccessSnapshots> {
+    const [access, meta] = (await read(tx, operation, [accessRefOf(owner), metaRef])) as [DocumentSnapshot, DocumentSnapshot];
+    return { access, meta };
+  }
+
+  /** 利用許可がactiveで、要求Grantの同意記録が同じownerの現在の世代か。不許可はgrant_inactive、不正・不明はunavailable。 */
+  function requireAccess(snapshots: AccessSnapshots, ownerId: string): void {
+    const decision = grantUseDecision(
+      { exists: snapshots.access.exists, data: snapshots.access.exists ? snapshots.access.data() : undefined },
+      { exists: snapshots.meta.exists, data: snapshots.meta.exists ? snapshots.meta.data() : undefined },
+      ownerId,
+    );
+    if (decision === 'denied') throw registrationError('grant_inactive');
+    if (decision !== 'allowed') throw registrationError('unavailable');
   }
 
   function requireMarker(snapshot: DocumentSnapshot): void {
@@ -504,6 +567,7 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
       liveNow(operation);
       const ownerRef = ownerRefOf(auth.ownerId);
       const requestGrantRef = grantRefOf(auth.grantId);
+      const requestMetaRef = grantMetaRefOf(auth.grantId);
       const subscriptionRef = subscriptionDocs.doc(auth.ownerId);
 
       // 初回snapshot: 書込みなしの通常transaction。owner・marker・購読・要求Grantと、購読のactive/pendingが束縛したGrant（重複なし）を読む。
@@ -521,12 +585,14 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
         }
         const boundRefs = boundIds.map(grantRefOf);
         const boundSnapshots = boundRefs.length === 0 ? [] : await read(tx, operation, boundRefs);
-        // 全ての読取りの後の最新時刻で、markerとowner・要求Grantのmetadataを確かめる（不成立は開封前に全無書込みで失敗）。
+        const accessSnapshots = await readAccess(tx, operation, owner, requestMetaRef);
+        // 全ての読取りの後の最新時刻で、markerとowner・要求Grantのmetadata・利用許可を確かめる（不成立は開封前に全無書込みで失敗）。
         const at = liveNow(operation);
         requireMarker(marker);
         if (!ownerActive(owner, at)) throw registrationError('grant_inactive');
         const generation = ownerGeneration(owner.data());
         if (!grantLive(requestGrant, auth.ownerId, auth.grantId, at)) throw registrationError('grant_inactive');
+        requireAccess(accessSnapshots, auth.ownerId);
         return {
           subscription: versionOf(subscription),
           generation,
@@ -541,7 +607,8 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
       const proven = await proveAll(operation, auth.ownerId, first.grants);
       const grantRefs = proven.map((entry) => entry.ref);
 
-      // 分類transaction: 同じrefを再読し、購読の精密版とowner世代の完全一致・marker・最新owner・要求Grant proof activeを要求する。
+      // 分類transaction: 同じrefを再読し、購読の精密版とowner世代の完全一致・marker・最新owner・要求Grant proof active・利用許可を
+      // 要求する（challengeの前の最終確認）。
       const classified = await run(operation, async (tx) => {
         const [owner, marker, subscription, ...grantSnapshots] = (await read(tx, operation, [ownerRef, markerRef, subscriptionRef, ...grantRefs])) as [
           DocumentSnapshot,
@@ -549,8 +616,10 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
           DocumentSnapshot,
           ...DocumentSnapshot[],
         ];
+        const accessSnapshots = await readAccess(tx, operation, owner, requestMetaRef);
         const at = decisionTime(operation);
         const { generation, verdicts } = authorize(operation, auth, { owner, marker, grants: grantSnapshots }, proven, at);
+        requireAccess(accessSnapshots, auth.ownerId);
         if (generation !== first.generation || !sameDocVersion(versionOf(subscription), first.subscription)) throw registrationError('conflict');
         const state = readState(subscription, auth.ownerId) ?? emptyKmsState();
         projectBindings(state, at, verdictLookup(verdicts));
@@ -575,6 +644,7 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
           operation,
           ownerRef,
           subscriptionRef,
+          metaRef: requestMetaRef,
           subscription: first.subscription,
           generation: first.generation,
           grants: Object.freeze(proven),
@@ -603,7 +673,7 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
       const operation = copyOperation(operationInput);
       if (operation.deadlineAt !== record.operation.deadlineAt || operation.signal !== record.operation.signal) fail();
       const capsules = copyCapsules(capsulesInput, policy);
-      const { auth, request, ownerRef, subscriptionRef } = record;
+      const { auth, request, ownerRef, subscriptionRef, metaRef } = record;
       liveNow(operation);
 
       const grantRefs = record.grants.map((entry) => entry.ref);
@@ -614,8 +684,11 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
           DocumentSnapshot,
           ...DocumentSnapshot[],
         ];
+        // challengeの待機中の停止・再登録（世代の変化）も、この最終transactionで拒否する。
+        const accessSnapshots = await readAccess(tx, operation, owner, metaRef);
         const at = decisionTime(operation);
         const { generation, verdicts } = authorize(operation, auth, { owner, marker, grants: grantSnapshots }, record.grants, at);
+        requireAccess(accessSnapshots, auth.ownerId);
         // challengeの待機中の取消・再登録・延長・Grantの再保存は、同じid/hashへ戻っていても版違いのconflict（自動の再challenge・外側retry0）。
         if (generation !== record.generation || !sameDocVersion(versionOf(subscription), record.subscription)) throw registrationError('conflict');
         const state = readState(subscription, auth.ownerId) ?? emptyKmsState();

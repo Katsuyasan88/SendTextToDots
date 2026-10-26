@@ -51,7 +51,9 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 
 旧v1のroute（`/v1/commands`・`/v1/commands/{commandId}`・`/v1/commands/{commandId}/cancel`）は404 not_foundで、処理を行いません。v2のrouteへの誤ったmethodは405 method_not_allowed、v2へ`schemaVersion` 1や旧項目を送ると400 invalid_requestです。新旧の変換・redirectはありません。
 
-エラーは `{"error":{"code":"…","retryable":<boolean>}}`。主なcode: invalid_request(400)・authentication_required(401)・connection_revoked(403)・not_found(404)・method_not_allowed(405)・subscription_required / destination_change_pending / idempotency_conflict(409)・command_expired / clock_skew(422)・rate_limited(429、Retry-After)・temporarily_unavailable(503)。retryableがtrueでも本文の自動再送はせず、同じIDの状態を照会してください。
+エラーは `{"error":{"code":"…","retryable":<boolean>}}`。主なcode: invalid_request(400)・authentication_required(401)・connection_revoked / access_denied(403)・not_found(404)・method_not_allowed(405)・subscription_required / destination_change_pending / idempotency_conflict(409)・command_expired / clock_skew(422)・rate_limited(429、Retry-After)・temporarily_unavailable(503)。retryableがtrueでも本文の自動再送はせず、同じIDの状態を照会してください。
+
+利用許可: 新規POST（同じIDの再POSTを含む）は、運営者が明示登録した利用許可（[CONFIGURATION](CONFIGURATION.md#access-admin)）がactiveで、配送先の購読が現在の許可の世代で同意したGrantに結ばれている時だけ受け付けます。未登録・停止中・旧世代のGrantは403 `access_denied`（retryable false。接続の失効 `connection_revoked` とは別）、許可を確認できない時は503 `temporarily_unavailable` です。受付後に停止が確定した場合は送出権の確定時に再確認し、送らずに `failed` で終えます（既に送出権を得た1件は既存の契約どおり確定します）。状態の照会と取消は利用許可を条件にしません。
 
 期限: 処理予算は受信から20秒か元の期限の短い方、外部HTTPは最大10秒、Functions timeoutは30秒。
 
@@ -63,7 +65,7 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 
 | endpoint | 内容 |
 | --- | --- |
-| `GET /v1/web/connection` | Bearer Firebase ID token。`{state}` |
+| `GET /v1/web/connection` | Bearer Firebase ID token。`{state, access}`（accessは `allowed`・`denied`・`unavailable`。UID・許可一覧・世代は返さない） |
 | `POST /v1/web/disconnect` | 同ownerのGrant/購読を失効。`{state}` |
 | `/interaction/{uid}`・`…/login`・`…/consent`・`…/deny`・`/interaction/app.js` | OAuth認可のinteraction（同origin・CSRF・毎回の明示同意）とその固定script |
 | `/mcp` | MCP（Bearer access token、scope `sttd:events`） |
@@ -74,6 +76,8 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 表示言語: HTML画面（`/console`・OAuth interaction・利用者向けOAuthエラー）は英語/日本語で描きます。`?lang=en` / `?lang=ja` の明示選択は表示専用のsession cookie `sttd_language`（Path=/・SameSite=Lax・Secure・期限なし）へ保存し、送信画面での言語切替も同じcookieをbrowserで書くため最後の選択が残ります。無い時は `Accept-Language` の優先順位（日本語選好ならja、それ以外はen）で決めます。このcookieを認証・認可に使わず、machine code・field・scope・route・送信本文は翻訳しません。
 
 状態の優先順位: 有効なGrantが無い→unlinked、承認待ちの送信先置換→change_pending、有効な購読→subscribed、直前の購読が期限切れ→expired、それ以外（未購読・購読取消）→linked。
+
+利用許可（`access`）は購読の`state`と別に返します。許可を読めない時もHTTP 200で`state`と`access: "unavailable"`を返し、新しい利用はできません。OAuth interactionのloginでは、未登録・停止中の本人は403 `access_denied`（画面は「このサービスの利用が許可されていません。運営者へ確認」）でownerを作りません。同意の時点で停止・再登録を跨いだ場合も同じ案内の403画面でGrantを使える状態にしません。code交換・refreshは同じ世代のGrantだけで、そうでなければ既存の`invalid_grant`です。MCPの`events/subscribe`（延長・secret更新を含む）は既存のForbidden（`data.reason` = `access_revoked`）で、challengeの前と最終の保存時の両方で確かめます。`events/unsubscribe`・接続解除・状態照会・取消は利用許可を条件にしません。
 
 ## 4. MCP Events
 

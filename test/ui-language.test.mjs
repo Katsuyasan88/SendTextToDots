@@ -24,7 +24,7 @@ import {
   selectLanguage,
   text,
 } from '../dist/connect/i18n.js';
-import { INTERACTION_SCRIPT, INTERACTION_SCRIPT_PATH, renderInteractionConsent, renderInteractionLogin } from '../dist/connect/pages.js';
+import { INTERACTION_SCRIPT, INTERACTION_SCRIPT_PATH, renderInteractionAccessDenied, renderInteractionConsent, renderInteractionLogin } from '../dist/connect/pages.js';
 import { loadDeploymentConfig } from '../dist/config/validate.js';
 import { renderOAuthErrorPage } from '../dist/oauth/provider.js';
 
@@ -212,4 +212,54 @@ test('L3 rendering: every page carries html lang, title and body in the selected
   assert.equal(/^import /m.test(CONSOLE_SCRIPT), false, 'the local send screen has no static SDK import (loaded on explicit sign-in only)');
   assert.equal(/\/v1\/web\//.test(INTERACTION_SCRIPT), false, 'the interaction script has no connection-state or disconnect call (the send screen owns them)');
   results.L3 = { pages: Object.keys(pages).length, keys: Object.keys(MESSAGES.en).length };
+});
+
+test('L7 OAuth access refusal: the login script shows the not-permitted message only for the fixed 403 access_denied (other 403 / malformed / other failures keep the existing message); the consent refusal page is a fixed bilingual notice without forms, CSRF or identifiers', async () => {
+  const IMPORTS = [
+    `import { initializeApp } from 'https://www.gstatic.com/firebasejs/13.0.0/firebase-app.js';`,
+    `import { getAuth, OAuthProvider, signInWithPopup, signOut } from 'https://www.gstatic.com/firebasejs/13.0.0/firebase-auth.js';`,
+  ];
+  for (const line of IMPORTS) assert.ok(INTERACTION_SCRIPT.includes(line), 'the fixed SDK imports are present');
+  const source = IMPORTS.reduce((text, line) => text.replace(line, ''), INTERACTION_SCRIPT);
+  const run = async (lang, response) => {
+    const nodes = new Map(['sttd-message', 'sttd-continue', 'sttd-apple-login', 'sttd-switch-account'].map((id) => [id, { id, hidden: true, textContent: '', onclick: null }]));
+    const fetches = [];
+    const reloads = [];
+    const context = vm.createContext({
+      document: { body: { dataset: { sttdView: 'interaction-login', sttdFirebase: JSON.stringify(WEB), sttdLanguage: lang, sttdInteraction: 'uid-1', sttdCsrf: 'csrf-1' } }, getElementById: (id) => nodes.get(id) ?? null },
+      location: { reload: () => reloads.push(1) },
+      fetch: async (url, init) => (fetches.push({ url, init }), response),
+      initializeApp: () => ({}),
+      getAuth: () => ({ currentUser: { getIdToken: async () => 'synthetic-id-token' }, authStateReady: async () => {} }),
+      OAuthProvider: class {},
+      signInWithPopup: async () => {
+        throw new Error('no popup in this test');
+      },
+      signOut: async () => {},
+    });
+    await vm.runInContext(`(async () => {\n${source}\n})()`, context);
+    await nodes.get('sttd-continue').onclick();
+    return { message: nodes.get('sttd-message').textContent, fetches, reloads };
+  };
+  const json = (status, body) => ({ status, json: async () => body });
+  for (const lang of ['en', 'ja']) {
+    const refused = await run(lang, json(403, { error: { code: 'access_denied', retryable: false } }));
+    assert.equal(refused.message, MESSAGES[lang]['interaction.accessDenied'], `${lang}: fixed refusal`);
+    assert.equal(refused.fetches.length, 1);
+    for (const other of [json(403, { error: { code: 'forbidden', retryable: false } }), { status: 403, json: async () => JSON.parse('not json') }, json(409, { error: { code: 'access_denied' } }), json(503, { error: { code: 'access_denied' } })]) {
+      assert.equal((await run(lang, other)).message, MESSAGES[lang]['interaction.loginConfirmFailed'], `${lang}: not disguised as an access refusal`);
+    }
+    const ok = await run(lang, { status: 204, json: async () => null });
+    assert.deepEqual([ok.reloads.length, ok.message], [1, '']);
+  }
+  assert.notEqual(MESSAGES.ja['interaction.accessDenied'], MESSAGES.ja['interaction.loginConfirmFailed']);
+  assert.ok(MESSAGES.ja['interaction.accessDenied'].includes('このサービスの利用が許可されていません') && MESSAGES.ja['interaction.accessDenied'].includes('運営者'));
+
+  for (const lang of ['en', 'ja']) {
+    const page = renderInteractionAccessDenied(WEB, 'uid-1', lang);
+    assert.ok(page.startsWith(`<!DOCTYPE html>\n<html lang="${lang}">`));
+    assert.ok(page.includes(MESSAGES[lang]['interaction.accessDenied']));
+    assert.equal(/<form|csrf|data-sttd-csrf|data-sttd-interaction/i.test(page), false, 'no form, CSRF or interaction binding');
+  }
+  results.L7 = { languages: 2 };
 });

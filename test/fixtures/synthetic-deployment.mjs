@@ -3,6 +3,7 @@
 
 export const DEPLOYMENT_CONFIG = {
   configured: true,
+  accessPolicy: 'explicit-allow-v1',
   projectId: 'sendtexttodots-test',
   projectNumber: '123456789012',
   databaseId: '(default)',

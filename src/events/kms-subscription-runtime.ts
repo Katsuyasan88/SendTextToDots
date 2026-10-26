@@ -307,11 +307,21 @@ export function createKmsSubscriptionRegistrationRuntime(options: KmsSubscriptio
   const grantDocRef = methodOf(connectTarget, 'grantDocRef');
   const ownerDocActive = methodOf(connectTarget, 'ownerDocActive');
   const grantDocLive = methodOf(connectTarget, 'grantDocLive');
+  const accessDocRefForOwner = methodOf(connectTarget, 'accessDocRefForOwner');
+  const grantMetaDocRef = methodOf(connectTarget, 'grantMetaDocRef');
+  const grantUseDecision = methodOf(connectTarget, 'grantUseDecision');
   const connect = Object.freeze({
     ownerDocRef: (ownerId: string) => ownerDocRef(ownerId),
     grantDocRef: (grantId: string) => grantDocRef(grantId),
     ownerDocActive: (data: Record<string, unknown> | undefined, at: number) => ownerDocActive(data, at) === true,
     grantDocLive: (data: Record<string, unknown> | undefined, ownerId: string, grantId: string, at: number) => grantDocLive(data, ownerId, grantId, at) === true,
+    accessDocRefForOwner: (data: Record<string, unknown> | undefined) => accessDocRefForOwner(data),
+    grantMetaDocRef: (grantId: string) => grantMetaDocRef(grantId),
+    // 利用許可の判定は既知の3値だけを採用し、他は一時障害へ閉じる。
+    grantUseDecision: (access: unknown, meta: unknown, ownerId: string) => {
+      const value = grantUseDecision(access, meta, ownerId);
+      return value === 'allowed' || value === 'denied' ? value : 'unavailable';
+    },
   }) as unknown as KmsSubscriptionRegistrationConnect;
 
   const hashMethod = methodOf(fields.get('hasher'), 'hash');

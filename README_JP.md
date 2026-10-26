@@ -56,6 +56,7 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 4. `npm run build`後、`npm run package`でAPI ZIPとMCP Cloud Build source archiveをoffline作成。包装だけでは配置されません。同じ内容での再包装は`output_exists`で停止します。既存archiveの確認方法は[INSTALL](docs/INSTALL.md)を参照してください。
 5. [INSTALL](docs/INSTALL.md)のarchive配置例・origin/IAM確認に従い、APIをCloud Functions 第2世代、MCP/OAuthをDockerfile → Cloud Build → Cloud Runの順で配置します。Cloud資源作成・配置・停止のtoolは同梱されません。導入者のCloud権限が必要で、第三者projectでの手順全体の実行検証は未完了です。
 6. `console.config.example.json`を`console.local.json`へコピーし、API/MCPのoriginとFirebase Webの公開設定を入れて`npm run console -- --config console.local.json`を実行、`http://localhost:8765/console`を開きます（English/日本語）。ボタンを押すまで読み込みも送信もしません。5段階に沿って、Appleログイン → 接続確認（Dots/ChatGPTからOAuth接続し`text.submitted`を購読して「受信中」にする）→ テスト用指示文をDotsへ貼る → 1件送ってDotsで一致を確認 → 運用用指示文を貼る、の順に進めます。[LOCAL_CONSOLE](docs/LOCAL_CONSOLE.md)。
+   使う本人（自分を含む）は、運営者が管理CLIで明示登録した利用者だけです（[CONFIGURATION](docs/CONFIGURATION.md#access-admin)）。手順1のログイン後にUIDを確認して登録し、それから接続します。
 7. セットアップ後は同じ画面の手順4で通常の送信を行うか、下のAPI例を使います。手順2の「接続を解除」は確認の後に認可と購読を失効させます。
 
 [Dotsの受信テストと応答設定](docs/DOTS_GUIDE.md)に、受信先Dotsへ貼る指示文を用意しています。本文一致の配送確認を行った後、短文は引用・長文は要約・秘密情報は省く通常の応答へ切り替えられます。送信画面の案内でも、選択中の言語で両方の文面を表示・コピーできます。

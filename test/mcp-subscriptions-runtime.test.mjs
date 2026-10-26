@@ -310,20 +310,37 @@ const newSecret = (bytes = 32) => remember(`whsec_${randomBytes(bytes).toString(
 const idOf = (ownerId, url) => `sub_${baseHasher.hash('subscription.id', JSON.stringify([ownerId, EVENT, '{}', url]))}`;
 const hashOf = (secret) => baseHasher.hash('subscription.secret', secret);
 
+// 利用許可（合成）: ownerごとに別のidentityHashと許可record（active・世代）を置き、Grantの同意記録へ同じ世代を束縛する。
+const accessOf = new Map();
+const accessPath = (identityHash) => `sttdConnect/${NS}/access/${identityHash}`;
+const metaPath = (grantId) => `sttdConnect/${NS}/grantMeta/${baseHasher.hash(`t256:${NS}:grant`, grantId)}`;
+function setAccess(ownerId, state, generation = randomUUID()) {
+  const entry = accessOf.get(ownerId);
+  entry.generation = generation;
+  db.write(accessPath(entry.identityHash), { version: 1, state, generation, updatedAt: Math.floor(clockState.value) });
+  return generation;
+}
 function newOwner(extra = {}) {
   const ownerId = remember(randomUUID());
   const now = Math.floor(clockState.value);
-  db.write(ownerPath(ownerId), { identityHash: 'f'.repeat(64), sealedUid: remember(`sealed-uid-${randomUUID()}`), createdAt: now, lastActiveAt: now, revokedAt: null, ...extra });
+  const identityHash = randomBytes(32).toString('hex');
+  db.write(ownerPath(ownerId), { identityHash, sealedUid: remember(`sealed-uid-${randomUUID()}`), createdAt: now, lastActiveAt: now, revokedAt: null, ...extra });
+  accessOf.set(ownerId, { identityHash, generation: null });
+  setAccess(ownerId, 'active');
   return ownerId;
 }
 const payloadOf = (ownerId, grantId, overrides = {}) => {
   const nowSec = Math.floor(clockState.value / 1000);
   return { iat: nowSec, exp: nowSec + 3600, accountId: ownerId, clientId: 'https://client.sttd-subscriptions.invalid/meta.json', kind: 'Grant', jti: grantId, resources: { [RESOURCE]: 'sttd:events' }, ...overrides };
 };
-async function newGrant(ownerId, overrides = {}, grantId = remember(`grant-${randomBytes(9).toString('base64url')}`)) {
+async function newGrant(ownerId, overrides = {}, grantId = remember(`grant-${randomBytes(9).toString('base64url')}`), meta = {}) {
   const payload = payloadOf(ownerId, grantId, overrides);
   remember(JSON.stringify(payload));
   await grantsAdapter.upsert(grantId, payload, 3600);
+  const generation = accessOf.get(ownerId)?.generation;
+  if (generation !== undefined) {
+    db.write(metaPath(grantId), { ownerId, authTimeSec: Math.floor(clockState.value / 1000), createdAt: Math.floor(clockState.value), accessGeneration: generation, ...meta });
+  }
   return grantId;
 }
 async function who() {
@@ -1150,4 +1167,130 @@ test('U16 text.submitted: events/list has exactly the 4-field payload schema; su
   const mapping = entry.slice(entry.indexOf("case 'unknown_event':"));
   assert.ok(entry.includes("case 'unknown_event':") && /^case 'unknown_event':\s*return new ProtocolError\(ERROR_NOT_FOUND,\s*'Unknown event',\s*\{\s*kind:\s*'event'\s*\}\)/.test(mapping), 'unknown_event -> NotFound kind=event');
   assert.ok(/ERROR_NOT_FOUND = -32011/.test(readFileSync(new URL('../dist/events/contract.js', import.meta.url), 'utf8')));
+});
+
+test('U17 explicit access: challenge-before refusal, stop/re-enable during challenge, legacy/old-generation Grants, invalid record; unsubscribe stays available', { timeout: 30_000 }, async () => {
+  // 未許可（disabled）・許可record欠落: challenge前に拒否（送信0・seal0・無書込み）。
+  for (const stop of [(ownerId) => setAccess(ownerId, 'disabled'), (ownerId) => db.docs.delete(accessPath(accessOf.get(ownerId).identityHash))]) {
+    const auth = await who();
+    stop(auth.ownerId);
+    const count = counter();
+    assert.equal((await subscribe(auth, input(newUrl('u17a'), newSecret()))).kind, 'sub:grant_inactive');
+    const c = count();
+    assert.deepEqual({ sent: c.sent, encrypt: c.encrypt, writes: c.writes }, { sent: 0, encrypt: 0, writes: 0 });
+    assert.equal(dataOf(subPath(auth.ownerId)), undefined);
+  }
+  // 世代を持たない旧Grant（移行前）・別世代のGrant: 拒否。不正なrecord・同意記録: 一時障害（許可へ読み替えない）。
+  {
+    const auth = { ownerId: newOwner(), grantId: null };
+    auth.grantId = await newGrant(auth.ownerId);
+    const meta = dataOf(metaPath(auth.grantId));
+    const legacy = { ...meta };
+    delete legacy.accessGeneration;
+    db.write(metaPath(auth.grantId), legacy);
+    assert.equal((await subscribe(auth, input(newUrl('u17b'), newSecret()))).kind, 'sub:grant_inactive');
+    db.write(metaPath(auth.grantId), { ...meta, accessGeneration: randomUUID() });
+    assert.equal((await subscribe(auth, input(newUrl('u17b'), newSecret()))).kind, 'sub:grant_inactive');
+    const count = counter();
+    db.write(metaPath(auth.grantId), { ...meta, accessGeneration: 'not-a-generation' });
+    expectRt(await subscribe(auth, input(newUrl('u17b'), newSecret())), 'unavailable');
+    db.write(metaPath(auth.grantId), meta);
+    const identityHash = accessOf.get(auth.ownerId).identityHash;
+    db.write(accessPath(identityHash), { version: 2, state: 'active', generation: accessOf.get(auth.ownerId).generation, updatedAt: 1 });
+    expectRt(await subscribe(auth, input(newUrl('u17b'), newSecret())), 'unavailable');
+    const c = count();
+    assert.deepEqual({ sent: c.sent, writes: c.writes }, { sent: 0, writes: 0 });
+  }
+  // challengeの待機中に停止 → activateの最終transactionで拒否（challengeは1回だけ・保存0）。停止→再登録（新世代）でも同じ。
+  for (const change of [(ownerId) => setAccess(ownerId, 'disabled'), (ownerId) => (setAccess(ownerId, 'disabled'), setAccess(ownerId, 'active'))]) {
+    const auth = await who();
+    const challengeGate = gate();
+    let release;
+    senderState.behavior = (request) => {
+      challengeGate.reached();
+      return new Promise((resolve) => {
+        release = () => resolve(echo(request));
+      });
+    };
+    const count = counter();
+    const running = subscribe(auth, input(newUrl('u17c'), newSecret()));
+    await challengeGate.whenReached;
+    senderState.behavior = null;
+    change(auth.ownerId);
+    release();
+    const result = await running;
+    assert.equal(result.kind, 'sub:grant_inactive');
+    assert.equal(count().sent, 1);
+    assert.equal(dataOf(subPath(auth.ownerId)), undefined);
+  }
+  // 購読済み → 停止 → 旧Grantでの延長は拒否、解除（unsubscribe）は利用許可を条件にしない。再有効化後も旧Grantは復活せず、
+  // 新世代の同意（新Grant）だけが新規の購読に使える。
+  {
+    const auth = await who();
+    const url = newUrl('u17d');
+    const secret = newSecret();
+    assert.equal((await subscribe(auth, input(url, secret))).ok, true);
+    setAccess(auth.ownerId, 'disabled');
+    const count = counter();
+    assert.equal((await subscribe(auth, input(url, secret))).kind, 'sub:grant_inactive');
+    assert.equal(count().sent, 0);
+    assert.equal((await unsubscribe(auth, { name: EVENT, url })).ok, true);
+    assert.equal(dataOf(subPath(auth.ownerId)).active, null);
+    setAccess(auth.ownerId, 'active');
+    assert.equal((await subscribe(auth, input(url, secret))).kind, 'sub:grant_inactive', 'the old-generation Grant does not come back');
+    const fresh = { ownerId: auth.ownerId, grantId: await newGrant(auth.ownerId) };
+    const renewed = await subscribe(fresh, input(url, secret));
+    assert.equal(renewed.ok, true, renewed.kind);
+  }
+  // 許可recordが不正でも、解除は進む（照会・取消・解除を許可DBに依存させない）。
+  {
+    const auth = await who();
+    const url = newUrl('u17e');
+    assert.equal((await subscribe(auth, input(url, newSecret()))).ok, true);
+    db.write(accessPath(accessOf.get(auth.ownerId).identityHash), { broken: true });
+    assert.equal((await unsubscribe(auth, { name: EVENT, url })).ok, true);
+  }
+});
+
+test('U18 delivery store reads the same access record and Grant consent generation in prepare/dispatch: stop before dispatch -> no send right, new/same-ID POST refused, old generation refused, invalid record is a fixed state error', { timeout: 30_000 }, async () => {
+  const { KmsRequestDeliveryStore } = await import('../dist/delivery/kms-store.js');
+  const { DeliveryStateError } = await import('../dist/delivery/contract.js');
+  const store = new KmsRequestDeliveryStore({ db, namespace: `t270_${randomUUID()}`, connect, hash: (purpose, value) => baseHasher.hash(purpose, value), clock, policy });
+  const request = (ownerId, commandId = randomUUID()) => ({
+    ownerId,
+    commandKey: store.commandKey(ownerId, commandId),
+    digest: randomBytes(32).toString('hex'),
+    attemptId: randomUUID(),
+    receivedAt: Math.floor(clockState.value),
+    expiresAt: Math.floor(clockState.value) + 60_000,
+  });
+  const auth = await who();
+  assert.equal((await subscribe(auth, input(newUrl('u18'), newSecret()))).ok, true);
+
+  // 許可あり: 準備できる。停止が先に確定 → dispatchは送出権を与えず未送信の終端（authorization_lost）。
+  const first = request(auth.ownerId);
+  assert.equal((await store.prepare(first, op())).kind, 'prepared');
+  setAccess(auth.ownerId, 'disabled');
+  const refused = await store.dispatch(auth.ownerId, first.commandKey, first.attemptId, null, op());
+  assert.equal(refused.kind, 'refused');
+  assert.deepEqual([refused.doc.state, refused.doc.reason], ['failed', 'authorization_lost']);
+  // 停止中: 新しいPOSTも同じIDの再POSTも利用許可の拒否（接続の失効とは別）。
+  assert.deepEqual(await store.prepare(request(auth.ownerId), op()), { kind: 'denied', denial: 'access_denied' });
+  assert.deepEqual(await store.prepare({ ...first, attemptId: randomUUID() }, op()), { kind: 'denied', denial: 'access_denied' });
+  // 再有効化（新世代）: 旧世代のGrantに束縛した購読では送れない（自動復活なし）。
+  setAccess(auth.ownerId, 'active');
+  assert.deepEqual(await store.prepare(request(auth.ownerId), op()), { kind: 'denied', denial: 'access_denied' });
+  // 不正な許可record: 許可・拒否のどちらへも読み替えない固定の状態error（APIでは503）。
+  db.write(accessPath(accessOf.get(auth.ownerId).identityHash), { version: 1, state: 'paused', generation: randomUUID(), updatedAt: 1 });
+  await assert.rejects(store.prepare(request(auth.ownerId), op()), (error) => error instanceof DeliveryStateError);
+
+  // dispatchが先に確定: 送出権はそのまま有効（後の停止で取り消さない）。
+  const other = await who();
+  assert.equal((await subscribe(other, input(newUrl('u18b'), newSecret()))).ok, true);
+  const second = request(other.ownerId);
+  assert.equal((await store.prepare(second, op())).kind, 'prepared');
+  const granted = await store.dispatch(other.ownerId, second.commandKey, second.attemptId, null, op());
+  assert.equal(granted.kind, 'granted');
+  setAccess(other.ownerId, 'disabled');
+  assert.equal((await store.read(other.ownerId, second.commandKey, op()))?.state, 'dispatching');
 });

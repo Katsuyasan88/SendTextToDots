@@ -96,6 +96,18 @@ export interface KmsDeliveryConnect {
   grantDocRef(grantId: string): DocumentReference;
   ownerDocActive(data: Record<string, unknown> | undefined, now: number): boolean;
   grantDocLive(data: Record<string, unknown> | undefined, ownerId: string, grantId: string, now: number): boolean;
+  /** owner文書のdataから本人の利用許可recordの参照（無ければnull）。 */
+  accessDocRefForOwner(data: Record<string, unknown> | undefined): DocumentReference | null;
+  /** Grantの同意記録（利用許可の世代を持つ）の参照。 */
+  grantMetaDocRef(grantId: string): DocumentReference;
+  /** 許可recordだけからの利用許可。 */
+  accessUseDecision(access: { readonly exists: boolean; readonly data: unknown }): 'allowed' | 'denied' | 'unavailable';
+  /** 許可recordとGrantの同意記録からの、このowner・Grantの新規利用の可否。 */
+  grantUseDecision(
+    access: { readonly exists: boolean; readonly data: unknown },
+    meta: { readonly exists: boolean; readonly data: unknown },
+    ownerId: string,
+  ): 'allowed' | 'denied' | 'unavailable';
 }
 
 export interface KmsRequestDeliveryStoreDeps {
@@ -342,14 +354,35 @@ export class KmsRequestDeliveryStore {
     ]) as [DocumentSnapshot, DocumentSnapshot, DocumentSnapshot, DocumentSnapshot, DocumentSnapshot];
     const state = this.#reader.read(subscription, ownerId);
     const grantId = state?.active?.grantId;
+    // 利用許可: owner文書のidentityHashから許可recordを、有効な購読が束縛したGrantの同意記録（世代）と一緒に同じtransactionで読む。
+    const accessRefInput = connect.accessDocRefForOwner(owner.data());
+    if (accessRefInput === null) throw new DeliveryStateError();
+    const accessRef = this.#own(accessRefInput);
     let grantData: Record<string, unknown> | undefined;
+    let access: DocumentSnapshot;
+    let meta: DocumentSnapshot | undefined;
     if (grantId !== undefined) {
-      const [grant] = await this.#read(tx, operation, [this.#own(connect.grantDocRef(grantId))]);
+      const [grant, accessSnapshot, metaSnapshot] = await this.#read(tx, operation, [
+        this.#own(connect.grantDocRef(grantId)),
+        accessRef,
+        this.#own(connect.grantMetaDocRef(grantId)),
+      ]);
       grantData = grant!.data();
+      access = accessSnapshot!;
+      meta = metaSnapshot!;
+    } else {
+      [access] = (await this.#read(tx, operation, [accessRef])) as [DocumentSnapshot];
     }
     // 全ての読取りの後の最新時刻で判断する。
     const now = liveNow(this.#d.clock, operation);
     this.#reader.check(marker);
+    const accessInput = { exists: access.exists, data: access.exists ? access.data() : undefined };
+    const decision =
+      grantId === undefined || meta === undefined
+        ? connect.accessUseDecision(accessInput)
+        : connect.grantUseDecision(accessInput, { exists: meta.exists, data: meta.exists ? meta.data() : undefined }, ownerId);
+    // 読めない・不正な許可/同意記録は固定の一時障害（許可・拒否のどちらへも読み替えない。送出しない）。
+    if (decision !== 'allowed' && decision !== 'denied') throw new DeliveryStateError();
     return {
       command,
       control,
@@ -360,6 +393,7 @@ export class KmsRequestDeliveryStore {
         ownerActive: connect.ownerDocActive(owner.data(), now),
         subscription: state,
         grantLive: grantId !== undefined && connect.grantDocLive(grantData, ownerId, grantId, now),
+        access: decision,
       },
     };
   }

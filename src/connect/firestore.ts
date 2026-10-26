@@ -4,7 +4,8 @@
 //   identities/{identityHash}   Firebase project＋検証済みUID → 内部owner（一意）
 //   owners/{ownerId}            封緘したUID・最終利用・失効。氏名・メールは持たない
 //   interactions/{uidHash}      元OAuth interactionへ束縛したCSRFのhash・ログインしたowner・単回の同意
-//   grantMeta/{grantHash}       同意したGrantのowner・Firebase認証時刻（交換・refresh時の失効確認に使う）
+//   grantMeta/{grantHash}       同意したGrantのowner・Firebase認証時刻・利用許可の世代（交換・refresh時の失効確認と新規利用の許可に使う）
+//   access/{identityHash}       運営者が明示登録した利用許可（access/policy.ts。ここでは読むだけで、書くのは管理module）
 //   replay/{keyHash}            client assertionの単回予約
 // メモリー保存へ切り替える経路はない。保存の失敗はそのまま例外で伝える。
 // 封緘portは同期の値もPromiseも返せる。結果は必ずawaitしてから使い、Firestoreが再実行し得るtransactionの関数の中では
@@ -12,13 +13,15 @@
 
 import { randomUUID } from 'node:crypto';
 
-import type { DocumentReference, DocumentSnapshot, Firestore, Timestamp } from '@google-cloud/firestore';
+import type { DocumentReference, DocumentSnapshot, Firestore, Timestamp, Transaction } from '@google-cloud/firestore';
 import { errors, type Adapter, type AdapterFactory, type AdapterPayload } from 'oidc-provider';
 
 import type { Clock } from '../policy.js';
 import { hashesEqual, newOpaqueValue, type SecretHasher } from '../secrets.js';
 import type { AssertionReplayStore } from '../stores.js';
 import type { VerifiedIdentity } from '../identity/firebase.js';
+import { accessDocRef, accessVerdictOfSnapshot, AccessUnavailableError, grantGenerationOfSnapshot } from '../access/firestore.js';
+import { accessVerdictOf, ACCESS_UNAVAILABLE, grantGenerationOf, grantUseVerdict, ownerIdentityHash, type AccessVerdict } from '../access/policy.js';
 
 export const CONNECT_STORAGE_ROOT = 'sttdConnect';
 const NAMESPACE_PATTERN = /^t256_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -127,7 +130,20 @@ export type BindOutcome = 'ok' | 'rejected' | 'other_owner';
 export interface ConsentRecord {
   readonly ownerId: string;
   readonly authTimeSec: number;
+  /** login時に確かめた利用許可の世代。 */
+  readonly accessGeneration: string;
 }
+
+/** login（owner解決）の結果。deniedは利用不許可（ownerを作らない）、inactiveは既存ownerの失効・無活動。許可の一時障害はAccessUnavailableError。 */
+export type OwnerAdmission =
+  | { readonly kind: 'admitted'; readonly ownerId: string; readonly accessGeneration: string }
+  | { readonly kind: 'denied' }
+  | { readonly kind: 'inactive' };
+
+/** 接続画面の表示用の利用許可（UID・世代・一覧を含めない）。 */
+export type AccessDisplay = 'allowed' | 'denied' | 'unavailable';
+
+export { AccessUnavailableError };
 
 export class ConnectStorage {
   readonly #d: ConnectStorageDeps;
@@ -403,26 +419,49 @@ export class ConnectStorage {
     );
   }
 
+  #accessRef(identityHash: string): DocumentReference {
+    return accessDocRef(this.#root, identityHash);
+  }
+
+  #grantMetaRef(grantId: string): DocumentReference {
+    return this.#root.collection('grantMeta').doc(this.#hash('grant', grantId));
+  }
+
+  /** owner文書（transactionで読んだdata）から許可recordを同じtransactionで読む。identityHashが無い・形違いはunavailable。 */
+  async #accessForOwner(tx: Transaction, ownerData: unknown): Promise<AccessVerdict> {
+    const identityHash = ownerIdentityHash(ownerData);
+    if (identityHash === null) return ACCESS_UNAVAILABLE;
+    return accessVerdictOfSnapshot(await tx.get(this.#accessRef(identityHash)));
+  }
+
   /**
-   * 検証済みの本人から内部ownerを一意に解決し、無ければ作る。失効・無活動のownerはundefined（再利用・振替をしない）。
+   * 検証済みの本人から内部ownerを一意に解決し、無ければ作る（利用許可がactiveの時だけ。欠落・disabledはdeniedでownerを作らない）。
+   * 失効・無活動のownerはinactive（再利用・振替をしない）。
    * 新規の候補ownerIdと封緘UIDはtransactionの外で1回だけ準備する。関数の中は最新のidentity対応・owner状態を読み、既存の
    * 対応を優先する（候補は使わずに捨てる）。候補を作れない競合（同じidの既存文書など）はcreateの失敗として非成功。
    */
-  async resolveOwner(identity: VerifiedIdentity): Promise<string | undefined> {
+  async resolveOwner(identity: VerifiedIdentity): Promise<OwnerAdmission> {
     const identityRef = this.#identityRef(identity);
+    const accessRef = this.#accessRef(identityRef.id);
     const candidateId = randomUUID();
     const sealedUid = await this.#seal(this.#ownerUidPurpose(candidateId), identity.uid, { kind: 'owner-uid', ownerId: candidateId });
-    return this.#d.db.runTransaction(async (tx) => {
+    return this.#d.db.runTransaction(async (tx): Promise<OwnerAdmission> => {
+      // 利用許可（運営者の明示登録）を同じtransactionで読む。欠落・disabledはowner作成・活動更新の前に拒否、不正・障害は一時障害。
+      const access = accessVerdictOfSnapshot(await tx.get(accessRef));
       const mapped = (await tx.get(identityRef)).data() as { ownerId?: unknown } | undefined;
+      if (access.kind === 'unavailable') throw new AccessUnavailableError();
+      if (access.kind === 'denied') return { kind: 'denied' };
       if (mapped !== undefined) {
-        if (typeof mapped.ownerId !== 'string') return undefined;
+        if (typeof mapped.ownerId !== 'string') return { kind: 'inactive' };
         const ownerRef = this.#ownerRef(mapped.ownerId);
         const owner = (await tx.get(ownerRef)).data();
         // 有効性は、この実行で最新の文書を読んだ後の時刻で判断する（再実行の間に無活動期限を過ぎたownerを古い時刻で延ばさない）。
         const now = this.#d.clock.now();
-        if (!this.#activeOwner(owner, now)) return undefined;
+        if (!this.#activeOwner(owner, now)) return { kind: 'inactive' };
+        // 許可は検証済みidentityのhashへ結ぶ。owner文書のidentityHashが同じ対応を指さなければ付け替えず一時障害。
+        if (ownerIdentityHash(owner) !== identityRef.id) throw new AccessUnavailableError();
         tx.update(ownerRef, { lastActiveAt: now });
-        return mapped.ownerId;
+        return { kind: 'admitted', ownerId: mapped.ownerId, accessGeneration: access.generation };
       }
       const now = this.#d.clock.now();
       const ownerId = candidateId;
@@ -434,7 +473,7 @@ export class ConnectStorage {
         lastActiveAt: now,
         revokedAt: null,
       });
-      return ownerId;
+      return { kind: 'admitted', ownerId, accessGeneration: access.generation };
     });
   }
 
@@ -443,6 +482,35 @@ export class ConnectStorage {
     const mapped = (await this.#identityRef(identity).get()).data() as { ownerId?: unknown } | undefined;
     if (typeof mapped?.ownerId !== 'string') return undefined;
     return (await this.isOwnerActive(mapped.ownerId)) ? mapped.ownerId : undefined;
+  }
+
+  /**
+   * 検証済みの本人の利用許可を表示用に読む（ownerの有無・状態とは独立）。読めない・不正はunavailable（例外を外へ出さない）。
+   * 照会・取消・解除の可否はこれに依存させない。
+   */
+  async accessDisplay(identity: VerifiedIdentity): Promise<AccessDisplay> {
+    try {
+      return accessVerdictOfSnapshot(await this.#accessRef(this.#identityRef(identity).id).get()).kind;
+    } catch {
+      return 'unavailable';
+    }
+  }
+
+  /**
+   * GrantをこのownerがいまOAuthの新規利用（code交換・refresh）に使えるか。owner文書のidentityHash→許可record、grantMetaの世代を
+   * 同じtransactionで読む。falseは資格不成立（欠落・disabled・旧形式・旧世代・別owner）、不正・障害はAccessUnavailableError。
+   */
+  async grantUsable(ownerId: string, grantId: string): Promise<boolean> {
+    const ownerRef = this.#ownerRef(ownerId);
+    const metaRef = this.#grantMetaRef(grantId);
+    const verdict = await this.#d.db.runTransaction(async (tx): Promise<AccessVerdict> => {
+      const owner = await tx.get(ownerRef);
+      const meta = await tx.get(metaRef);
+      const access = await this.#accessForOwner(tx, owner.data());
+      return grantUseVerdict(access, grantGenerationOfSnapshot(meta), ownerId);
+    });
+    if (verdict.kind === 'unavailable') throw new AccessUnavailableError();
+    return verdict.kind === 'allowed';
   }
 
   async isOwnerActive(ownerId: string): Promise<boolean> {
@@ -494,6 +562,42 @@ export class ConnectStorage {
     );
   }
 
+  /** owner文書のdataから、その本人の許可recordの参照（identityHashが無い・形違いはnull）。 */
+  accessDocRefForOwner(data: Record<string, unknown> | undefined): DocumentReference | null {
+    const identityHash = ownerIdentityHash(data);
+    return identityHash === null ? null : this.#accessRef(identityHash);
+  }
+
+  /** Grantの同意記録（grantMeta）文書の参照。 */
+  grantMetaDocRef(grantId: string): DocumentReference {
+    return this.#grantMetaRef(grantId);
+  }
+
+  /**
+   * transactionで読んだ許可recordとgrantMetaのdata（欠落はundefined）から、このowner・Grantの新規利用の可否。I/O・開封0。
+   * 不正・不明はunavailable（allowedへ読み替えない）。
+   */
+  grantUseDecision(
+    access: { readonly exists: boolean; readonly data: unknown },
+    meta: { readonly exists: boolean; readonly data: unknown },
+    ownerId: string,
+  ): 'allowed' | 'denied' | 'unavailable' {
+    try {
+      return grantUseVerdict(accessVerdictOf(access.exists, access.data), grantGenerationOf(meta.exists, meta.data), ownerId).kind;
+    } catch {
+      return 'unavailable';
+    }
+  }
+
+  /** transactionで読んだ許可recordのdataだけからの利用許可（Grantを伴わない判定）。不正はunavailable。 */
+  accessUseDecision(access: { readonly exists: boolean; readonly data: unknown }): 'allowed' | 'denied' | 'unavailable' {
+    try {
+      return accessVerdictOf(access.exists, access.data).kind;
+    } catch {
+      return 'unavailable';
+    }
+  }
+
   // ---- 接続interaction（元OAuth要求への束縛・CSRF・単回の同意） ----
 
   #interactionRef(uid: string): DocumentReference {
@@ -534,36 +638,53 @@ export class ConnectStorage {
     );
   }
 
-  /** ログイン結果をこのinteractionへ束縛する。別ownerへの切替は拒否し、元のownerのまま残す。 */
-  async bindInteraction(uid: string, csrf: string, ownerId: string, authTimeSec: number): Promise<BindOutcome> {
+  /**
+   * ログイン結果をこのinteractionへ束縛する。別ownerへの切替は拒否し、元のownerのまま残す。同じtransactionで利用許可を再確認し、
+   * login時の世代と一致する時だけ世代も束縛する（停止・再登録を跨いだら'denied'。不正・障害はAccessUnavailableError）。
+   */
+  async bindInteraction(uid: string, csrf: string, ownerId: string, authTimeSec: number, accessGeneration: string): Promise<BindOutcome | 'denied'> {
     const ref = this.#interactionRef(uid);
+    const ownerRef = this.#ownerRef(ownerId);
     const now = this.#d.clock.now();
-    return this.#d.db.runTransaction(async (tx) => {
+    return this.#d.db.runTransaction(async (tx): Promise<BindOutcome | 'denied'> => {
       const data = (await tx.get(ref)).data() as Record<string, unknown> | undefined;
+      const access = await this.#accessForOwner(tx, (await tx.get(ownerRef)).data());
       if (data === undefined || data.state === 'done' || typeof data.expiresAt !== 'number' || now >= data.expiresAt) {
         return 'rejected';
       }
       if (!this.#csrfMatches(data, csrf)) return 'rejected';
       if (typeof data.ownerId === 'string' && data.ownerId !== ownerId) return 'other_owner';
-      tx.update(ref, { ownerId, authTimeSec, state: 'authenticated' });
+      if (access.kind === 'unavailable') throw new AccessUnavailableError();
+      if (access.kind === 'denied' || access.generation !== accessGeneration) return 'denied';
+      tx.update(ref, { ownerId, authTimeSec, accessGeneration, state: 'authenticated' });
       return 'ok';
     });
   }
 
   /** 本人の明示操作。ログイン済み・CSRF一致・期限内の時だけ1回だけ通し、以後は使えない。 */
-  async consumeInteraction(uid: string, csrf: string): Promise<ConsentRecord | undefined> {
+  async consumeInteraction(uid: string, csrf: string): Promise<ConsentRecord | 'denied' | undefined> {
     const ref = this.#interactionRef(uid);
     const now = this.#d.clock.now();
-    return this.#d.db.runTransaction(async (tx) => {
+    return this.#d.db.runTransaction(async (tx): Promise<ConsentRecord | 'denied' | undefined> => {
       const data = (await tx.get(ref)).data() as Record<string, unknown> | undefined;
+      const owner = data !== undefined && typeof data.ownerId === 'string' ? (await tx.get(this.#ownerRef(data.ownerId))).data() : undefined;
       if (data === undefined || data.state !== 'authenticated' || typeof data.expiresAt !== 'number' || now >= data.expiresAt) {
         return undefined;
       }
       if (!this.#csrfMatches(data, csrf) || typeof data.ownerId !== 'string' || typeof data.authTimeSec !== 'number') {
         return undefined;
       }
+      // 世代を束縛していない（この版より前にloginした）interactionは同意に使わない（やり直し）。
+      if (typeof data.accessGeneration !== 'string') return undefined;
+      // 同じtransactionで利用許可を再確認する。停止・再登録を跨いだ同意はこのinteractionを閉じてやり直させる（Grantを作らない）。
+      const access = await this.#accessForOwner(tx, owner);
+      if (access.kind === 'unavailable') throw new AccessUnavailableError();
+      if (access.kind === 'denied' || access.generation !== data.accessGeneration) {
+        tx.update(ref, { state: 'done', csrfHash: null });
+        return 'denied';
+      }
       tx.update(ref, { state: 'done', csrfHash: null });
-      return { ownerId: data.ownerId, authTimeSec: data.authTimeSec };
+      return { ownerId: data.ownerId, authTimeSec: data.authTimeSec, accessGeneration: data.accessGeneration };
     });
   }
 
@@ -580,17 +701,30 @@ export class ConnectStorage {
 
   // ---- Grantの同意記録 ----
 
-  async putGrantMeta(grantId: string, record: ConsentRecord): Promise<void> {
-    await this.#root
-      .collection('grantMeta')
-      .doc(this.#hash('grant', grantId))
-      .create({ ownerId: record.ownerId, authTimeSec: record.authTimeSec, createdAt: this.#d.clock.now() });
+  /**
+   * 同意したGrantの記録を作る。同じtransactionでownerの許可recordを読み、activeかつ同意（login）時と同じ世代の時だけ作る。
+   * 停止・再登録を跨いだら作らず'denied'（そのGrantはmetadataなしで新規利用に使えない）。不正・障害はAccessUnavailableError。
+   */
+  async putGrantMeta(grantId: string, record: ConsentRecord): Promise<'created' | 'denied'> {
+    const metaRef = this.#grantMetaRef(grantId);
+    const ownerRef = this.#ownerRef(record.ownerId);
+    return this.#d.db.runTransaction(async (tx): Promise<'created' | 'denied'> => {
+      const access = await this.#accessForOwner(tx, (await tx.get(ownerRef)).data());
+      if (access.kind === 'unavailable') throw new AccessUnavailableError();
+      if (access.kind === 'denied' || access.generation !== record.accessGeneration) return 'denied';
+      tx.create(metaRef, {
+        ownerId: record.ownerId,
+        authTimeSec: record.authTimeSec,
+        createdAt: this.#d.clock.now(),
+        accessGeneration: record.accessGeneration,
+      });
+      return 'created';
+    });
   }
 
-  async grantMeta(grantId: string): Promise<ConsentRecord | undefined> {
-    const data = (await this.#root.collection('grantMeta').doc(this.#hash('grant', grantId)).get()).data() as
-      | { ownerId?: unknown; authTimeSec?: unknown }
-      | undefined;
+  /** 同意記録のowner・認証時刻。新規利用の世代の判定はgrantUsableで行う。 */
+  async grantMeta(grantId: string): Promise<{ readonly ownerId: string; readonly authTimeSec: number } | undefined> {
+    const data = (await this.#grantMetaRef(grantId).get()).data() as { ownerId?: unknown; authTimeSec?: unknown } | undefined;
     if (typeof data?.ownerId !== 'string' || typeof data.authTimeSec !== 'number') return undefined;
     return { ownerId: data.ownerId, authTimeSec: data.authTimeSec };
   }

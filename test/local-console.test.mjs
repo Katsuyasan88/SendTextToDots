@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
 import { after, test } from 'node:test';
 
-import { LOCAL_NONCE_HEADER } from '../dist/connect/console.js';
+import { LOCAL_NONCE_HEADER, LOCAL_REFUSAL_HEADER } from '../dist/connect/console.js';
 import { ConsoleConfigFileError, validateLocalConsoleConfig } from '../dist/console/config.js';
 import { DEFAULT_LOCAL_PORT, parseLocalConsoleArgs, startLocalConsole } from '../dist/console/local-server.js';
 
@@ -166,11 +166,12 @@ test('P3 relay protection: every defect is refused before any upstream call', as
     ['host other port', { path: '/v1/web/connection', headers: good, host: `localhost:${port + 1}` }, 400, 'invalid_request'],
     ['host dns rebinding', { path: '/v1/web/connection', headers: good, host: 'attacker.example' }, 400, 'invalid_request'],
     ['absolute target', { path: `http://localhost:${port}/v1/web/connection`, headers: good }, 400, 'invalid_request'],
-    ['nonce missing', { path: '/v1/web/connection', headers: { Authorization: TOKEN } }, 403, 'forbidden'],
-    ['nonce wrong', { path: '/v1/web/connection', headers: { Authorization: TOKEN, [LOCAL_NONCE_HEADER]: 'b'.repeat(64) } }, 403, 'forbidden'],
-    ['origin other', { path: '/v1/web/connection', headers: { ...good, Origin: 'http://localhost:1' } }, 403, 'forbidden'],
-    ['origin https', { path: '/v1/web/connection', headers: { ...good, Origin: `https://localhost:${port}` } }, 403, 'forbidden'],
-    ['origin null', { path: '/v1/web/connection', headers: { ...good, Origin: 'null' } }, 403, 'forbidden'],
+    // 古いtab（別起動のnonce）・別originは画面の再読込みを案内する固定のlocal code。
+    ['nonce missing', { path: '/v1/web/connection', headers: { Authorization: TOKEN } }, 403, 'local_reload_required'],
+    ['nonce wrong', { path: '/v1/web/connection', headers: { Authorization: TOKEN, [LOCAL_NONCE_HEADER]: 'b'.repeat(64) } }, 403, 'local_reload_required'],
+    ['origin other', { path: '/v1/web/connection', headers: { ...good, Origin: 'http://localhost:1' } }, 403, 'local_reload_required'],
+    ['origin https', { path: '/v1/web/connection', headers: { ...good, Origin: `https://localhost:${port}` } }, 403, 'local_reload_required'],
+    ['origin null', { path: '/v1/web/connection', headers: { ...good, Origin: 'null' } }, 403, 'local_reload_required'],
     ['bearer missing', { path: '/v1/web/connection', headers: { [LOCAL_NONCE_HEADER]: server.nonce } }, 401, 'authentication_required'],
     ['bearer basic', { path: '/v1/web/connection', headers: { ...good, Authorization: 'Basic abc' } }, 401, 'authentication_required'],
     ['bearer bad chars', { path: '/v1/web/connection', headers: { ...good, Authorization: 'Bearer a b' } }, 401, 'authentication_required'],
@@ -194,6 +195,8 @@ test('P3 relay protection: every defect is refused before any upstream call', as
   for (const [name, options, status, expectedCode] of cases) {
     const response = await raw(port, options);
     assert.deepEqual([response.status, expectedCode === null ? null : code(response)], [status, expectedCode], name);
+    // helper自身の送出前の拒否には固定のlocal headerが付く（画面はこれだけで未送信と判定する）。
+    if (expectedCode !== null) assert.equal(response.headers[LOCAL_REFUSAL_HEADER.toLowerCase()], '1', `${name}: helper refusal marker`);
   }
   // 重複header（nonce・Authorization）はrawで2件送る。
   for (const [name, header, value] of [['duplicate nonce', LOCAL_NONCE_HEADER, server.nonce], ['duplicate authorization', 'Authorization', TOKEN]]) {
@@ -244,10 +247,17 @@ test('P4 relay: each allowed route reaches its fixed upstream with only the fixe
   Object.assign(up.state, { status: 404, body: JSON.stringify({ error: { code: 'not_found', retryable: false } }), headers: { 'content-type': 'application/json; charset=utf-8' } });
   const missing = await raw(port, { path: `/v2/commands/${ID}`, headers: good });
   assert.deepEqual([missing.status, code(missing), missing.headers['retry-after']], [404, 'not_found', undefined]);
-  // 上流失敗 → 502（固定）。
+  // 上流が同名のheader・codeを返しても転送しない（上流の応答をhelperの送出前拒否に偽装できない）。利用許可の拒否もそのまま。
+  Object.assign(up.state, { status: 403, body: JSON.stringify({ error: { code: 'local_reload_required', retryable: false } }), headers: { 'content-type': 'application/json; charset=utf-8', [LOCAL_REFUSAL_HEADER.toLowerCase()]: '1' } });
+  const spoofed = await raw(port, { method: 'POST', path: '/v2/commands', headers: { ...good, 'Content-Type': 'application/json', 'Idempotency-Key': ID }, body: '{}' });
+  assert.deepEqual([spoofed.status, code(spoofed), spoofed.headers[LOCAL_REFUSAL_HEADER.toLowerCase()]], [403, 'local_reload_required', undefined]);
+  Object.assign(up.state, { status: 200, body: JSON.stringify({ state: 'subscribed', access: 'allowed' }), headers: { 'content-type': 'application/json; charset=utf-8' } });
+  const withAccess = await raw(port, { path: '/v1/web/connection', headers: good });
+  assert.deepEqual([withAccess.status, JSON.parse(withAccess.body), withAccess.headers[LOCAL_REFUSAL_HEADER.toLowerCase()]], [200, { state: 'subscribed', access: 'allowed' }, undefined]);
+  // 上流失敗 → 502（固定）。上流を呼んだ後なのでlocalの印は付けない（結果不明のまま）。
   up.state.mode = 'fail';
   const failed = await raw(port, { path: '/v1/web/connection', headers: good });
-  assert.deepEqual([failed.status, code(failed)], [502, 'upstream_unavailable']);
+  assert.deepEqual([failed.status, code(failed), failed.headers[LOCAL_REFUSAL_HEADER.toLowerCase()]], [502, 'upstream_unavailable', undefined]);
   // browser切断 → 上流signalがabort。
   up.state.mode = 'hold';
   const aborted = await new Promise((resolve) => {
