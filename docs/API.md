@@ -55,7 +55,7 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 
 期限: 処理予算は受信から20秒か元の期限の短い方、外部HTTPは最大10秒、Functions timeoutは30秒。
 
-送信画面 `/console`（MCP originで配信）は、空の入力欄に利用者が入力した本文を同じ5項目の形でAPIへ直接送ります（方向・定型文の選択はありません）。接続状態の表示と、明示の確認後に既存の `/v1/web/disconnect` で行う接続解除も同じ画面にあります。APIのCORSは設定のMCP originからの上の3 routeだけを許可します（許可header: authorization・content-type・idempotency-key、`Retry-After` を公開、wildcard・credential cookieなし）。Originが付いた旧v1 routeや他のoriginは固定の403、Originの無い要求はCORS headerを付けずに通常の処理（v1は404）へ進みます。
+ローカル送信画面 `/console` は、空の入力欄に利用者が入力した本文を同じ5項目の形でローカルhelper経由でAPIへ送ります（方向・定型文の選択はありません）。接続状態の表示と、明示の確認後に既存の `/v1/web/disconnect` で行う接続解除も同じ画面にあります。helperは利用者のBearer tokenを固定のAPI/MCP originへ中継し、ブラウザのOrigin・cookie・local nonceは転送しません。APIのCORSは引き続き設定のMCP originからの上の3 routeだけを許可します（許可header: authorization・content-type・idempotency-key、`Retry-After` を公開、wildcard・credential cookieなし）。localhostをCloud側の許可originへ追加する必要はありません。Originが付いた旧v1 routeや他のoriginは固定の403、Originの無い要求はCORS headerを付けずに通常の処理（v1は404）へ進みます。
 
 ## 3. 送信画面と接続状態
 
