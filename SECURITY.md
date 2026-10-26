@@ -6,7 +6,7 @@ SendTextToDots is experimental. No release line is currently promised ongoing se
 
 **Reporting channel status:** the private reporting channel has not yet been enabled and verified for public use. Adding this file does not enable GitHub private vulnerability reporting. The repository owner must enable and check that channel as part of publication.
 
-When private reporting is enabled, open the repository's [Security advisories](https://github.com/Katsuyasan88/SentTextToDots/security/advisories) and choose **Report a vulnerability**. GitHub describes the process in [Privately reporting a security vulnerability](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/report-privately).
+When private reporting is enabled, open the repository's [Security advisories](https://github.com/Katsuyasan88/SendTextToDots/security/advisories) and choose **Report a vulnerability**. GitHub describes the process in [Privately reporting a security vulnerability](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/report-privately).
 
 If that button is unavailable, ask the maintainers for a private security contact in an issue containing **only the contact request**. Do not include vulnerability details, proof-of-concept code, tokens, keys, real user data, callback URLs or message text in public issues, discussions or pull requests. No alternative e-mail address is currently designated here.
 
