@@ -31,7 +31,8 @@ const WORK = fileURLToPath(new URL('..', import.meta.url));
 function fakeDb() {
   const docs = new Map();
   let tick = 0;
-  const control = { fail: false, writes: 0, transactions: 0, options: [] };
+  // onGet: tx.getの後に呼ぶ（時計を進める等）。retryOnce: 1回目の実行を捨ててSDKのように閉包を再実行する（beforeRetryを呼ぶ）。
+  const control = { fail: false, writes: 0, transactions: 0, options: [], onGet: null, retryOnce: false, beforeRetry: null, attempts: 0 };
   const snapshot = (path) => {
     const entry = docs.get(path);
     return { exists: entry !== undefined, updateTime: entry?.updateTime, data: () => (entry === undefined ? undefined : structuredClone(entry.data)) };
@@ -53,17 +54,30 @@ function fakeDb() {
       control.transactions += 1;
       control.options.push(options);
       if (control.fail) throw new Error('synthetic transaction failure');
-      const pending = [];
-      const result = await fn({
-        get: async (ref) => snapshot(ref.path),
-        create: (ref, data) => void pending.push(() => {
-          if (docs.has(ref.path)) throw new Error('ALREADY_EXISTS');
-          write(ref.path, data);
-        }),
-        set: (ref, data) => void pending.push(() => write(ref.path, data)),
-      });
-      for (const apply of pending) apply();
-      return result;
+      for (;;) {
+        control.attempts += 1;
+        const pending = [];
+        const result = await fn({
+          get: async (ref) => {
+            const value = snapshot(ref.path);
+            control.onGet?.();
+            return value;
+          },
+          create: (ref, data) => void pending.push(() => {
+            if (docs.has(ref.path)) throw new Error('ALREADY_EXISTS');
+            write(ref.path, data);
+          }),
+          set: (ref, data) => void pending.push(() => write(ref.path, data)),
+        });
+        if (control.retryOnce) {
+          // 競合でcommitできなかった1回目（書込みを捨てる）→ SDKが閉包を再実行する。
+          control.retryOnce = false;
+          control.beforeRetry?.();
+          continue;
+        }
+        for (const apply of pending) apply();
+        return result;
+      }
     },
   };
   return db;
@@ -71,32 +85,38 @@ function fakeDb() {
 
 function harness({ key = randomBytes(32) } = {}) {
   const db = fakeDb();
-  const calls = { open: 0, close: 0, keys: [], closeFails: false };
+  // keyDelayMs: 鍵を遅れて返す。closeMode: 'ok' | 'fail' | 'hang'。
+  const calls = { open: 0, close: 0, keys: [], closeFails: false, closeMode: 'ok', keyDelayMs: 0, openGate: null };
+  const time = { value: BASE };
   const deps = {
     config: () => CONFIG,
-    clock: { now: () => BASE },
+    clock: { now: () => time.value },
     openSdk: async (config, operation) => {
       calls.open += 1;
       assert.equal(config, CONFIG);
-      assert.ok(operation.deadlineAt === BASE + 30_000 && operation.signal instanceof AbortSignal);
-      return {
+      assert.ok(operation.signal instanceof AbortSignal && operation.deadlineAt <= time.value + 25_000, 'the work deadline is passed to the SDK');
+      const sdk = {
         db,
         readIdentifierKey: async () => {
+          if (calls.keyDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, calls.keyDelayMs));
           const copy = Buffer.from(key);
           calls.keys.push(copy);
           return copy;
         },
         close: async () => {
           calls.close += 1;
-          if (calls.closeFails) throw new Error('synthetic close failure');
+          if (calls.closeFails || calls.closeMode === 'fail') throw new Error('synthetic close failure');
+          if (calls.closeMode === 'hang') await new Promise(() => {});
         },
       };
+      if (calls.openGate) await calls.openGate;
+      return sdk;
     },
   };
   const run = (command, expected, overrides = {}) =>
     runAccessAdmin({ command, target: TARGET, ...(expected === undefined ? {} : { expected }) }, overrides.uid ?? UID, { ...deps, ...overrides.deps });
   const accessPath = (uid = UID) => `sttdConnect/${CONFIG.connectNamespace}/access/${createHmacHasher(key).hash(`t256:${CONFIG.connectNamespace}:identity`, `${CONFIG.projectId}\0${uid}`)}`;
-  return { db, calls, deps, run, key, accessPath };
+  return { db, calls, deps, run, key, accessPath, time };
 }
 
 test('M1 arguments, stdin UID and fixed output', () => {
@@ -120,8 +140,34 @@ test('M1 arguments, stdin UID and fixed output', () => {
   assert.equal(parseUidInput(`${UID}\n`), UID);
   assert.equal(parseUidInput(`${UID}\r\n`), UID);
   assert.equal(parseUidInput(UID), UID);
-  for (const bad of ['', '\n', `${UID}\n${UID}\n`, `${UID} x`, ' uid', 'u'.repeat(129), `${UID}\n\n`, Buffer.alloc(2000, 0x61)]) {
-    assert.equal(parseUidInput(bad), null, String(bad).slice(0, 20));
+  // 現行の検証済みidentityと同じく、有効なUnicodeのUIDも1〜128文字ならそのまま受ける（trim・置換・正規化しない）。
+  for (const unicode of ['利用者ユーザー', 'uid-😀-x', ' spaced uid ', 'e\u0301', 'u'.repeat(128), '😀'.repeat(64), `a${String.fromCharCode(0xd83d, 0xde00)}b`]) {
+    assert.equal(parseUidInput(`${unicode}\n`), unicode, JSON.stringify(unicode));
+  }
+  assert.notEqual(parseUidInput('e\u0301'), parseUidInput('\u00e9'), 'not normalized into another UID');
+  for (const bad of [
+    '',
+    '\n',
+    `${UID}\n${UID}\n`,
+    `${UID}\n\n`,
+    `${UID}\r`,
+    `a\rb`,
+    `a\tb`,
+    `a\u2028b`,
+    `\ufeff${UID}`,
+    'u'.repeat(129),
+    '😀'.repeat(65),
+    Buffer.from([0x61, 0xff, 0x62]),
+    Buffer.from([0xed, 0xa0, 0x80]),
+    // 文字列入力の孤立surrogate（UTF-8変換でU+FFFDへ置き換わる前に拒否する）。
+    String.fromCharCode(0xd800),
+    String.fromCharCode(0xdc00),
+    `a${String.fromCharCode(0xd800)}b`,
+    `a${String.fromCharCode(0xdc00)}b\n`,
+    `${String.fromCharCode(0xdc00, 0xd800)}`,
+    Buffer.alloc(2000, 0x61),
+  ]) {
+    assert.equal(parseUidInput(bad), null, JSON.stringify(String(bad).slice(0, 20)));
   }
   const line = formatAdminResult({ code: 'status', state: 'active', version: '1900000001.000000001' });
   assert.equal(line, '{"code":"status","state":"active","version":"1900000001.000000001"}\n');
@@ -137,7 +183,7 @@ test('M2 target mismatch or an unconfigured deployment stops before the SDK fact
     throw new Error('deployment_config_unconfigured');
   };
   assert.deepEqual(await h.run('status', undefined, { deps: { config: unconfigured } }), { code: 'unconfigured' });
-  assert.deepEqual(await h.run('status', undefined, { uid: 'bad uid' }), { code: 'invalid_input' });
+  assert.deepEqual(await h.run('status', undefined, { uid: 'bad' + String.fromCharCode(10) + 'uid' }), { code: 'invalid_input' });
   assert.equal(h.calls.open, 0);
 });
 
@@ -199,21 +245,139 @@ test('M4 invalid record / DB failure / deadline / close failure are fixed codes;
   assert.deepEqual(await h.run('status'), { code: 'unavailable' });
   assert.equal(h.db.control.transactions, transactions + 1, 'one transaction, no outer retry');
   h.db.control.fail = false;
-  // 元期限を過ぎた後の結果は採用しない。
+  // 開始の時点で処理の元期限を過ぎていれば、SDKを作らない。
+  const opened = h.calls.open;
   let calls = 0;
   const late = { now: () => (calls++ === 0 ? BASE : BASE + 30_001) };
   assert.deepEqual(await h.run('status', undefined, { deps: { clock: late } }), { code: 'timed_out' });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(h.calls.close, h.calls.open, 'an SDK opened after the deadline is closed, not adopted');
+  assert.deepEqual(await h.run('status', undefined, { deps: { startedAt: BASE - 25_000 } }), { code: 'timed_out' });
+  assert.equal(h.calls.open, opened, 'no SDK is started after the deadline');
   // 鍵の形が違えば使わない。
   assert.deepEqual(await harness({ key: randomBytes(16) }).run('status'), { code: 'unavailable' });
-  // closeの失敗: 失敗した操作はclose_failed、確定した結果は変えない。
+  // closeの失敗は固定のcleanup fieldで示し、codeは書き換えない。
   h.calls.closeFails = true;
   h.db.control.fail = true;
-  assert.deepEqual(await h.run('status'), { code: 'close_failed' });
+  assert.deepEqual(await h.run('status'), { code: 'unavailable', cleanup: 'failed' });
   h.db.control.fail = false;
-  assert.deepEqual(await h.run('status'), { code: 'close_failed' }, 'an invalid record with a failed close');
+  assert.deepEqual(await h.run('status'), { code: 'invalid_record', cleanup: 'failed' });
   assert.equal(h.calls.close, h.calls.open);
+});
+
+test('M6 deadline inside the transaction: a clock past the work deadline after tx.get or before an SDK retry gives timed_out with no write; the expected version and generation are not re-read', async () => {
+  // tx.getの後に時計が開始+30001へ進む（PMの反例）→ timed_out・書込み0。
+  {
+    const h = harness();
+    h.db.control.onGet = () => {
+      h.time.value = BASE + 30_001;
+    };
+    const transactions = h.db.control.transactions;
+    // 全体の元期限（開始+30秒）も過ぎているので、後始末は待たずにcloseを試みてunconfirmedと示す。
+    assert.deepEqual(await h.run('grant', 'absent'), { code: 'timed_out', cleanup: 'unconfirmed' });
+    assert.deepEqual([h.db.control.writes, h.db.docs.size, h.db.control.transactions - transactions], [0, 0, 1]);
+    assert.equal(h.calls.close, h.calls.open, 'the SDK is still closed');
+  }
+  // 処理の元期限（開始+25秒）ちょうどを過ぎた時点でも同じ（全体の30秒を待たない）。
+  {
+    const h = harness();
+    h.db.control.onGet = () => {
+      h.time.value = BASE + 25_000;
+    };
+    assert.deepEqual(await h.run('grant', 'absent'), { code: 'timed_out' });
+    assert.equal(h.db.control.writes, 0);
+  }
+  // SDKが閉包を再実行する前に期限を過ぎる → 再実行の開始で止まり、書込み0（期待版・世代を取り直して書かない）。
+  {
+    const h = harness();
+    h.db.control.retryOnce = true;
+    h.db.control.beforeRetry = () => {
+      h.time.value = BASE + 26_000;
+    };
+    assert.deepEqual(await h.run('revoke', 'absent'), { code: 'timed_out' });
+    assert.deepEqual([h.db.control.writes, h.db.control.attempts], [0, 2]);
+  }
+  // 期限内の再実行は同じ期待版・同じ世代で1件だけ書く。
+  {
+    const h = harness();
+    h.db.control.retryOnce = true;
+    const generation = randomUUID();
+    assert.deepEqual(await h.run('grant', 'absent', { deps: { newGeneration: () => generation } }), { code: 'changed', state: 'active' });
+    assert.deepEqual([h.db.control.writes, h.db.docs.get(h.accessPath()).data.generation], [1, generation]);
+  }
+  // status（読取り）も同じ検査。
+  {
+    const h = harness();
+    h.db.control.onGet = () => {
+      h.time.value = BASE + 30_001;
+    };
+    assert.deepEqual(await h.run('status'), { code: 'timed_out', cleanup: 'unconfirmed' });
+  }
+});
+
+test('M7 bounded waits and cleanup: a slow SDK open or key is abandoned at the work deadline, the late handle is closed and the late key zeroed; a hanging close is reported as unconfirmed within the cleanup bound; a failed close keeps the confirmed DB result', async () => {
+  // 遅いopen（処理の元期限まで残り20ms）→ timed_out、後から開いたSDKは採用せず閉じる。
+  {
+    const h = harness();
+    let release;
+    h.calls.openGate = new Promise((resolve) => (release = resolve));
+    assert.deepEqual(await h.run('status', undefined, { deps: { startedAt: BASE - 24_980 } }), { code: 'timed_out' });
+    assert.equal(h.calls.close, 0);
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(h.calls.close, 1, 'the late SDK handle is closed');
+  }
+  // 遅い鍵 → timed_out、後から届いた鍵Bufferは0埋め。SDKは閉じる。
+  {
+    const h = harness();
+    h.calls.keyDelayMs = 80;
+    assert.deepEqual(await h.run('status', undefined, { deps: { startedAt: BASE - 24_960 } }), { code: 'timed_out' });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(h.calls.keys.length, 1);
+    assert.ok(h.calls.keys[0].every((byte) => byte === 0), 'the late key is zeroed');
+    assert.equal(h.calls.close, h.calls.open);
+    assert.equal(h.db.control.transactions, 0, 'no transaction after the deadline');
+  }
+  // 確定したchangedの後のclose失敗: changedのまま、cleanup failed（未実行へ書き換えない・再書込みしない）。
+  {
+    const h = harness();
+    h.calls.closeMode = 'fail';
+    assert.deepEqual(await h.run('grant', 'absent'), { code: 'changed', state: 'active', cleanup: 'failed' });
+    assert.equal(h.db.control.writes, 1);
+  }
+  // 閉じ終わらないclose: 後始末の上限（最大5秒）で待つのをやめ、cleanup unconfirmed。
+  {
+    const h = harness();
+    h.calls.closeMode = 'hang';
+    const started = Date.now();
+    assert.deepEqual(await h.run('status'), { code: 'status', state: 'absent', version: 'absent', cleanup: 'unconfirmed' });
+    const waited = Date.now() - started;
+    assert.ok(waited >= 4_900 && waited < 7_000, `bounded cleanup wait (${waited} ms)`);
+  }
+  // 全体の元期限を過ぎてから後始末に入る場合は待たずに閉じることを試み、unconfirmed。
+  assert.match(formatAdminResult({ code: 'changed', state: 'active', cleanup: 'unconfirmed' }), /^\{"code":"changed","state":"active","cleanup":"unconfirmed"\}\n$/);
+});
+
+test('M8 CLI stdin is bounded: EOF within the limit gives the bytes, more than 1 KiB or no EOF before the deadline stops reading without waiting further and zeroes what was read', async () => {
+  const { readStdin } = await import('../scripts/manage-access.mjs');
+  const { PassThrough } = await import('node:stream');
+  const ok = new PassThrough();
+  const reading = readStdin(ok, Date.now() + 1_000);
+  ok.end(`${UID}\n`);
+  const got = await reading;
+  assert.equal(got.kind, 'ok');
+  assert.equal(parseUidInput(got.bytes), UID);
+  const big = new PassThrough();
+  const tooLarge = readStdin(big, Date.now() + 1_000);
+  big.write(Buffer.alloc(1025, 0x61));
+  assert.deepEqual(await tooLarge, { kind: 'too_large' });
+  const open = new PassThrough();
+  const started = Date.now();
+  const chunk = Buffer.from('partial-uid');
+  const waiting = readStdin(open, Date.now() + 50);
+  open.write(chunk);
+  assert.deepEqual(await waiting, { kind: 'timed_out' });
+  assert.ok(Date.now() - started < 1_000, 'no wait for EOF beyond the deadline');
+  assert.ok(open.destroyed, 'the stream is stopped');
+  assert.deepEqual(await readStdin(new PassThrough(), Date.now() - 1), { kind: 'timed_out' });
 });
 
 test('M5 the CLI import has no side effect; the admin module is not in the API/MCP runtime closure', async () => {

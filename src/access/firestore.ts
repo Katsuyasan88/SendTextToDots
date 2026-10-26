@@ -83,6 +83,8 @@ export type AccessChangeOutcome =
 /**
  * 期待版と完全一致した時だけ目標状態へ1件更新する（1 transaction、SDKの最大実行回数maxAttempts）。同じ状態なら書込みなし。
  * 版違いはconflict（最新状態へ自動適用しない）。不正なrecordはAccessRecordError（修復しない）。
+ * liveは呼出し元の元期限・中止の検査（過ぎていれば例外）。SDKの開始前・各実行の開始・各awaitの後・書込みの直前に呼び、期限後に
+ * 新しいtransaction・書込みを始めない（期待版・世代は取り直さない）。期限前に始めたcommitの物理的な取消は約束しない。
  */
 export async function changeAccess(
   db: Firestore,
@@ -93,17 +95,22 @@ export async function changeAccess(
     readonly now: number;
     readonly newGeneration: string;
     readonly maxAttempts: number;
+    readonly live: () => void;
   },
 ): Promise<AccessChangeOutcome> {
-  const { expected, desired, now, newGeneration, maxAttempts } = change;
+  const { expected, desired, now, newGeneration, maxAttempts, live } = change;
   if (!isAccessVersion(expected)) throw new AccessRecordError();
+  live();
   return db.runTransaction(
     async (tx: Transaction): Promise<AccessChangeOutcome> => {
+      live();
       const snapshot = await tx.get(ref);
+      live();
       const status = accessStatusOf(snapshot);
       if (status.version !== expected) return { kind: 'conflict' };
       const next = nextAccessRecord(status.record, desired, now, newGeneration);
       if (next === null) return { kind: 'unchanged', record: status.record };
+      live();
       if (status.record === null) tx.create(ref, { ...next });
       else tx.set(ref, { ...next });
       return { kind: 'changed', record: next };

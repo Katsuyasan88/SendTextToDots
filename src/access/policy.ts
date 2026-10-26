@@ -4,8 +4,9 @@
 //   - 欠落・disabled → denied（利用不許可）。
 //   - 不正schema・未知版 → unavailable（固定の一時障害。activeへ読み替えず、永久の不許可やowner失効とも区別する）。
 //   - 正常active → allowed（そのgenerationが利用許可の世代）。
-//   Grantの同意記録（grantMeta）は {ownerId, authTimeSec, createdAt, accessGeneration}。accessGenerationが無い旧形式は移行前Grantとして
-//   新規利用に使えず（denied）、値の形が不正ならunavailable。世代・ownerの不一致はdenied。
+//   Grantの同意記録（grantMeta）は exact {ownerId: 小文字UUID, authTimeSec: 正の安全な整数, createdAt: 正の安全な整数ms, accessGeneration}。
+//   accessGenerationだけが無い正しい旧形式は移行前Grantとして新規利用に使えず（denied）、それ以外の形の不正はunavailable。
+//   世代・ownerの不一致はdenied。
 // identityHashは接続保存（ConnectStorage）の既存identity用HMACと同じ値で、ここでは形（64桁の小文字hex）だけを見る。
 
 /** 許可recordの唯一の版。 */
@@ -16,6 +17,10 @@ export const ACCESS_COLLECTION = 'access';
 const GENERATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const IDENTITY_HASH = /^[0-9a-f]{64}$/;
 const RECORD_KEYS = ['version', 'state', 'generation', 'updatedAt'] as const;
+const GRANT_META_LEGACY_KEYS = ['ownerId', 'authTimeSec', 'createdAt'] as const;
+const GRANT_META_KEYS = ['ownerId', 'authTimeSec', 'createdAt', 'accessGeneration'] as const;
+/** 接続保存の内部owner ID（randomUUIDの小文字UUID）。 */
+const OWNER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export type AccessState = 'active' | 'disabled';
 
@@ -121,10 +126,19 @@ export function grantGenerationOf(exists: boolean, value: unknown): GrantGenerat
   const data = plainData(value);
   if (data === null) return { kind: 'invalid' };
   try {
+    // exact key: 旧形式は{ownerId, authTimeSec, createdAt}、現行はそれにaccessGeneration。余分・欠落は不正。
+    const keys = Reflect.ownKeys(data);
+    const legacy = !Object.hasOwn(data, 'accessGeneration');
+    const expected: readonly string[] = legacy ? GRANT_META_LEGACY_KEYS : GRANT_META_KEYS;
+    if (keys.length !== expected.length || !keys.every((key) => typeof key === 'string' && expected.includes(key))) return { kind: 'invalid' };
     const ownerId = ownValue(data, 'ownerId');
     const authTimeSec = ownValue(data, 'authTimeSec');
-    if (typeof ownerId !== 'string' || ownerId.length === 0 || typeof authTimeSec !== 'number') return { kind: 'invalid' };
-    if (!Object.hasOwn(data, 'accessGeneration')) return { kind: 'legacy' };
+    const createdAt = ownValue(data, 'createdAt');
+    // ownerは内部owner ID（小文字UUID）、認証時刻は正の安全な整数秒、作成時刻は正の安全な整数のepoch ms。
+    if (typeof ownerId !== 'string' || !OWNER_ID.test(ownerId)) return { kind: 'invalid' };
+    if (typeof authTimeSec !== 'number' || !Number.isSafeInteger(authTimeSec) || authTimeSec <= 0) return { kind: 'invalid' };
+    if (typeof createdAt !== 'number' || !Number.isSafeInteger(createdAt) || createdAt <= 0) return { kind: 'invalid' };
+    if (legacy) return { kind: 'legacy' };
     const generation = ownValue(data, 'accessGeneration');
     if (!isAccessGeneration(generation)) return { kind: 'invalid' };
     return { kind: 'bound', ownerId, generation };

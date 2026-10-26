@@ -786,6 +786,29 @@ test('W11 access: allowed unlocks; denied / unavailable / an old service without
   assert.equal(ui2.el('sttd-result').textContent, JA('console.error.access_denied'));
   assert.notEqual(JA('console.error.access_denied'), JA('console.error.403'));
   assert.equal(ui2.el('sttd-verify-send').disabled, true);
+  // 403 access_denied の後は、手動の接続確認でallowedを得るまで新しい送信を封鎖する（ボタンも直接handlerもPOST 0）。
+  h2.state.mode = 'deliver';
+  ui2.el('sttd-new').click();
+  await settle();
+  assert.deepEqual([ui2.el('sttd-send').disabled, ui2.el('sttd-text').disabled], [true, true]);
+  assert.ok(ui2.el('sttd-result').textContent.includes(JA('wizard.access.denied')));
+  const postsBefore = ui2.api().filter((entry) => entry.url === '/v2/commands').length;
+  ui2.el('sttd-text').value = 'must not be sent';
+  ui2.el('sttd-send').onclick();
+  await settle();
+  assert.equal(ui2.api().filter((entry) => entry.url === '/v2/commands').length, postsBefore, 'no POST until access is re-checked');
+  // 手動の再確認でallowedなら再開できる。
+  ui2.clickPanel(2);
+  ui2.el('sttd-refresh').click();
+  await settle();
+  assert.equal(ui2.el('sttd-state-guide').textContent, JA('wizard.next.subscribed'));
+  ui2.clickPanel(4);
+  assert.equal(ui2.el('sttd-send').disabled, false);
+  ui2.el('sttd-text').value = 'after re-check';
+  ui2.el('sttd-send').click();
+  await settle();
+  assert.equal(ui2.api().filter((entry) => entry.url === '/v2/commands').length, postsBefore + 1);
+  assert.equal(ui2.el('sttd-result').textContent, JA('console.state.delivered'));
   results.W11 = { fetches: ui.fetches.length };
 });
 

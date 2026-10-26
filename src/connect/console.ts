@@ -966,7 +966,12 @@ async function send() {
   if (state !== null) apply(current, state);
   else if (outcome.kind === 'not_sent') current.rejected = 'console.notSent';
   else if (outcome.kind === 'local') current.rejected = 'console.localRefused';
-  else if (outcome.kind === 'response' && outcome.status === 403 && errorCode(outcome.json) === 'access_denied') current.rejected = 'console.error.access_denied';
+  else if (outcome.kind === 'response' && outcome.status === 403 && errorCode(outcome.json) === 'access_denied') {
+    // 上流が利用許可の拒否を確定した: 手動の接続確認でallowedを得るまで新しい送信を封鎖する（照会・取消・解除は残す）。
+    current.rejected = 'console.error.access_denied';
+    access = 'denied';
+    guideKey = 'wizard.access.denied';
+  }
   else if (outcome.kind === 'response' && ERROR_STATUSES.includes(outcome.status)) current.rejected = 'console.error.' + outcome.status;
   render();
 }

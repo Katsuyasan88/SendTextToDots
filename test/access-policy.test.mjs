@@ -325,3 +325,42 @@ test('P6 connection display: allowed / denied / unavailable, never throws and ne
   assert.equal(await fx.storage.accessDisplay(fx.identity('uid-d')), 'unavailable');
   fx.db.control.failReads = false;
 });
+
+test('P7 Grant consent metadata shape: owner, positive integer auth time, epoch-ms creation time and generation are checked; malformed values are a temporary failure, only a well-formed record without a generation is a legacy refusal', () => {
+  const owner = randomUUID();
+  const generation = randomUUID();
+  const allowed = accessVerdictOf(true, { version: 1, state: 'active', generation, updatedAt: BASE });
+  const good = { ownerId: owner, authTimeSec: 1_900_000_000, createdAt: BASE, accessGeneration: generation };
+  const use = (meta) => grantUseVerdict(allowed, grantGenerationOf(true, meta), owner).kind;
+  assert.equal(use(good), 'allowed');
+  const { accessGeneration, ...legacy } = good;
+  assert.equal(accessGeneration, generation);
+  assert.deepEqual(grantGenerationOf(true, legacy), { kind: 'legacy' });
+  assert.equal(use(legacy), 'denied', 'a well-formed pre-migration record is refused, not a failure');
+  const malformed = {
+    authNaN: { authTimeSec: Number.NaN },
+    authInfinity: { authTimeSec: Number.POSITIVE_INFINITY },
+    authNegative: { authTimeSec: -1 },
+    authZero: { authTimeSec: 0 },
+    authFraction: { authTimeSec: 1.5 },
+    authString: { authTimeSec: '1900000000' },
+    createdNaN: { createdAt: Number.NaN },
+    createdZero: { createdAt: 0 },
+    createdFraction: { createdAt: 1.5 },
+    createdMissing: { createdAt: undefined },
+    ownerUpper: { ownerId: owner.toUpperCase() },
+    ownerText: { ownerId: 'owner-1' },
+    generationUpper: { accessGeneration: generation.toUpperCase() },
+    generationNull: { accessGeneration: null },
+    extraKey: { note: 'x' },
+  };
+  for (const [name, change] of Object.entries(malformed)) {
+    const meta = { ...good, ...change };
+    for (const key of Object.keys(change)) if (change[key] === undefined) delete meta[key];
+    assert.equal(use(meta), 'unavailable', name);
+    // 同じ異常値は世代なしの旧形式でもlegacyにせず一時障害。
+    const old = { ...meta };
+    delete old.accessGeneration;
+    if (name !== 'generationUpper' && name !== 'generationNull') assert.equal(grantGenerationOf(true, old).kind, 'invalid', `${name} (legacy shape)`);
+  }
+});
