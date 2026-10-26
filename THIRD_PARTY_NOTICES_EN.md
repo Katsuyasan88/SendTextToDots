@@ -136,7 +136,7 @@ The columns are package, version, license, kind (runtime / dev / optional) and t
 | balanced-match | 1.0.2 | MIT | runtime | lock |
 | base64-js | 1.5.1 | MIT | runtime | lock |
 | bignumber.js | 9.3.1 | MIT | runtime | lock |
-| body-parser | 2.3.0 | MIT | runtime | lock |
+| body-parser | 2.4.0 | MIT | runtime | lock |
 | brace-expansion | 2.1.7 | MIT | runtime | lock |
 | buffer-equal-constant-time | 1.0.1 | BSD-3-Clause | runtime | lock |
 | bytes | 3.1.2 | MIT | runtime | lock |
@@ -369,4 +369,4 @@ The columns are package, version, license, kind (runtime / dev / optional) and t
 | yargs | 17.7.3 | MIT | runtime | lock |
 | yargs-parser | 21.1.1 | ISC | runtime | lock |
 | yocto-queue | 0.1.0 | MIT | optional | lock |
-| zod | 4.6.5 | MIT | runtime | lock |
+| zod | 4.6.7 | MIT | runtime | lock |
