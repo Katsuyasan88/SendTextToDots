@@ -153,6 +153,10 @@ test('P2 serving: the page, script and style come from localhost only; language 
   }
   const post = await raw(server.port, { method: 'POST', path: '/console' });
   assert.deepEqual([post.status, code(post)], [405, 'method_not_allowed']);
+  // 手順2のプラグイン追加ガイドは、helperの検証済み設定のMCP originへ/mcpを付けた登録先だけを表示する（API originは載せない）。
+  assert.ok(page.body.includes(`<code id="sttd-plugin-url" class="sttd-plugin-url">${CONFIG.mcpOrigin}/mcp</code>`));
+  assert.equal(page.body.includes(CONFIG.apiOrigin), false, 'the API origin is not offered for registration');
+  assert.equal(page.body.includes(`${server.origin}/mcp`), false, 'the local page is not offered for registration');
   assert.equal(up.calls.length, 0, 'serving never calls upstream');
   results.P2 = { nonceLength: server.nonce.length };
 });

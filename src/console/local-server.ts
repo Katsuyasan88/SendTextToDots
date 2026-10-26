@@ -282,7 +282,7 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
       const query = url.searchParams.get(LANGUAGE_QUERY);
       const language = selectLanguage({ query, cookie: req.headers.cookie, acceptLanguage: req.headers['accept-language'] });
       const extra: Record<string, string> = path === CONSOLE_PATH && isLanguage(query) ? { 'Set-Cookie': languageCookie(language, false) } : {};
-      const asset = consoleAsset(path, web, { language, nonce, secure: false })!;
+      const asset = consoleAsset(path, web, { language, nonce, secure: false, mcpOrigin: config.mcpOrigin })!;
       log({ event: 'local.asset', route: path });
       return send(res, 200, asset.type, asset.body, { ...asset.headers, ...extra });
     }

@@ -3,7 +3,8 @@
 //     ログイン操作で初めてimport()し、復元済みsessionの確認・ID token取得・接続状態の確認もその後にだけ行う。popupは明示操作だけ。
 //   - 認証後の操作（接続確認・解除・送信・中止・同ID確認）は同origin（localhost helper）の限定pathへ、Authorization: Bearer と起動ごとのlocal nonce
 //     （X-Sttd-Local-Nonce）を付けて送る。helperが固定のMCP/API originへ中継する。本文はRAM/DOMだけ、保存0。
-//   - 5段階wizard: 1 ログイン → 2 接続確認（手動1回） → 3 テスト用Dotsプロンプト（コピー＋本人の「貼り付けて次へ」） → 4 送信（単回POST・同ID・取消。
+//   - 5段階wizard: 1 ログイン → 2 接続確認（手動1回。プラグイン追加・OAuth接続の展開ガイドと、helperの検証済みMCP originから作る登録先URLを
+//     表示するだけで通信しない） → 3 テスト用Dotsプロンプト（コピー＋本人の「貼り付けて次へ」） → 4 送信（単回POST・同ID・取消。
 //     本人の「Dotsで本文一致を確認して次へ」） → 5 運用用Dotsプロンプト（コピー＋「貼り付けて完了」）。初期は1だけ有効。完了済みの前stepは薄く
 //     表示して再選択でき、再表示だけでは証跡を消さない。再ログイン開始時は2以降、受信を確認できない時は3以降、テスト設定の再適用は4/5を戻す。
 //     未解放のstepはクリックしても進めず通信しない。古いasync結果（世代が違うログイン/確認）で後続を解放しない。完了後は4で通常送信を繰り返せる。
@@ -36,6 +37,14 @@ export const CONSOLE_STYLE_PATH = '/console/app.css';
 export const CONSOLE_SDK_BASE = `https://www.gstatic.com/firebasejs/${FIREBASE_WEB_SDK_VERSION}/`;
 /** helperへの中継要求に必須のlocal nonce header（起動ごとの乱数。Cloudへは転送しない）。 */
 export const LOCAL_NONCE_HEADER = 'X-Sttd-Local-Nonce';
+/** 手順2の登録先に使うMCP origin（`https://<DNS名>`だけ。path・port・query・IP・単一label（localhost等）なし）。helperの検証（http/origin.ts）を通る値は全て受ける。 */
+const MCP_ORIGIN = /^https:\/\/(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?=[a-z0-9-]*[a-z])[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/** 手順2のプラグイン追加ガイドから開く公式手順（利用者が明示的に開く普通のリンク。preview・自動遷移なし）。 */
+export const PLUGIN_GUIDE_LINKS = Object.freeze({
+  connect: 'https://developers.openai.com/plugins/deploy/connect-chatgpt',
+  customMcp: 'https://developers.openai.com/api/docs/guides/custom-mcp-server',
+});
 /**
  * helperが上流を呼ぶ前に自分で拒否した応答にだけ付ける固定header（値は`1`）。helperは上流応答のこの名前のheaderを転送しないので、
  * 画面はこれがある時だけ「未送信（helperの拒否）」と扱う（上流の同名codeでは未送信にしない）。
@@ -74,6 +83,11 @@ export interface ConsolePageOptions {
   readonly nonce: string;
   /** 画面がhttpsで配信されるか（表示言語cookieのSecure属性）。localhostのhttpではfalse。 */
   readonly secure: boolean;
+  /**
+   * helperの検証済み設定のMCP origin（`https://<host>`）。手順2のガイドに登録先`<mcpOrigin>/mcp`として表示する。
+   * 未指定ならURLを推定・表示せず、配置のMCP originへ/mcpを付ける案内だけを出す。形が違えばConsoleConfigError。
+   */
+  readonly mcpOrigin?: string | undefined;
 }
 
 /**
@@ -103,6 +117,8 @@ export function consoleSecurityHeaders(web: FirebaseWebConfig): Record<string, s
 export function renderConsolePage(web: FirebaseWebConfig, options: ConsolePageOptions): string {
   checkWeb(web);
   const nonce = checkLocalNonce(options?.nonce);
+  const mcpOrigin = options.mcpOrigin;
+  if (mcpOrigin !== undefined && (typeof mcpOrigin !== 'string' || mcpOrigin.length > 261 || !MCP_ORIGIN.test(mcpOrigin))) throw new ConsoleConfigError();
   const lang: Language = isLanguage(options.language) ? options.language : DEFAULT_LANGUAGE;
   const t = (key: MessageKey) => escapeHtml(text(lang, key));
   const i18n = (key: MessageKey) => ` data-sttd-i18n="${key}"`;
@@ -163,6 +179,29 @@ ${stepHead(5, 'wizard.step5')}
 <section id="sttd-panel-2" class="sttd-panel" aria-labelledby="sttd-panel-2-title" data-sttd-state="locked" tabindex="0">
 <h2 id="sttd-panel-2-title" class="sttd-panel-title"${i18n('wizard.step2')}>${t('wizard.step2')}</h2>
 <p id="sttd-state-intro"${i18n('wizard.stateIntro')}>${t('wizard.stateIntro')}</p>
+<p id="sttd-plugin-intro"${i18n('plugin.intro')}>${t('plugin.intro')}</p>
+<details id="sttd-plugin-guide" class="sttd-instructions-details">
+<summary id="sttd-plugin-summary"${i18n('plugin.title')}>${t('plugin.title')}</summary>
+${
+  mcpOrigin === undefined
+    ? `<p id="sttd-plugin-url-missing"${i18n('plugin.urlMissing')}>${t('plugin.urlMissing')}</p>`
+    : `<p id="sttd-plugin-url-label"${i18n('plugin.urlLabel')}>${t('plugin.urlLabel')}</p>
+<p><code id="sttd-plugin-url" class="sttd-plugin-url">${escapeHtml(`${mcpOrigin}/mcp`)}</code></p>`
+}
+<p id="sttd-plugin-url-note"${i18n('plugin.urlNote')}>${t('plugin.urlNote')}</p>
+<ol id="sttd-plugin-steps">
+<li id="sttd-plugin-step-1"${i18n('plugin.step1')}>${t('plugin.step1')}</li>
+<li id="sttd-plugin-step-2"${i18n('plugin.step2')}>${t('plugin.step2')}</li>
+<li id="sttd-plugin-step-3"${i18n('plugin.step3')}>${t('plugin.step3')}</li>
+<li id="sttd-plugin-step-4"${i18n('plugin.step4')}>${t('plugin.step4')}</li>
+<li id="sttd-plugin-step-5"${i18n('plugin.step5')}>${t('plugin.step5')}</li>
+</ol>
+<p id="sttd-plugin-labels"${i18n('plugin.labels')}>${t('plugin.labels')}</p>
+<ul>
+<li><a id="sttd-plugin-doc-connect" href="${PLUGIN_GUIDE_LINKS.connect}" target="_blank" rel="noopener noreferrer"${i18n('plugin.docConnect')}>${t('plugin.docConnect')}</a></li>
+<li><a id="sttd-plugin-doc-custom" href="${PLUGIN_GUIDE_LINKS.customMcp}" target="_blank" rel="noopener noreferrer"${i18n('plugin.docCustom')}>${t('plugin.docCustom')}</a></li>
+</ul>
+</details>
 <p id="sttd-state-text" role="status"></p>
 <p id="sttd-state-guide"></p>
 <div class="sttd-actions">
@@ -238,6 +277,7 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-instructions-details summary { cursor: pointer; font-weight: 600; min-height: 44px; display: flex; align-items: center; }
 .sttd-instructions { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; background: #f5f6f8; border: 1px solid #d9dce1; border-radius: 6px; padding: 0.75rem; margin: 0; }
 .sttd-actions { display: flex; flex-wrap: wrap; }
+.sttd-plugin-url { overflow-wrap: anywhere; background: #f5f6f8; border: 1px solid #d9dce1; border-radius: 4px; padding: 0.1rem 0.3rem; }
 #sttd-result, #sttd-disconnect-result, #sttd-wizard-note { font-weight: 600; min-height: 1.5em; overflow-wrap: anywhere; }
 .sttd-note { font-size: 0.85rem; color: #4a5059; }
 .sttd-panel[data-sttd-state="locked"] { opacity: 0.55; background: #eceef1; }

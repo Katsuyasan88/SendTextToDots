@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
-import { consoleAsset, LOCAL_NONCE_HEADER, LOCAL_REFUSAL_HEADER } from '../dist/connect/console.js';
+import { consoleAsset, LOCAL_NONCE_HEADER, LOCAL_REFUSAL_HEADER, PLUGIN_GUIDE_LINKS } from '../dist/connect/console.js';
 import { MESSAGES } from '../dist/connect/i18n.js';
 import { loadDeploymentConfig } from '../dist/config/validate.js';
 import { gate, runConsole, settle, syntheticSdk } from './fixtures/console-browser.mjs';
@@ -958,4 +958,63 @@ test('W14 cancel / check / new message also require the active step 4: direct ha
   assert.equal(el('sttd-result').textContent, EN('console.state.delivered'));
   assert.equal(ui.fetches.length, fetches + 1);
   results.W14 = { fetches: ui.fetches.length };
+});
+
+test('W15 step 2 plugin guide: a short intro is visible from the start; the expandable steps show this deployment\'s <mcpOrigin>/mcp (escaped, following the helper origin) or, without an origin, no invented URL; opening, links and language switches send nothing; a locked or inactive step 2 keeps the guide closed; an existing connection can still read it', { timeout: 20_000 }, async () => {
+  const MCP = 'https://mcp-guide.example.org';
+  const page = (language, mcpOrigin) => consoleAsset('/console', WEB, { language, nonce: NONCE, secure: false, ...(mcpOrigin === undefined ? {} : { mcpOrigin }) }).body;
+  // 登録先URLはhelperの検証済みoriginへ追従し、HTMLへescapeして埋め込む。localhost・API・query・不正な形は受けない。
+  for (const origin of [MCP, 'https://other-mcp.example.net']) {
+    const body = page('en', origin);
+    assert.ok(body.includes(`<code id="sttd-plugin-url" class="sttd-plugin-url">${origin}/mcp</code>`), origin);
+    assert.equal(body.includes('sttd-plugin-url-missing'), false);
+  }
+  for (const bad of ['http://mcp-guide.example.org', 'https://localhost', 'https://mcp-guide.example.org/mcp', 'https://mcp-guide.example.org?x=1', 'https://a"><script>x</script>.example.org', 'javascript:alert(1)', '']) {
+    assert.throws(() => page('en', bad), (error) => error.name === 'ConsoleConfigError', bad);
+  }
+  const missing = page('ja', undefined);
+  assert.equal(missing.includes('id="sttd-plugin-url"'), false, 'no URL is invented without an origin');
+  assert.ok(missing.includes(JA('plugin.urlMissing')));
+
+  const sdk = syntheticSdk();
+  const { state, onFetch } = helper('unlinked');
+  const ui = await runConsole({ html: page('en', MCP), onFetch, sdk });
+  const { el } = ui;
+  // 初期表示: 導入文と閉じたガイドが手順2の中にあり、通信0。手順2は未解放なのでsummaryをclickしても開かない。
+  assert.equal(el('sttd-plugin-intro').textContent, EN('plugin.intro'));
+  assert.equal(el('sttd-plugin-guide').parent.id, 'sttd-panel-2');
+  assert.equal(el('sttd-plugin-guide').open, false);
+  el('sttd-plugin-summary').click();
+  assert.equal(el('sttd-plugin-doc-connect').click(), true, 'a link in a locked panel does not navigate');
+  assert.equal(el('sttd-plugin-guide').open, false, 'a locked step keeps the guide closed');
+  assert.equal(el('sttd-plugin-url').textContent, `${MCP}/mcp`);
+  assert.equal(el('sttd-plugin-url-note').textContent, EN('plugin.urlNote'));
+  for (const n of [1, 2, 3, 4, 5]) assert.equal(el(`sttd-plugin-step-${n}`).textContent, EN(`plugin.step${n}`));
+  assert.deepEqual([el('sttd-plugin-doc-connect').getAttribute('href'), el('sttd-plugin-doc-custom').getAttribute('href')], [PLUGIN_GUIDE_LINKS.connect, PLUGIN_GUIDE_LINKS.customMcp]);
+  assert.deepEqual([el('sttd-plugin-doc-connect').getAttribute('target'), el('sttd-plugin-doc-connect').getAttribute('rel')], ['_blank', 'noopener noreferrer']);
+  // ログインで手順2が有効になると、展開して読める。展開・公式リンク・言語切替は通信も認証も起こさない。
+  el('sttd-login').click();
+  await settle();
+  assert.equal(ui.stepState(2), 'current');
+  const fetches = ui.fetches.length;
+  const tokens = sdk.calls.tokens;
+  el('sttd-plugin-summary').click();
+  assert.equal(el('sttd-plugin-guide').open, true);
+  assert.equal(el('sttd-plugin-doc-custom').click(), false, 'an ordinary link (opened by the user, not prevented)');
+  el('sttd-lang-ja').click();
+  await settle();
+  assert.deepEqual([el('sttd-plugin-summary').textContent, el('sttd-plugin-step-4').textContent, el('sttd-plugin-labels').textContent], [JA('plugin.title'), JA('plugin.step4'), JA('plugin.labels')]);
+  assert.equal(el('sttd-plugin-url').textContent, `${MCP}/mcp`, 'the URL is not translated');
+  assert.equal(el('sttd-plugin-guide').open, true, 'switching the language keeps the guide open');
+  assert.deepEqual([ui.fetches.length, sdk.calls.tokens], [fetches, tokens], 'no request and no token for the guide');
+  // 接続済み（受信中）で手順3へ進んだ後も、手順2を選び直せばガイドを見直せる（再登録は求めない）。
+  state.connection = 'subscribed';
+  el('sttd-refresh').click();
+  await settle();
+  assert.equal(ui.stepState(3), 'current');
+  assert.equal(ui.clickPanel(2), true);
+  assert.equal(ui.stepState(2), 'current');
+  assert.equal(el('sttd-plugin-guide').open, true);
+  assert.equal(ui.web('/v1/web/connection').length, 1, 'only the explicit check reached the helper');
+  results.W15 = { fetches: ui.fetches.length };
 });
