@@ -124,7 +124,18 @@ test('R1 current dist: for every compiled JS the lexer finds exactly the static 
   assert.deepEqual(mismatched, []);
   const pages = moduleSpecifiers(fs.readFileSync(join(DIST, 'connect', 'pages.js'), 'utf8'));
   const consoleJs = moduleSpecifiers(fs.readFileSync(join(DIST, 'connect', 'console.js'), 'utf8'));
-  for (const found of [pages, consoleJs]) assert.equal(found.imports.some((item) => item.includes('firebase') || item.includes('http')), false, 'browser script imports are not server dependencies');
+  // 画面を描くmoduleのimportは、dist内に実在する相対pathのserver側pure moduleだけ。bare（node:組込みのhttp/https/net等を含む）・URL・
+  // Firebase browser module（scriptの文字列の中のimport()）は依存にしない。部分一致ではなく、specifierの形と解決先で確かめる。
+  for (const [name, found] of [['pages', pages], ['console', consoleJs]]) {
+    for (const item of found.imports) {
+      assert.ok(/^\.\.?\//.test(item), `${name}: only relative server modules (${item})`);
+      assert.equal(/^[a-z][a-z0-9+.-]*:|\/\/|firebase/i.test(item), false, `${name}: no URL/scheme/Firebase specifier (${item})`);
+      const target = join(DIST, 'connect', item);
+      assert.ok(target.startsWith(DIST) && fs.existsSync(target), `${name}: resolves inside dist (${item})`);
+    }
+    assert.equal(found.cjs.length, 0, `${name}: no requireCjs`);
+  }
+  assert.ok(consoleJs.imports.includes('../http/origin.js'), 'the pure origin helper is an ordinary server-side relative import of the renderer');
   assert.ok(fs.readFileSync(join(DIST, 'connect', 'pages.js'), 'utf8').includes('firebase-auth.js'), 'the browser script text is present in the compiled file');
 });
 

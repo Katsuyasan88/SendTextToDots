@@ -964,13 +964,26 @@ test('W15 step 2 plugin guide: a short intro is visible from the start; the expa
   const MCP = 'https://mcp-guide.example.org';
   const page = (language, mcpOrigin) => consoleAsset('/console', WEB, { language, nonce: NONCE, secure: false, ...(mcpOrigin === undefined ? {} : { mcpOrigin }) }).body;
   // 登録先URLはhelperの検証済みoriginへ追従し、HTMLへescapeして埋め込む。localhost・API・query・不正な形は受けない。
-  for (const origin of [MCP, 'https://other-mcp.example.net']) {
+  for (const origin of [MCP, 'https://other-mcp.example.net', 'https://a.1-2']) {
     const body = page('en', origin);
     assert.ok(body.includes(`<code id="sttd-plugin-url" class="sttd-plugin-url">${origin}/mcp</code>`), origin);
     assert.equal(body.includes('sttd-plugin-url-missing'), false);
   }
-  for (const bad of ['http://mcp-guide.example.org', 'https://localhost', 'https://mcp-guide.example.org/mcp', 'https://mcp-guide.example.org?x=1', 'https://a"><script>x</script>.example.org', 'javascript:alert(1)', '']) {
+  for (const bad of ['http://mcp-guide.example.org', 'https://localhost', 'https://a.localhost', 'https://1.2.3.4', 'https://mcp-guide.example.org/mcp', 'https://mcp-guide.example.org?x=1', 'https://a"><script>x</script>.example.org', 'javascript:alert(1)', '']) {
     assert.throws(() => page('en', bad), (error) => error.name === 'ConsoleConfigError', bad);
+  }
+  // rendererは配置設定・helperと同じ既存の判定（http/origin.js）をそのまま使う（判定が食い違わない）。
+  const { isDevelopmentPublicOrigin } = await import('../dist/http/origin.js');
+  const accepted = (origin) => {
+    try {
+      page('en', origin);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for (const origin of [MCP, 'https://a.1-2', 'https://a.localhost', 'https://localhost', 'https://1.2.3.4', 'https://x.example.org:8443', 'https://X.example.org']) {
+    assert.equal(accepted(origin), isDevelopmentPublicOrigin(origin), origin);
   }
   const missing = page('ja', undefined);
   assert.equal(missing.includes('id="sttd-plugin-url"'), false, 'no URL is invented without an origin');

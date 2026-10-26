@@ -28,6 +28,7 @@ import {
   type Language,
   type MessageKey,
 } from './i18n.js';
+import { isDevelopmentPublicOrigin } from '../http/origin.js';
 import { FIREBASE_POPUP_SCRIPT_ORIGIN, FIREBASE_WEB_SDK_VERSION, type FirebaseWebConfig } from './pages.js';
 
 export const CONSOLE_PATH = '/console';
@@ -37,9 +38,6 @@ export const CONSOLE_STYLE_PATH = '/console/app.css';
 export const CONSOLE_SDK_BASE = `https://www.gstatic.com/firebasejs/${FIREBASE_WEB_SDK_VERSION}/`;
 /** helperへの中継要求に必須のlocal nonce header（起動ごとの乱数。Cloudへは転送しない）。 */
 export const LOCAL_NONCE_HEADER = 'X-Sttd-Local-Nonce';
-/** 手順2の登録先に使うMCP origin（`https://<DNS名>`だけ。path・port・query・IP・単一label（localhost等）なし）。helperの検証（http/origin.ts）を通る値は全て受ける。 */
-const MCP_ORIGIN = /^https:\/\/(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?=[a-z0-9-]*[a-z])[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-
 /** 手順2のプラグイン追加ガイドから開く公式手順（利用者が明示的に開く普通のリンク。preview・自動遷移なし）。 */
 export const PLUGIN_GUIDE_LINKS = Object.freeze({
   connect: 'https://developers.openai.com/plugins/deploy/connect-chatgpt',
@@ -118,7 +116,8 @@ export function renderConsolePage(web: FirebaseWebConfig, options: ConsolePageOp
   checkWeb(web);
   const nonce = checkLocalNonce(options?.nonce);
   const mcpOrigin = options.mcpOrigin;
-  if (mcpOrigin !== undefined && (typeof mcpOrigin !== 'string' || mcpOrigin.length > 261 || !MCP_ORIGIN.test(mcpOrigin))) throw new ConsoleConfigError();
+  // 配置設定・helperと同じ既存の判定（http/origin.ts）だけを使い、別の規則を持たない。
+  if (mcpOrigin !== undefined && !isDevelopmentPublicOrigin(mcpOrigin)) throw new ConsoleConfigError();
   const lang: Language = isLanguage(options.language) ? options.language : DEFAULT_LANGUAGE;
   const t = (key: MessageKey) => escapeHtml(text(lang, key));
   const i18n = (key: MessageKey) => ` data-sttd-i18n="${key}"`;
