@@ -69,6 +69,15 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 
 Firebase ID tokenの寿命は約1時間です。Firebase clientの認証sessionを使う入力元はSDKで有効なtokenを取得でき、通常は毎時間Appleへ手動で再ログインする必要はありません。API例自体は渡されたtokenを使うだけで、ログインや更新は行いません。[sessionと自動送信の範囲](docs/API.md#firebase-sessions)を参照してください。
 
+## 今後の予定
+
+今後の開発では、次の対応を検討しています。
+
+- **Googleログイン**：Appleに加えるログイン手段。
+- **開発者向けの一度限りのログインコード**：Appleログインの代わりに使う一時コード。有効期間・発行方法・既存アカウントとの紐付けなどは未定です。
+
+これらはまだ利用できません。方式・対応順・提供時期は未定で、計画は変更される場合があります。現在の本人確認はFirebaseのApple providerだけに対応し、利用には運営者による明示登録も必要です。[現在の認証とsessionの制約](docs/API.md#firebase-sessions)を確認してください。
+
 ## 互換性
 
 0.3.0は新規導入専用で、自動移行はありません。API・Eventsは0.2.0と非互換、0.2.0より前とは保存形式・OAuth scope・封緘形式も異なります。配置前に[互換性の詳細](docs/INSTALL.md#030の互換性)を確認してください。

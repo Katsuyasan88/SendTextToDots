@@ -69,6 +69,15 @@ Use the [one-message Node.js example and API contract](docs/API_EN.md#direct-cli
 
 Firebase ID tokens last about an hour. A sender that uses a Firebase client session should obtain a current token through the SDK; it does not normally require a manual Apple sign-in every hour. The API example consumes a supplied token and does not manage sign-in or refresh. See [sessions and automation limits](docs/API_EN.md#firebase-sessions).
 
+## Roadmap
+
+Planned areas of development include:
+
+- **Google sign-in:** another sign-in option alongside Apple.
+- **One-time login codes for developers:** an alternative to Apple sign-in. The expiry, issuance process and link to an existing account are still to be decided.
+
+These features are not available yet. The design, order and release dates are not fixed, and plans may change. Authentication currently supports only the Firebase Apple provider; using the service also requires explicit registration by the operator. See the [current authentication and session limits](docs/API_EN.md#firebase-sessions).
+
 ## Compatibility
 
 Version 0.3.0 is for new installations only; there is no automatic migration. The API and Events contract is incompatible with 0.2.0, and versions before 0.2.0 also use different storage, OAuth scopes, and sealing formats. See [compatibility details](docs/INSTALL_EN.md#compatibility-of-030) before deployment.
