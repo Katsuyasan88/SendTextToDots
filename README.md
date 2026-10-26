@@ -94,7 +94,7 @@ Version 0.3.0 is for new installations only; there is no automatic migration. Th
 
 ## Security
 
-Read the [security policy and reporting channel status](SECURITY.md) and [technical security design](docs/SECURITY_EN.md). The private reporting channel still requires activation and verification at publication. Do not put vulnerability details, tokens, secrets or real user data in public issues.
+Read the [security policy and reporting channel status](SECURITY.md) and [technical security design](docs/SECURITY_EN.md). Report vulnerabilities privately through the reporting channel described in the security policy. Do not put vulnerability details, tokens, secrets or real user data in public issues.
 
 ## Directory layout
 
