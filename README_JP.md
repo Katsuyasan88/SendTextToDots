@@ -78,6 +78,7 @@ Firebase ID tokenの寿命は約1時間です。Firebase clientの認証session�
 - 2026-10-25、作者の環境で実Dotsへの2件の配送（直接APIと`/console`、日本語・改行を含む）と、同じ開発環境の再起動後の単純な計算指示1件を確認しました。限定した確認であり、任意指示の実行保証ではありません。
 - 追加の本人提供資料で、MacでGitHubのcommit `ad276fccc504bc367df209edb694809570496c3e` を取得し、配置設定だけを変更してbuildに成功、`/console`からの1件が実Dotsに入力どおり届いた実績を記録しています。Macの自動試験は108/112成功で、4件は`127.0.0.2`へのlisten時の`EADDRNOTAVAIL`で失敗。同じsourceのLinux Cloud Buildでは合成試験112/112成功との報告です。第三者独立検証や長期の本番運用受入とは区別します。環境と残る制約は[LIMITATIONS](docs/LIMITATIONS.md)を参照してください。
 - 本番の信頼性・負荷・費用・同UIDの複数入口・1件ごとの即時処理は保証しません。受信側でまとめて処理される場合があります。Events草案の変更も互換性に影響し得ます。
+- 使えるのは運営者が管理CLIで明示登録した利用者だけです（自分も含む）。停止・再登録の後は以前のGrant・購読で新しい送信・購読ができず、OAuthの同意と購読のやり直しが必要です。状態の照会・取消・接続解除は停止中も使えます（[CONFIGURATION](docs/CONFIGURATION.md#access-admin)）。
 - 本人確認はFirebaseのApple providerだけです。認証省略や任意endpoint・資格・emulator・HTTP経由の設定overrideはありません。
 - 本serviceは本文を永続保存しません。期限切れの保存metadataは利用不可になりますが、物理削除とaccount全削除は未実装です。受信後の保持・処理は受信サービスの条件に従います。RAM・SDK・OS内の物理消去も保証しません。
 - MITが許諾するのは本sourceで、外部サービスやSDKの利用権を再許諾しません。[SECURITY](docs/SECURITY.md)と[LIMITATIONS](docs/LIMITATIONS.md)を参照してください。
@@ -95,10 +96,11 @@ Firebase ID tokenの寿命は約1時間です。Firebase clientの認証session�
 | `src/deployment/` | Functions entry・Cloud Run entry・CORS |
 | `src/google-runtime/` | Google SDKの所有起動（Cloud実行環境gate・危険な環境変数の拒否） |
 | `src/delivery/`・`src/commands/` | 送信APIの入力検証・単回配送・中止・状態 |
+| `src/access/` | 利用許可（運営者の明示登録）の判定・保存形式と管理CLIの本体 |
 | `src/connect/`・`src/oauth/`・`src/mcp/`・`src/events/` | 送信画面・OAuth interaction画面（英日辞書は`i18n.ts`）・OAuth・MCP Events・購読・署名 |
 | `src/storage/`・`src/protection/`・`src/keys/` | Firestore保存形式・KMS封緘・Secret読取り |
 | `src/egress/` | 安全なHTTPS送出（IP検証・固定接続・TLS・期限・上限） |
-| `scripts/` | offline包装（`package-artifacts.mjs`）・試験runner |
+| `scripts/` | offline包装（`package-artifacts.mjs`）・利用許可の管理CLI（`manage-access.mjs`）・試験runner |
 | `test/` | 自動試験（合成値だけ） |
 | `references/` | 宛先IP分類の根拠にしたIANA表（CC0 1.0）。[references/README.md](references/README.md) |
 | `firestore/` | 全拒否のFirestore rulesと索引除外 |

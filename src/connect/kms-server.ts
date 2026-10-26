@@ -1,5 +1,6 @@
-// MCP/OAuthのKMS接続server。startDevelopmentKmsConnectServerが、接続状態/解除API（/v1/web/*。ローカル送信画面のhelperが中継する）・provider interaction（＋その固定script）
-// （login/consent/deny）・/console（固定API originの操作画面）・MCP・protected resource metadata・OAuth/.well-knownを、要求ごとのcontext・
+// MCP/OAuthのKMS接続server。startDevelopmentKmsConnectServerが、接続状態/解除API（/v1/web/connection・/v1/web/disconnect。ローカル送信画面の
+// helperがBearer tokenつきで中継する）・OAuth provider interaction（login/consent/denyと固定script /interaction/app.js）・MCP（/mcp）・
+// protected resource metadata・OAuth/.well-knownを配信する（送信画面/consoleと旧接続画面/connectは配信せず、未知pathと同じ404）。要求ごとのcontext・
 // KMS port・AS resolver・MCP入口・購読登録runtime・購読viewの上で内部に組み立て、固定のhttps publicOrigin（issuer）で0.0.0.0の指定portに
 // 待ち受ける。OAuth profileはconnect-kms-development。任意のresolver・store・proof・validatorの注入口は無い。
 // db・identity・KMS transport・secret source・clientEgress・verificationSender・clockは借用で、成功・失敗・closeのどれでもterminate/close/dispose0。

@@ -1,4 +1,6 @@
-// Functions入口（command v2の3 route）の固定originだけのCORS。/consoleを配信するMCP origin（配置設定のconnect.publicOrigin）のbrowserからの直接要求だけを許す。
+// Functions入口（command v2の3 route）の固定originだけのCORS。許可するOriginは配置設定のMCP origin（connect.publicOrigin）1つだけで、そのoriginの
+// browserからの直接要求を照合する。現在の送信画面は利用者のパソコンのローカルhelper（src/console/local-server.ts）が配信・中継し、helperからの
+// 要求はOriginを付けないため、このCORSを使わない（localhostを許可originへ足さず、許可範囲を広げない）。Cloud Runは/consoleを配信しない。
 //   - Originが無い要求（native client）はCORS headerを足さない。
 //   - Originが設定のMCP originと完全一致し、1つだけの時だけ許可。異なる・重複・route外は固定403（wildcard・任意origin・credential cookie許可0）。
 //   - OPTIONSはroute・Access-Control-Request-Method・Access-Control-Request-Headers（authorization・content-type・idempotency-keyだけ）を
@@ -9,7 +11,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import { loadDeploymentConfig } from '../config/validate.js';
 
-/** 許可する唯一のOrigin（/consoleを配信する設定のMCP origin）。配置設定が不正なら固定のDeploymentConfigError。 */
+/** 許可する唯一のOrigin（配置設定のMCP origin。送信画面の配信元ではない）。配置設定が不正なら固定のDeploymentConfigError。 */
 export function consoleAllowedOrigin(): string {
   return loadDeploymentConfig().connect.publicOrigin;
 }

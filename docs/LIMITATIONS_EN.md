@@ -34,11 +34,14 @@ These are the author's installation and usage results on another device, not ind
 | Changing the subscribing client | The OAuth client is fixed to the single ChatGPT CIMD in `src/oauth/cimd.ts`. Other clients are unverified |
 | Build/test on macOS and Linux | In the author's material above, the Mac build succeeded with 108 passed / 4 failed tests, and Linux Cloud Build passed 112/112. The portability of the Mac loopback tests is unresolved. The Windows verified versions are Windows 11, Node 22.23.4, npm 10.9.9 and TypeScript 7.0.2. This is not a guarantee for every OS or version |
 | Display language | The English/Japanese pages and the language cookie are verified only by synthetic tests. Real browser behaviour and other languages are unverified; languages other than English and Japanese fall back to English |
+| Access permission (explicit registration) | The checks, refusals of consent/subscription/sends and the admin CLI's expected versions, deadlines and cleanup are verified only with synthetic SDKs and databases. Running the admin CLI for real (the operator's ADC, real Firestore and Secret Manager), real IAM permissions and the re-consent/re-subscription flow when updating an existing deployment are unverified |
+| Plugin guide in step 2 | That showing, expanding and switching the language send nothing is verified only with a synthetic DOM. The field names and availability of the ChatGPT Plugins screen (which depend on the account/workspace) and actually adding the server and connecting through OAuth are unverified |
 | Local send screen | The helper, the 5-step setup and the relay are verified only with synthetic SDK/DOM/fetch and loopback. Real browser sign-in, clipboard, Apple popup, and relaying to a real deployment are unverified. The author's earlier real deliveries were made with the former Cloud Run `/console`, which is no longer part of the current source (whether a given deployment still serves it depends on when it was deployed) |
 
 ## Not included
 
-- The iPhone/Apple Watch app (the source client). Direction controls, preset instruction mappings and text generation are features of the source and are not part of this source.
+- The source apps or scripts (for example an iPhone/Apple Watch app). Direction controls, preset instruction mappings and text generation are features of the source and are not part of this source.
+- Automatic user registration, a web screen for managing access, and checks of purchases or billing. Access is changed only with the explicitly run admin CLI (`scripts/manage-access.mjs`).
 - Tools to create, deploy or stop Cloud resources. Packaging (`npm run package`) only creates archives offline.
 - A tool to create the KMS subscription marker (installers create it in the format of [INSTALL_EN.md](INSTALL_EN.md)).
 - Verification of paid purchases or quotas. Self-hosting users and costs are managed by the installer.

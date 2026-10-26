@@ -78,6 +78,7 @@ Version 0.3.0 is for new installations only; there is no automatic migration. Th
 - The author verified two real Dots deliveries on 2026-10-25 (direct API and `/console`, including Japanese and line breaks), and one simple calculation instruction after restarting the same development environment. These are limited observations, not a guarantee of arbitrary instruction execution.
 - A subsequent author-supplied report records setup from GitHub commit `ad276fccc504bc367df209edb694809570496c3e` on a Mac, with deployment configuration changes only, successful builds, and one matching real Dots delivery from `/console`. Mac tests passed 108/112; four failed when binding to `127.0.0.2` (`EADDRNOTAVAIL`). The same source passed 112/112 synthetic tests in Linux Cloud Build. These are author reports, not independent third-party verification or acceptance of long-term production operation. See [LIMITATIONS](docs/LIMITATIONS_EN.md) for environments and remaining limits.
 - Production reliability, load, cost, multiple entry points sharing one UID, and immediate processing of each message are not guaranteed. The receiver may batch messages. Draft Events changes may affect compatibility.
+- Only users the operator has explicitly registered with the admin CLI can use the service, including yourself. After a stop or re-registration, earlier Grants and subscriptions can no longer be used for new sends or subscriptions; consent through OAuth and subscribe again. Status lookups, cancellation and disconnecting keep working while stopped ([CONFIGURATION](docs/CONFIGURATION_EN.md#access-admin)).
 - Authentication supports only Firebase's Apple provider. There is no authentication bypass or arbitrary endpoint, credential, emulator, or HTTP configuration override.
 - Message text is not persisted by this service. Expired stored metadata is made unusable, but physical deletion and full account deletion are not implemented. Receiver retention and processing follow that service's terms. Physical erasure from RAM, SDKs, and the OS is not guaranteed.
 - MIT licenses this source; it does not sublicense external services or SDKs. See [SECURITY](docs/SECURITY_EN.md) and [LIMITATIONS](docs/LIMITATIONS_EN.md).
@@ -95,10 +96,11 @@ Read the [security policy and reporting channel status](SECURITY.md) and [techni
 | `src/deployment/` | Functions entry, Cloud Run entry, and CORS |
 | `src/google-runtime/` | Owned Google SDK initialization, Cloud runtime gate, and rejection of unsafe environment variables |
 | `src/delivery/`, `src/commands/` | Send API validation, single delivery attempt, cancellation, and status |
+| `src/access/` | Access permission (explicit registration by the operator): checks, storage format and the admin CLI core |
 | `src/connect/`, `src/oauth/`, `src/mcp/`, `src/events/` | Send screen and OAuth interaction pages (English/Japanese dictionary in `i18n.ts`), OAuth, MCP Events, subscriptions, and signatures |
 | `src/storage/`, `src/protection/`, `src/keys/` | Firestore storage formats, KMS sealing, and secret reads |
 | `src/egress/` | Safe outbound HTTPS with IP validation, pinned connections, TLS, deadlines, and limits |
-| `scripts/` | Offline packaging (`package-artifacts.mjs`) and test runner |
+| `scripts/` | Offline packaging (`package-artifacts.mjs`), the access admin CLI (`manage-access.mjs`) and test runner |
 | `test/` | Automated tests using synthetic values only |
 | `references/` | IANA tables used for destination IP classification (CC0 1.0); see [references/README_EN.md](references/README_EN.md) |
 | `firestore/` | Deny-all Firestore rules and index exemptions |
