@@ -67,4 +67,4 @@ Callback verification, delivery and CIMD retrieval share the same egress compone
 
 ## Reporting vulnerabilities
 
-The way to report security issues for the public repository will be defined at publication. Until then, do not write secrets, real data or tokens in public issues.
+See the English [security policy and reporting channel status](../SECURITY.md). The private channel must be enabled and verified during publication; adding the policy file does not enable it. Do not put vulnerability details, secrets, real data or tokens in public issues. If the reporting button is unavailable, ask only for a private security contact without disclosing the issue.

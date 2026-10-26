@@ -111,7 +111,7 @@ Version 0.3.0 is for new installations only; there is no automatic migration. Th
 
 ## Security
 
-Read the [security design and reporting status](docs/SECURITY_EN.md). A private vulnerability reporting channel will be specified before public release; no active channel is claimed here. Do not put tokens, secrets, or real user data in public issues.
+Read the [security policy and reporting channel status](SECURITY.md) and [technical security design](docs/SECURITY_EN.md). The private reporting channel still requires activation and verification at publication. Do not put vulnerability details, tokens, secrets or real user data in public issues.
 
 ## Directory layout
 
