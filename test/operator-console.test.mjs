@@ -414,8 +414,11 @@ test('B1 issue unlocks only step 2 from the controller state; sending stays lock
   assert.equal(ui.el('sttd-method-desc-code').hidden, false);
   assert.equal(ui.el('sttd-method-desc-apple').hidden, true);
   assert.equal(ui.el('sttd-code-panel').hidden, false);
+  // 選択だけでは10分以内の入力案内を出さない（発行の説明だけ）
+  assert.equal(ui.el('sttd-code-guide').hidden, true, 'no input guide before a code is issued');
   await ui.click('sttd-method-continue');
   assert.equal(ui.el('sttd-code-value').textContent, '012345');
+  assert.equal(ui.el('sttd-code-guide').hidden, false, 'input guide shown after a successful issue');
   assert.equal(ui.stepState(2), 'ready');
   await ui.click('sttd-panel-2');
   assert.equal(ui.stepState(2), 'current');
@@ -458,6 +461,23 @@ test('B3 switching method resets to step 1, locks later steps and closes the cod
   assert.equal(ui.el('sttd-method-apple').checked, true);
   assert.equal(ui.el('sttd-method-code').checked, false);
   assert.equal(ui.el('sttd-method-desc-apple').hidden, false);
+});
+
+test('B7 the code input guide appears only after a successful issue; hidden on failure, cancel and method switch', async () => {
+  let fail = true;
+  const ui = await runConsoleWithOperator({ onOperator: async (action) => (action === 'issue' ? (fail ? { status: 503, json: { error: { code: 'issue_failed' } } } : issuedJson()) : { status: 200, json: { state: 'cancelled' } }) });
+  await ui.click('sttd-method-code');
+  await ui.click('sttd-method-continue');
+  assert.equal(ui.el('sttd-code-guide').hidden, true, 'not shown after a failed issue');
+  fail = false;
+  await ui.click('sttd-method-continue');
+  assert.equal(ui.el('sttd-code-guide').hidden, false);
+  await ui.click('sttd-code-cancel');
+  assert.equal(ui.el('sttd-code-guide').hidden, true, 'hidden after cancel');
+  await ui.click('sttd-method-continue');
+  assert.equal(ui.el('sttd-code-guide').hidden, false);
+  await ui.click('sttd-method-apple');
+  assert.equal(ui.el('sttd-code-guide').hidden, true, 'hidden after a method switch');
 });
 
 test('B6 Apple with Continue starts the existing Apple sign-in; selecting alone loads nothing', async () => {

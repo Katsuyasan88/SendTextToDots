@@ -170,7 +170,7 @@ export function renderOperatorSection(input: {
 <div class="sttd-actions"><button type="button" id="sttd-method-continue">${t('continue')}</button></div>
 <p id="sttd-switch-notice" hidden>${t('switchNotice')}</p>
 <div id="sttd-code-panel" hidden>
-<p>${t('codeGuide')}</p>
+<p id="sttd-code-guide" hidden>${t('codeGuide')}</p>
 <div class="sttd-actions"><button type="button" id="sttd-code-reissue" hidden>${t('reissue')}</button>
 <button type="button" id="sttd-code-confirm" hidden>${t('confirm')}</button>
 <button type="button" id="sttd-code-cancel" hidden>${t('cancel')}</button></div>
@@ -236,9 +236,11 @@ function stopTimer() {
   if (timer !== null) { clearInterval(timer); timer = null; }
 }
 
+// 10分以内・1回使用の案内は発行に成功したコードがある間だけ（取消・期限切れ・方式切替・接続完了で隠す。発行中/失敗では出さない）
 function hideCode() {
   stopTimer();
   show('sttd-code-display', false);
+  show('sttd-code-guide', false);
 }
 
 function controls() {
@@ -260,6 +262,7 @@ function showCode(code, authExpiresAt, at) {
   issuedOnce = true;
   controls();
   show('sttd-code-display', true);
+  show('sttd-code-guide', true);
   stopTimer();
   timer = setInterval(tick, 1000);
   tick();
