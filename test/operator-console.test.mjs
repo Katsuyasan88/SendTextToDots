@@ -1,4 +1,4 @@
-// 開発者向けコード（T-065）の画面・operator helperの合成検証。
+// 開発者向けコード（運営者が発行する6桁コードでの接続）の画面・operator helperの合成検証。
 //   - O: operator設定のexact schema、限定4操作（Origin必須/nonce/認証header拒否/小本文/JSON/未知route/method）、二重クリックの直列化、
 //        照会による発行結果の再表示（再発行しない）、再発行失敗で現在のコードを維持、active時だけcustom token、取消。
 //        CLIは同projectの署名SAだけをFirebase Adminの`serviceAccountId`へ渡し、不正なら資格・SDK・Secretの前に止まる（合成のSDK生成口）。

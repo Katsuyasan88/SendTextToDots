@@ -1,4 +1,4 @@
-// 開発者向けコード（T-065）のプラグイン接続画面のコード入力（POST /interaction/{uid}/code の判定 developerCodeEntry）をHTTPで合成検証する。
+// 開発者向けコード（運営者が発行する6桁コードでの接続）のプラグイン接続画面のコード入力（POST /interaction/{uid}/code の判定 developerCodeEntry）をHTTPで合成検証する。
 //   - 機能offは固定404（本文・cookie・CSRFを読まない）。Origin欠落/違いは403。Content-Type/長さ1KiB/JSON exact/CSRF形の違反は400。
 //   - interaction cookieの確認失敗とCSRF不一致ではコード交換を呼ばない（試行件数も消費しない）。成功時だけcustom tokenを同originへ返す。
 //   - 交換の固定結果（rejected/rate_limited/failed/unavailable）をkms-serverと同じ固定statusへ写す。

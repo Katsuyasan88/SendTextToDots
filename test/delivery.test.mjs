@@ -1398,7 +1398,7 @@ test('V08 explicit access with the production decisions: not permitted -> 403 ac
 });
 
 
-// ---------- 開発者向けコード（T-065）: コード登録→code identity→接続保存のowner→送信API→KMS配送serviceで本文2件 ----------
+// ---------- 開発者向けコード（運営者が発行する6桁コードでの接続）: コード登録→code identity→接続保存のowner→送信API→KMS配送serviceで本文2件 ----------
 // 実物: 予約/消費/確定（DeveloperLoginStore）、交換（createDeveloperCodeExchange）、共通verifier（createFirebaseAdminVerifier＋code照合）、
 // 接続保存の利用許可/owner解決（ConnectStorage.resolveOwner/findOwner）、送信HTTP入口とKMS配送service。合成: Firestore（in-memory）、
 // Firebase Auth（ID token検証の結果）、配送の保存・封緘・送出（この試験fileのkmsFixture）。OAuth同意画面/Grant metadata/購読登録の実処理は通さない。
