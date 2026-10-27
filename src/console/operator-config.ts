@@ -287,8 +287,15 @@ function showCode(code, authExpiresAt, at) {
   if (bridge.issued(at)) say(T('step2Unlocked'));
 }
 
+// このページ（helperのRAM）が所有するコードsessionがあるか。保存済みログインの復元だけでは所有しない（再発行・照会・取消の要求0）
+function owned() {
+  return issuedOnce || (chosen === 'code' && last !== null && last.signedIn === true && last.resumed !== true);
+}
+
 async function issue(action) {
   if (pending || chosen !== 'code') return;
+  // 新しい発行は明示の「続ける」で可。再発行は所有するsessionがある時だけ
+  if (action !== 'issue' && !owned()) return;
   const at = epoch;
   pending = true;
   try {
@@ -312,7 +319,7 @@ async function issue(action) {
 }
 
 async function confirmConnection() {
-  if (pending || chosen !== 'code') return;
+  if (pending || chosen !== 'code' || !issuedOnce) return;
   const at = epoch;
   pending = true;
   try {
@@ -334,7 +341,7 @@ async function confirmConnection() {
 }
 
 async function cancelCode() {
-  if (pending) return;
+  if (pending || !owned()) return;
   pending = true;
   try {
     const { status } = await call('cancel');

@@ -637,6 +637,13 @@ test('B10 skip in step 1 resumes a saved code sign-in only when the token claims
   assert.equal(ui.base.auth.currentUser.uid, CODE_UID);
   for (const id of ['sttd-code-reissue', 'sttd-code-cancel', 'sttd-code-confirm']) assert.equal(ui.el(id).hidden, true, `${id} hidden`);
   assert.equal(ui.el('sttd-refresh').hidden, false, 'the normal connection check is used');
+  assert.deepEqual([ui.el('sttd-skipped-1').hidden, ui.el('sttd-skipped-1').textContent], [false, 'Skipped (unconfirmed)']);
+  // 隠すだけでなく、handlerを直接呼んでもhelperが所有しないsessionへの照会・再発行・取消は要求0。
+  ui.el('sttd-code-reissue').onclick();
+  ui.el('sttd-code-confirm').onclick();
+  ui.el('sttd-code-cancel').onclick();
+  for (let i = 0; i < 4; i += 1) await settle();
+  assert.deepEqual([ui.fetches.length, ui.custom.calls, ui.stepState(2)], [0, 0, 'current'], 'no code request from direct handler calls');
   for (const n of [3, 4, 5, 6, 7]) assert.equal(ui.stepState(n), 'locked', `step ${n}`);
   // UIDの接頭辞だけでは信用しない: marker・family・project・tenant・providerのどれかが違えば手順1に留まり、保存済みログインも消さない。
   for (const [name, claims] of [['marker', codeClaims({ sttd_dlc: undefined })], ['family', codeClaims({ sttd_fam: 'not-a-family' })], ['project', codeClaims({ aud: 'other-project' })], ['tenant', codeClaims({ firebase: { sign_in_provider: 'custom', tenant: 't1' } })], ['provider', codeClaims({ firebase: { sign_in_provider: 'apple.com' } })], ['subject', codeClaims({ sub: 'sttdc_' + 'B'.repeat(32) })]]) {
@@ -672,4 +679,21 @@ test('B11 a code issued on this page after a resume keeps its own controls and i
   await ui.click('sttd-skip-1');
   assert.deepEqual([ui.stepState(1), ui.stepState(2), cancels()], ['skipped', 'current', 0], 'resuming does not cancel the issued code');
   assert.deepEqual([ui.el('sttd-code-reissue').hidden, ui.el('sttd-code-cancel').hidden], [false, false], 'the code issued on this page keeps its controls');
+});
+
+test('B12 after a resume, an explicit Continue issues a new code and its normal exchange replaces the resumed owner: step 1 becomes done (not skipped), the code check is hidden and reissue/cancel work as the page-owned session', async () => {
+  const ui = await runConsoleWithOperator({ restoredCode: true, restoredClaims: codeClaims(), onOperator: async (action) => (action === 'issue' || action === 'reissue' ? issuedJson() : activeJson()) });
+  await ui.click('sttd-method-code');
+  await ui.click('sttd-skip-1');
+  assert.deepEqual([ui.stepState(1), ui.fetches.length], ['skipped', 0]);
+  await ui.click('sttd-panel-1');
+  await ui.click('sttd-method-continue');
+  assert.deepEqual([ui.stepState(2), ui.fetches.filter((entry) => entry.url.endsWith('/issue')).length, ui.el('sttd-code-confirm').hidden], ['current', 1, false], 'the explicit Continue issues a page-owned code');
+  await ui.click('sttd-code-confirm');
+  assert.equal(ui.custom.calls, 1, 'the new code is exchanged once');
+  assert.deepEqual([ui.stepState(1), ui.stepState(2), ui.el('sttd-skipped-1').hidden], ['done', 'current', true], 'the resume flag is cleared by the normal code sign-in');
+  assert.deepEqual([ui.el('sttd-code-confirm').hidden, ui.el('sttd-code-reissue').hidden, ui.el('sttd-code-cancel').hidden], [true, false, false]);
+  const reissues = () => ui.fetches.filter((entry) => entry.url.endsWith('/reissue')).length;
+  await ui.click('sttd-code-reissue');
+  assert.equal(reissues(), 1, 'reissue works for the page-owned session');
 });

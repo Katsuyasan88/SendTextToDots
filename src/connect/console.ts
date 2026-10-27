@@ -169,7 +169,7 @@ export function renderConsolePage(web: FirebaseWebConfig, options: ConsolePageOp
 <p id="sttd-intro"${i18n('wizard.intro')}>${t('wizard.intro')}</p>
 <p id="sttd-wizard-note" role="status"></p>
 <section id="sttd-panel-1" class="sttd-panel" aria-labelledby="sttd-panel-1-title" data-sttd-state="current" tabindex="0">
-<div class="sttd-panel-head"><h2 id="sttd-panel-1-title" class="sttd-panel-title"${i18n('wizard.step1')}>${t('wizard.step1')}</h2><button type="button" id="sttd-skip-1" class="sttd-skip" disabled${i18n('wizard.skipResume')}>${t('wizard.skipResume')}</button></div>
+<div class="sttd-panel-head"><h2 id="sttd-panel-1-title" class="sttd-panel-title"${i18n('wizard.step1')}>${t('wizard.step1')}</h2><span id="sttd-skipped-1" class="sttd-skipped-label" hidden${i18n('wizard.skippedLabel')}>${t('wizard.skippedLabel')}</span><button type="button" id="sttd-skip-1" class="sttd-skip" disabled${i18n('wizard.skipResume')}>${t('wizard.skipResume')}</button></div>
 ${options.operatorFirst === true ? (options.operatorSection ?? '') : ''}
 <div id="sttd-apple-panel"${options.operatorFirst === true ? ' hidden' : ''}>
 <p id="sttd-login-intro"${i18n('wizard.loginIntro')}>${t('wizard.loginIntro')}</p>
@@ -182,7 +182,7 @@ ${options.operatorFirst === true ? (options.operatorSection ?? '') : ''}
 ${options.operatorFirst === true ? '' : (options.operatorSection ?? '')}
 </section>
 <section id="sttd-panel-2" class="sttd-panel" aria-labelledby="sttd-panel-2-title" data-sttd-state="locked" tabindex="0">
-<div class="sttd-panel-head"><h2 id="sttd-panel-2-title" class="sttd-panel-title"${i18n('wizard.step2')}>${t('wizard.step2')}</h2><button type="button" id="sttd-skip-2" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
+<div class="sttd-panel-head"><h2 id="sttd-panel-2-title" class="sttd-panel-title"${i18n('wizard.step2')}>${t('wizard.step2')}</h2><span id="sttd-skipped-2" class="sttd-skipped-label" hidden${i18n('wizard.skippedLabel')}>${t('wizard.skippedLabel')}</span><button type="button" id="sttd-skip-2" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
 <p id="sttd-state-intro"${i18n('wizard.stateIntro')}>${t('wizard.stateIntro')}</p>
 <p id="sttd-plugin-intro"${i18n('plugin.intro')}>${t('plugin.intro')}</p>
 <details id="sttd-plugin-guide" class="sttd-instructions-details">
@@ -222,7 +222,7 @@ ${options.operatorCodePanel ?? ''}
 <p id="sttd-disconnect-result" role="status"></p>
 </section>
 <section id="sttd-panel-3" class="sttd-panel" aria-labelledby="sttd-panel-3-title" data-sttd-state="locked" tabindex="0">
-<div class="sttd-panel-head"><h2 id="sttd-panel-3-title" class="sttd-panel-title"${i18n('wizard.step3')}>${t('wizard.step3')}</h2><button type="button" id="sttd-skip-3" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
+<div class="sttd-panel-head"><h2 id="sttd-panel-3-title" class="sttd-panel-title"${i18n('wizard.step3')}>${t('wizard.step3')}</h2><span id="sttd-skipped-3" class="sttd-skipped-label" hidden${i18n('wizard.skippedLabel')}>${t('wizard.skippedLabel')}</span><button type="button" id="sttd-skip-3" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
 <p id="sttd-guide-intro"${i18n('guide.intro')}>${t('guide.intro')}</p>
 <p id="sttd-guide-step1"${i18n('guide.step1')}>${t('guide.step1')}</p>
 <p id="sttd-receive-start"${i18n('wizard.receiveStart')}>${t('wizard.receiveStart')}</p>
@@ -237,7 +237,7 @@ ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wi
 <p id="sttd-receive-text" role="status"></p>
 </section>
 <section id="sttd-panel-5" class="sttd-panel" aria-labelledby="sttd-panel-5-title" data-sttd-state="locked" tabindex="0">
-<div class="sttd-panel-head"><h2 id="sttd-panel-5-title" class="sttd-panel-title"${i18n('wizard.step5')}>${t('wizard.step5')}</h2><button type="button" id="sttd-skip-5" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
+<div class="sttd-panel-head"><h2 id="sttd-panel-5-title" class="sttd-panel-title"${i18n('wizard.step5')}>${t('wizard.step5')}</h2><span id="sttd-skipped-5" class="sttd-skipped-label" hidden${i18n('wizard.skippedLabel')}>${t('wizard.skippedLabel')}</span><button type="button" id="sttd-skip-5" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
 <p id="sttd-send-intro"${i18n('wizard.sendIntro')}>${t('wizard.sendIntro')}</p>
 <p id="sttd-fixed-label"${i18n('wizard.fixedLabel')}>${t('wizard.fixedLabel')}</p>
 <p id="sttd-fixed-text" class="sttd-fixed"${i18n('wizard.fixedText')}>${t('wizard.fixedText')}</p>
@@ -253,12 +253,12 @@ ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wi
 <p id="sttd-verify-hint" class="sttd-note"${i18n('wizard.sendNotVerifiable')}>${t('wizard.sendNotVerifiable')}</p>
 </section>
 <section id="sttd-panel-6" class="sttd-panel" aria-labelledby="sttd-panel-6-title" data-sttd-state="locked" tabindex="0">
-<div class="sttd-panel-head"><h2 id="sttd-panel-6-title" class="sttd-panel-title"${i18n('wizard.step6')}>${t('wizard.step6')}</h2><button type="button" id="sttd-skip-6" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
+<div class="sttd-panel-head"><h2 id="sttd-panel-6-title" class="sttd-panel-title"${i18n('wizard.step6')}>${t('wizard.step6')}</h2><span id="sttd-skipped-6" class="sttd-skipped-label" hidden${i18n('wizard.skippedLabel')}>${t('wizard.skippedLabel')}</span><button type="button" id="sttd-skip-6" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
 <p id="sttd-guide-step3"${i18n('guide.step3')}>${t('guide.step3')}</p>
 ${instructions('operation', 'guide.showOperation', 'guide.operationText', 'guide.copyOperation', 'wizard.pastedOperationFinish')}
 </section>
 <section id="sttd-panel-7" class="sttd-panel" aria-labelledby="sttd-panel-7-title" data-sttd-state="locked" tabindex="0">
-<div class="sttd-panel-head"><h2 id="sttd-panel-7-title" class="sttd-panel-title"${i18n('wizard.step7')}>${t('wizard.step7')}</h2><button type="button" id="sttd-skip-7" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
+<div class="sttd-panel-head"><h2 id="sttd-panel-7-title" class="sttd-panel-title"${i18n('wizard.step7')}>${t('wizard.step7')}</h2><span id="sttd-skipped-7" class="sttd-skipped-label" hidden${i18n('wizard.skippedLabel')}>${t('wizard.skippedLabel')}</span><button type="button" id="sttd-skip-7" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
 <p id="sttd-free-intro"${i18n('wizard.freeIntro')}>${t('wizard.freeIntro')}</p>
 <label id="sttd-text-label" for="sttd-text"${i18n('console.textLabel')}>${t('console.textLabel')}</label>
 <textarea id="sttd-text" rows="4" maxlength="4096" placeholder="${t('console.textPlaceholder')}" disabled></textarea>
@@ -298,6 +298,8 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
 .sttd-skip { font-size: 0.85rem; color: #4a4a4a; background: #f0f0f0; border: 1px solid #8a8a8a; border-radius: 4px; padding: 0.15rem 0.5rem; }
 .sttd-required { font-size: 0.85rem; color: #4a4a4a; }
+.sttd-skipped-label { font-size: 0.85rem; font-weight: 600; color: #6b3a00; background: #fff4e0; border: 1px dashed #6b3a00; border-radius: 4px; padding: 0.1rem 0.4rem; }
+.sttd-panel[data-sttd-state="skipped"] { border: 1px dashed #6b3a00; }
 .sttd-instruction-block { margin-top: 0.75rem; }
 .sttd-instructions-details summary { cursor: pointer; font-weight: 600; min-height: 44px; display: flex; align-items: center; }
 .sttd-instructions { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; background: #f5f6f8; border: 1px solid #d9dce1; border-radius: 6px; padding: 0.75rem; margin: 0; }
@@ -574,7 +576,11 @@ function render() {
   // 省略した手順があれば「未確認の手順があります」の文面にして、全確認済みと区別する。
   el('sttd-complete').hidden = !(done[4] && passed(6));
   el('sttd-complete').textContent = T(unconfirmed() ? 'wizard.completeSkipped' : 'wizard.complete');
-  for (const n of SKIPPABLE) el('sttd-skip-' + n).disabled = !skippable(n);
+  for (const n of SKIPPABLE) {
+    el('sttd-skip-' + n).disabled = !skippable(n);
+    // 省略は見出しの横に文字で示す（確認済みになったら消す）。色だけ・bannerだけに頼らない
+    el('sttd-skipped-' + n).hidden = !(skipped[n] && !done[n]);
+  }
   // 4 受信状態の確認（明示1回GET。自動の再確認はしない）
   el('sttd-receive-check').disabled = inactive(4) || !available(4) || !signedIn || busy() || inFlight() || confirming;
   el('sttd-receive-text').textContent = checking && checkFrom === 4 ? T('wizard.receiveChecking') : T(receiveKey);
@@ -1455,6 +1461,14 @@ async function codeSignIn(epoch, customToken) {
   if (accountBusy || busy() || inFlight()) return false;
   const gen = ++loginGeneration;
   const stale = () => gen !== loginGeneration || method !== 'code' || epoch !== codeEpoch;
+  if (signedIn) {
+    // 復元などで別のownerがログイン中: 新しいコードの交換で置き換えるので、旧ownerの後続を戻す（observerが旧ownerの喪失として扱わないよう先に外す）
+    resetFrom(2);
+    signedIn = false;
+    ownerUid = null;
+    done[1] = false;
+    skipped[1] = false;
+  }
   accountBusy = true;
   accountKey = sdk === null ? 'wizard.loginLoading' : 'console.accountChecking';
   render();
@@ -1487,6 +1501,8 @@ async function codeSignIn(epoch, customToken) {
     ownerUid = user.uid;
     signedIn = true;
     done[1] = true;
+    // このページが発行したコードで認証した: 復元（省略）の扱いを外し、helperが所有するsessionとして扱う
+    skipped[1] = false;
     codeIssued = true;
     accountKey = 'wizard.loginDone';
     step = 2;

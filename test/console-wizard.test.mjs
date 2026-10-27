@@ -1258,6 +1258,9 @@ test('W18 skips: the top-right skip of step 1 resumes a saved Apple sign-in only
   el('sttd-skip-6').click();
   await settle();
   assert.deepEqual([5, 6, 7].map(ui.stepState), ['skipped', 'skipped', 'current']);
+  // 各手順の見出しに「スキップ済み」を文字で示す（4は省略できないので表示も無い）。
+  assert.deepEqual([1, 2, 3, 5, 6, 7].map((n) => el('sttd-skipped-' + n).hidden), [false, false, false, false, false, true]);
+  assert.deepEqual([el('sttd-skipped-2').textContent, el('sttd-skipped-2').parent.id, el('sttd-skipped-4')], [EN('wizard.skippedLabel'), 'sttd-panel-2', undefined]);
   assert.deepEqual([el('sttd-complete').hidden, el('sttd-complete').textContent], [false, EN('wizard.completeSkipped')]);
   assert.equal(el('sttd-verify-send').disabled, true, 'no match was confirmed');
   // 7: 結果不明の送信がある間は省略できず、証跡（結果・同ID確認）は残る。
@@ -1282,12 +1285,13 @@ test('W18 skips: the top-right skip of step 1 resumes a saved Apple sign-in only
   await settle();
   el('sttd-verify-send').click();
   await settle();
-  assert.deepEqual([ui.stepState(5), el('sttd-complete').textContent], ['done', EN('wizard.completeSkipped')]);
+  assert.deepEqual([ui.stepState(5), el('sttd-complete').textContent, el('sttd-skipped-5').hidden, el('sttd-skipped-6').hidden], ['done', EN('wizard.completeSkipped'), true, false], 'the skipped label goes away once the step is confirmed');
   // 別accountへの切替で、省略と完了をすべて戻す。
   sdk.changeUser('uid-b');
   await settle();
   assert.deepEqual([1, 2, 3, 4, 5, 6, 7].map(ui.stepState), ['current', 'locked', 'locked', 'locked', 'locked', 'locked', 'locked']);
   assert.equal(el('sttd-complete').hidden, true);
+  assert.deepEqual([1, 2, 3, 5, 6, 7].map((n) => el('sttd-skipped-' + n).hidden), [true, true, true, true, true, true], 'skips are reset with the sign-in');
   results.W18 = { posts: ui.api().length };
 });
 
