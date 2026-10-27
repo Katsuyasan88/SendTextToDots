@@ -15,6 +15,7 @@ This is source you deploy yourself, not a hosted service. Detailed documentation
 - Added optional developer sign-in with a 6-digit code issued by the local operator console. A code is valid for 10 minutes and one use; its number is reserved against reuse for at least 24 hours. Each new code connection is separate from an Apple account. The feature is off by default.
 - Updated the English/Japanese console to one sign-in choice and a common Continue button, with code controls in step 2, a required receiving check in step 4, a fixed delivery test in step 5, and free-text sends in step 7.
 - Added a small Skip action to the other steps and explicit resumption of the sign-in saved in the same browser. Resuming an existing connection does not issue a code or require the plugin to be added again. Skipped steps remain distinct from confirmed ones, and sending still requires the receiving check.
+- Fixed in-page language switching so the sign-in choices, code controls, and messages follow the selected language without restarting sign-in.
 
 See the [local console guide](docs/LOCAL_CONSOLE_EN.md) and [verification limits](docs/LIMITATIONS_EN.md). These are source changes awaiting publication, not an automatic update to an existing deployment.
 
