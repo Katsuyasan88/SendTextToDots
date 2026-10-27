@@ -174,8 +174,8 @@ test('L3 rendering: every page carries html lang, title and body in the selected
   assert.ok(/<textarea id="sttd-text"[^>]*placeholder="例: SendTextToDotsからのテストです"[^>]*><\/textarea>/.test(consoleJa));
   assert.ok(/<textarea id="sttd-text"[^>]*placeholder="Example: Hello from SendTextToDots \(delivery test\)"[^>]*><\/textarea>/.test(consoleEn));
   assert.ok(consoleJa.includes('>送信</button>') && consoleEn.includes('>Send</button>'), 'main button');
-  for (const n of [1, 2, 3, 4, 5]) assert.ok(consoleEn.includes(`id="sttd-step-${n}-head"`) && consoleEn.includes(`id="sttd-panel-${n}"`), `step ${n} present`);
-  assert.ok(/<li class="sttd-step" id="sttd-step-1" data-sttd-state="current">/.test(consoleEn) && /<li class="sttd-step" id="sttd-step-2" data-sttd-state="locked">/.test(consoleEn), 'only step 1 starts active');
+  for (const n of [1, 2, 3, 4, 5]) assert.ok(consoleEn.includes(`id="sttd-panel-${n}"`), `step ${n} present`);
+  assert.ok(/id="sttd-panel-1"[^>]*data-sttd-state="current"/.test(consoleEn) && /id="sttd-panel-2"[^>]*data-sttd-state="locked"/.test(consoleEn) && !consoleEn.includes('sttd-steps'), 'only step 1 starts active; no separate step list');
   for (const id of ['sttd-disconnect', 'sttd-disconnect-confirm', 'sttd-disconnect-yes', 'sttd-disconnect-no', 'sttd-disconnect-result']) assert.ok(consoleEn.includes(`id="${id}"`), id);
   assert.equal(consoleEn.includes('href="/connect"'), false, 'console no longer sends the user to /connect to disconnect');
   // Dots設定案内: 長い指示文は初期折りたたみのdetails（openなし）内のpreにあり、summaryとコピーボタンは各言語の文言。コピーボタンはdetailsの外（閉じたままでも押せる）。

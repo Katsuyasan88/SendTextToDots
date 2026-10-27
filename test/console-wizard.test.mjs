@@ -112,8 +112,6 @@ test('W1 initial page: nothing is fetched and the SDK is not loaded; only step 1
   assert.equal(el('sttd-panel-1').getAttribute('aria-disabled'), 'false');
   for (const n of [2, 3, 4, 5]) {
     assert.equal(el('sttd-panel-' + n).getAttribute('aria-disabled'), 'true');
-    assert.equal(el(`sttd-step-${n}-head`).click(), false, `step ${n} head disabled`);
-    el(`sttd-step-${n}-head`).onclick();
     ui.clickPanel(n);
     ui.keyPanel(n, 'Enter');
     assert.equal(ui.panelState(n), 'locked', `step ${n} does not activate through any handler`);
@@ -261,7 +259,9 @@ test('W3 connection check: one manual GET; subscribed advances to step 3; each o
   uiB.el('sttd-refresh').click();
   await settle();
   assert.equal(uiB.el('sttd-state-text').textContent, JA('wizard.checking'));
-  assert.deepEqual([uiB.el('sttd-step-3-head').disabled, uiB.el('sttd-step-4-head').disabled], [true, true], 'steps 3+ locked while checking');
+  uiB.clickPanel(3);
+  uiB.clickPanel(4);
+  assert.deepEqual([uiB.panelState(3) === 'current', uiB.panelState(4) === 'current'], [false, false], 'steps 3+ cannot be opened while checking');
   held.release();
   await settle();
   assert.deepEqual([uiB.stepState(2), uiB.stepState(3), uiB.stepState(4)], ['current', 'done', 'ready'], 'subscribed again: progress kept');
@@ -394,7 +394,7 @@ test('W5 send: empty field with placeholder, "送信", 5-field POST with nonce a
   assert.match(payload.commandId, UUID);
   assert.equal(Date.parse(payload.expiresAt) - Date.parse(payload.createdAt), 60_000);
   assert.equal(el('sttd-verify-send').disabled, true, 'in flight: cannot confirm');
-  assert.equal(el('sttd-step-1-head').disabled, false, 'done steps stay viewable while sending');
+  assert.notEqual(ui.panelState(1), 'locked', 'done steps stay viewable while sending');
   // 送信中にテスト設定を再適用しても、進行中のtest（commandId/中止手段）を失わず、別POSTも始まらない。
   assert.equal(ui.clickPanel(3), true, 'step 3 can be viewed while sending');
   assert.equal(el('sttd-done-test').disabled, true, 're-apply is inert while a send is in flight');

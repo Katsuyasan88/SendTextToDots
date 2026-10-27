@@ -111,9 +111,10 @@ test('A1 /console assets (local page): fixed HTML/JS/CSS, empty textarea with an
   assert.equal(/<select|<option|sttd-direction|方向|上<\/|下<\/|左<\/|右<\/|direction/i.test(page.body), false, 'no direction UI');
   assert.ok(page.body.includes('id="sttd-guide-test-text"') && page.body.includes('id="sttd-guide-operation-text"') && page.body.includes('id="sttd-copy-test"') && page.body.includes('id="sttd-copy-operation"'));
   assert.equal(/<textarea[^>]*value=|<input/i.test(page.body), false, 'no preset input');
-  for (const n of [1, 2, 3, 4, 5]) assert.ok(page.body.includes(`id="sttd-panel-${n}"`) && page.body.includes(`id="sttd-step-${n}-head"`), `step ${n}`);
-  assert.equal((page.body.match(/data-sttd-state="current"/g) ?? []).length, 2, 'exactly one active step at start (list item + its panel)');
-  assert.equal((page.body.match(/data-sttd-state="locked"/g) ?? []).length, 8, 'four locked steps (list item + panel each)');
+  for (const n of [1, 2, 3, 4, 5]) assert.ok(page.body.includes(`id="sttd-panel-${n}"`), `step ${n}`);
+  assert.equal((page.body.match(/data-sttd-state="current"/g) ?? []).length, 1, 'exactly one active step at start (its panel; no separate step list)');
+  assert.ok(!page.body.includes('id="sttd-steps"') && !page.body.includes('sttd-step-1-head'), 'no separate step list');
+  assert.equal((page.body.match(/data-sttd-state="locked"/g) ?? []).length, 4, 'four locked steps (panels only; no separate step list)');
   assert.equal((page.body.match(/<section id="sttd-panel-[1-5]"[^>]*>/g) ?? []).length, 5, 'all five panels present');
   assert.equal(/<section id="sttd-panel-[1-5]"[^>]*\shidden/.test(page.body), false, 'no panel is hidden; inactive ones are gray');
   assert.ok(page.body.indexOf('id="sttd-complete"') > page.body.lastIndexOf('</section>'), 'the completion banner is below all panels');

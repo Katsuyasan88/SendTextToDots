@@ -137,8 +137,6 @@ export function renderConsolePage(web: FirebaseWebConfig, options: ConsolePageOp
     .map(([name, value]) => ` data-${name}="${escapeHtml(value)}"`)
     .join('');
   const current = (candidate: Language) => (candidate === lang ? ' aria-current="true"' : '');
-  const stepHead = (n: number, key: MessageKey) =>
-    `<li class="sttd-step" id="sttd-step-${n}" data-sttd-state="${n === 1 ? 'current' : 'locked'}"><button type="button" id="sttd-step-${n}-head" class="sttd-step-head" aria-controls="sttd-panel-${n}"${n === 1 ? '' : ' disabled'}${i18n(key)}>${t(key)}</button> <span id="sttd-step-${n}-badge" class="sttd-badge"${i18n(n === 1 ? 'wizard.badgeCurrent' : 'wizard.badgeLocked')}>${t(n === 1 ? 'wizard.badgeCurrent' : 'wizard.badgeLocked')}</span></li>`;
   const instructions = (kind: 'test' | 'operation', showKey: MessageKey, textKey: MessageKey, copyKey: MessageKey, doneKey: MessageKey) => `<div class="sttd-instruction-block">
 <details id="sttd-guide-${kind}" class="sttd-instructions-details">
 <summary id="sttd-guide-${kind}-summary"${i18n(showKey)}>${t(showKey)}</summary>
@@ -164,19 +162,11 @@ export function renderConsolePage(web: FirebaseWebConfig, options: ConsolePageOp
 </nav>
 <h1 id="sttd-heading"${i18n('console.heading')}>${t('console.heading')}</h1>
 <p id="sttd-intro"${i18n('wizard.intro')}>${t('wizard.intro')}</p>
-<h2 id="sttd-wizard-title"${i18n('wizard.title')}>${t('wizard.title')}</h2>
-<ol id="sttd-steps" class="sttd-steps">
-${stepHead(1, 'wizard.step1')}
-${stepHead(2, 'wizard.step2')}
-${stepHead(3, 'wizard.step3')}
-${stepHead(4, 'wizard.step4')}
-${stepHead(5, 'wizard.step5')}
-</ol>
 <p id="sttd-wizard-note" role="status"></p>
 <section id="sttd-panel-1" class="sttd-panel" aria-labelledby="sttd-panel-1-title" data-sttd-state="current" tabindex="0">
 <h2 id="sttd-panel-1-title" class="sttd-panel-title"${i18n('wizard.step1')}>${t('wizard.step1')}</h2>
 ${options.operatorFirst === true ? (options.operatorSection ?? '') : ''}
-<div id="sttd-apple-panel">
+<div id="sttd-apple-panel"${options.operatorFirst === true ? ' hidden' : ''}>
 <p id="sttd-login-intro"${i18n('wizard.loginIntro')}>${t('wizard.loginIntro')}</p>
 <p id="sttd-account-text" role="status">${t('console.accountSignedOut')}</p>
 <div class="sttd-actions">
@@ -275,20 +265,16 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-language a { color: #1f5fbf; padding: 0.5rem 0.25rem; }
 .sttd-language a[aria-current="true"] { font-weight: 700; text-decoration: none; color: #1d1f23; }
 .sttd-language a[aria-disabled="true"] { color: #5b616b; pointer-events: none; }
-.sttd-steps { list-style: none; padding: 0; margin: 0 0 0.75rem; display: flex; flex-direction: column; gap: 0.25rem; }
-.sttd-step { display: flex; align-items: center; gap: 0.5rem; }
-.sttd-step-head { flex: 1; text-align: left; margin: 0; background: #fff; color: #1d1f23; border-color: #b8bdc6; }
-.sttd-step[data-sttd-state="current"] .sttd-step-head { border-color: #1f5fbf; border-width: 2px; font-weight: 700; }
-.sttd-step[data-sttd-state="done"] .sttd-step-head { color: #4a5059; background: #f5f6f8; }
-.sttd-step[data-sttd-state="locked"] .sttd-step-head { color: #8a9099; background: #eceef1; border-color: #d9dce1; }
 .sttd-badge { font-size: 0.8rem; color: #4a5059; min-width: 3.5rem; }
 .sttd-panel-title { font-size: 1.05rem; margin: 0 0 0.5rem; }
 .sttd-instruction-block { margin-top: 0.75rem; }
 .sttd-instructions-details summary { cursor: pointer; font-weight: 600; min-height: 44px; display: flex; align-items: center; }
 .sttd-instructions { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; background: #f5f6f8; border: 1px solid #d9dce1; border-radius: 6px; padding: 0.75rem; margin: 0; }
 .sttd-actions { display: flex; flex-wrap: wrap; }
-.sttd-method-choice button[aria-pressed="true"] { font-weight: 700; outline: 2px solid currentColor; outline-offset: 2px; }
-.sttd-method-choice button[aria-pressed="false"] { font-weight: 400; }
+.sttd-method-choice { border: 0; padding: 0; margin: 0 0 0.25rem; }
+.sttd-method-choice legend { font-weight: 600; padding: 0; margin-bottom: 0.25rem; }
+.sttd-radio { display: flex; align-items: center; gap: 0.5rem; min-height: 44px; cursor: pointer; }
+.sttd-radio input { width: 1.1rem; height: 1.1rem; margin: 0; }
 .sttd-plugin-url { overflow-wrap: anywhere; background: #f5f6f8; border: 1px solid #d9dce1; border-radius: 4px; padding: 0.1rem 0.3rem; }
 #sttd-result, #sttd-disconnect-result, #sttd-wizard-note { font-weight: 600; min-height: 1.5em; overflow-wrap: anywhere; }
 .sttd-note { font-size: 0.85rem; color: #4a5059; }
@@ -477,9 +463,6 @@ function render() {
   const phase = test === null ? null : phaseOf(test);
   for (const n of STEPS) {
     const state = step === n ? 'current' : done[n] ? 'done' : available(n) ? 'ready' : 'locked';
-    el('sttd-step-' + n).setAttribute('data-sttd-state', state);
-    el('sttd-step-' + n + '-head').disabled = !available(n);
-    el('sttd-step-' + n + '-badge').textContent = T(state === 'current' ? 'wizard.badgeCurrent' : state === 'done' ? 'wizard.badgeDone' : state === 'ready' ? '' : 'wizard.badgeLocked');
     // 全panelを順に表示し、非active/未解放はgray。panel自身（done/ready）はクリック/keyboardで再活性化できる。
     const panel = el('sttd-panel-' + n);
     panel.setAttribute('data-sttd-state', state);
@@ -1209,6 +1192,8 @@ async function codeSignIn(epoch, customToken) {
 /** operator部品への明示の口（同じページのscriptだけが使う。秘密・tokenを保持しない）。 */
 globalThis.sttdConsoleCode = Object.freeze({
   chooseMethod: (next) => chooseMethod(next),
+  // 方式「Apple」で共通の「続ける」を押した時だけ、既存のAppleログインを始める（選択・初期表示では通信しない）。
+  appleLogin: () => login(false),
   issued: (epoch) => codeIssuedFor(epoch),
   signIn: (epoch, customToken) => codeSignIn(epoch, customToken),
   subscribe(listener) {
@@ -1220,7 +1205,6 @@ globalThis.sttdConsoleCode = Object.freeze({
 
 function start() {
   for (const n of STEPS) {
-    el('sttd-step-' + n + '-head').onclick = () => selectStep(n);
     // 前のpanelのどこをクリックしても（Enter/Spaceでも）再活性化できる。capture phaseで判定し、非activeへのclickは内部操作にしない。
     el('sttd-panel-' + n).addEventListener('click', (event) => panelCapture(n, event), true);
     el('sttd-panel-' + n).addEventListener('keydown', (event) => panelKeyCapture(n, event), true);

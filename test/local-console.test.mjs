@@ -358,14 +358,14 @@ test('T065 local console: operator routes only in explicit operator mode; the no
   assert.equal((await raw(port, { path: '/console/operator.js' })).status, 404);
   const normalPage = await raw(port, { path: '/console' });
   assert.ok(normalPage.body.includes('id="sttd-code-not-configured"'));
-  assert.equal(normalPage.body.includes('id="sttd-code-issue"'), false);
+  assert.equal(normalPage.body.includes('id="sttd-method-continue"'), false);
   if (Array.isArray(normal.up.calls)) assert.equal(normal.up.calls.length, 0, 'no upstream call');
 
   const { routes, calls } = syntheticOperatorRoutes();
   const operator = await start({ operator: routes });
   const op = operator.server.port;
   const page = await raw(op, { path: '/console' });
-  assert.ok(page.body.includes('id="sttd-code-issue"'));
+  assert.ok(page.body.includes('id="sttd-method-continue"'));
   assert.ok(page.body.includes('<script type="module" src="/console/operator.js"></script>'));
   assert.equal((await raw(op, { path: '/console/operator.js' })).status, 200);
   assert.equal((await post(op, 'f'.repeat(64))).status, 403, 'wrong nonce');

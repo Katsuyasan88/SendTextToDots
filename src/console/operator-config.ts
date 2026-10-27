@@ -85,9 +85,12 @@ export interface OperatorRoutes {
 
 export const OPERATOR_TEXT = Object.freeze({
   en: Object.freeze({
-    methodTitle: 'Choose how to connect',
-    methodApple: 'Apple',
-    methodCode: 'Code',
+    methodTitle: 'Choose how to sign in',
+    methodApple: 'Sign in with Apple (recommended)',
+    methodCode: 'Sign in with a code',
+    continue: 'Continue',
+    descApple: 'Continue opens the Apple sign-in window.',
+    descCode: 'Continue generates a 6-digit code for the plugin connection screen.',
     notConfigured: 'Code issuance is not configured for this deployment.',
     codeGuide:
       'Enter the code in the plugin connection screen within 10 minutes. A code works once. After connecting, the number of texts you send is not limited.',
@@ -108,9 +111,12 @@ export const OPERATOR_TEXT = Object.freeze({
     step2Unlocked: 'You can now add the plugin (step 2). Sending stays locked until the connection is confirmed.',
   }),
   ja: Object.freeze({
-    methodTitle: '接続方法を選ぶ',
-    methodApple: 'Apple',
-    methodCode: 'コード',
+    methodTitle: 'ログイン方法を選ぶ',
+    methodApple: 'Appleでログイン（推奨）',
+    methodCode: 'コードでログイン',
+    continue: '続ける',
+    descApple: '「続ける」を押すとAppleのログイン画面を開きます。',
+    descCode: '「続ける」を押すと、プラグインの接続画面に入力する6桁のコードを発行します。',
     notConfigured: 'この配置ではコード発行が設定されていません。',
     codeGuide: '10分以内にプラグインの接続画面へ入力してください。使用は1回です。接続後の送信回数は制限しません。',
     issue: 'コードを発行',
@@ -154,14 +160,18 @@ export function renderOperatorSection(input: {
 <p id="sttd-code-not-configured">${t('notConfigured')}</p></section>`;
   }
   const data = ` data-sttd-operator-nonce="${escapeHtml(input.nonce)}" data-sttd-operator-language="${lang}" data-sttd-operator-firebase="${escapeHtml(JSON.stringify(input.web))}"`;
-  return `<section id="sttd-method" aria-labelledby="sttd-method-title"${data}><h3 id="sttd-method-title">${t('methodTitle')}</h3>
-<div class="sttd-actions sttd-method-choice" role="group" aria-labelledby="sttd-method-title"><button type="button" id="sttd-method-apple" aria-pressed="true">${t('methodApple')}</button>
-<button type="button" id="sttd-method-code" aria-pressed="false">${t('methodCode')}</button></div>
+  return `<section id="sttd-method"${data}>
+<fieldset class="sttd-method-choice"><legend>${t('methodTitle')}</legend>
+<label class="sttd-radio"><input type="radio" name="sttd-method" id="sttd-method-apple" value="apple" checked> ${t('methodApple')}</label>
+<label class="sttd-radio"><input type="radio" name="sttd-method" id="sttd-method-code" value="code"> ${t('methodCode')}</label>
+</fieldset>
+<p id="sttd-method-desc-apple" class="sttd-note">${t('descApple')}</p>
+<p id="sttd-method-desc-code" class="sttd-note" hidden>${t('descCode')}</p>
+<div class="sttd-actions"><button type="button" id="sttd-method-continue">${t('continue')}</button></div>
 <p id="sttd-switch-notice" hidden>${t('switchNotice')}</p>
 <div id="sttd-code-panel" hidden>
 <p>${t('codeGuide')}</p>
-<div class="sttd-actions"><button type="button" id="sttd-code-issue">${t('issue')}</button>
-<button type="button" id="sttd-code-reissue" hidden>${t('reissue')}</button>
+<div class="sttd-actions"><button type="button" id="sttd-code-reissue" hidden>${t('reissue')}</button>
 <button type="button" id="sttd-code-confirm" hidden>${t('confirm')}</button>
 <button type="button" id="sttd-code-cancel" hidden>${t('cancel')}</button></div>
 <p id="sttd-code-display" hidden>${t('codeLabel')}: <code id="sttd-code-value"></code> <span>${t('remaining')}: <span id="sttd-code-remaining"></span></span></p>
@@ -193,14 +203,20 @@ let pending = false;
 
 function say(text) { el('sttd-code-message').textContent = text; }
 function show(id, visible) { const node = el(id); if (node) node.hidden = !visible; }
-// 選んだ方式だけを表示する（未選択は既存のApple方式）。Appleの案内・ログインと、コード操作は同時に出さない。
+// 選んだ方式のradio・説明・操作だけを表示する（未選択は既存のApple方式）。operator modeでは下のApple操作を出さず、共通の「続ける」1つで始める。
+let selected = 'apple';
+let last = null;
 function reflect(m) {
-  const mode = m === 'code' ? 'code' : 'apple';
-  el('sttd-method-apple').setAttribute('aria-pressed', String(mode === 'apple'));
-  el('sttd-method-code').setAttribute('aria-pressed', String(mode === 'code'));
-  show('sttd-apple-panel', mode === 'apple');
-  show('sttd-code-panel', mode === 'code');
+  selected = m === 'code' ? 'code' : 'apple';
+  el('sttd-method-apple').checked = selected === 'apple';
+  el('sttd-method-code').checked = selected === 'code';
+  show('sttd-apple-panel', false);
+  show('sttd-method-desc-apple', selected === 'apple');
+  show('sttd-method-desc-code', selected === 'code');
+  show('sttd-code-panel', selected === 'code');
 }
+// 認証済み・発行済み等の進捗がある時だけ、方式切替で旧pluginの削除/再追加を案内する（初期・空の切替では出さない）。
+function hasProgress() { return issuedOnce || (last !== null && (last.signedIn || last.codeIssued)); }
 function current(at) { return chosen === 'code' && at === epoch; }
 
 async function call(action) {
@@ -226,7 +242,6 @@ function hideCode() {
 }
 
 function controls() {
-  show('sttd-code-issue', !issuedOnce);
   show('sttd-code-reissue', issuedOnce);
   show('sttd-code-confirm', issuedOnce);
   show('sttd-code-cancel', issuedOnce);
@@ -316,13 +331,26 @@ async function cancelCode() {
 
 async function choose(next) {
   // 方式の切替は本体がステップ1へ戻し後続を封鎖する。旧接続の停止は本人のプラグイン削除・再導入で、ここでは停止済みと表示しない。
-  const before = chosen;
-  if (!(await bridge.chooseMethod(next))) return;
-  if (before !== null && before !== next) show('sttd-switch-notice', true);
-  hideCode();
-  say('');
+  const before = chosen ?? 'apple';
+  const progressed = hasProgress();
+  if (!(await bridge.chooseMethod(next))) { reflect(chosen); return false; }
+  if (before !== next) {
+    show('sttd-switch-notice', progressed);
+    hideCode();
+    issuedOnce = false;
+    say('');
+  }
   reflect(next);
   if (next === 'code') controls();
+  return true;
+}
+
+// 共通の「続ける」: Appleなら既存のAppleログイン、コードならコードの発行（以後の確認・再発行・取消はコード操作）。
+async function proceed() {
+  const m = selected;
+  if (!(await choose(m))) return;
+  if (m === 'apple') await bridge.appleLogin();
+  else if (!issuedOnce) await issue('issue');
 }
 
 if (root && bridge) {
@@ -330,12 +358,14 @@ if (root && bridge) {
     if (state.epoch !== epoch && chosen === 'code') hideCode();
     epoch = state.epoch;
     chosen = state.method;
-    reflect(chosen);
+    last = state;
+    if (chosen !== null) reflect(chosen);
   });
   reflect(chosen);
+  // radioの選択（click/keyboard）は表示と方式の切替だけで、認証・発行・通信はしない
   el('sttd-method-apple').onclick = () => choose('apple');
   el('sttd-method-code').onclick = () => choose('code');
-  el('sttd-code-issue').onclick = () => issue('issue');
+  el('sttd-method-continue').onclick = () => proceed();
   el('sttd-code-reissue').onclick = () => issue('reissue');
   el('sttd-code-confirm').onclick = () => confirmConnection();
   el('sttd-code-cancel').onclick = () => cancelCode();

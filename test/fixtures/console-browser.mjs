@@ -274,7 +274,7 @@ export async function runConsole({ html, onFetch, sdk, navigator }) {
   await settle();
   const api = () => fetches.filter((entry) => entry.url.startsWith('/v2/'));
   const web = (path) => fetches.filter((entry) => entry.url === path);
-  const stepState = (n) => dom.elements.get(`sttd-step-${n}`).getAttribute('data-sttd-state');
+  const stepState = (n) => dom.elements.get(`sttd-panel-${n}`).getAttribute('data-sttd-state');
   const panelState = (n) => dom.elements.get(`sttd-panel-${n}`).getAttribute('data-sttd-state');
   /** panelの余白のクリック（targetはpanel自身）。非active内のcontrolはpointer-events:noneなので、その上のクリックもpanelがtargetになる。 */
   const clickPanel = (n) => dom.elements.get(`sttd-panel-${n}`).click();
