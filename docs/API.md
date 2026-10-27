@@ -87,7 +87,7 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 | --- | --- | --- |
 | 401 | `authentication_required` | Bearer tokenがない、または本人確認ができない |
 | 403 | `access_denied` | 運営者の利用許可がない、または停止中 |
-| 409 | `connection_required` | 接続（owner）がない、失効した、または90日間使われていない。接続し直してください（鍵の取得では接続を作りません） |
+| 409 | `connection_required` | 接続（owner）がまだ無い場合は、通常の接続手順で接続してから取り直してください（鍵の取得では接続を作りません）。接続が失効した、または90日間使われていない場合は、取得やログインを繰り返しても自動では復活しません（このAPIには復旧の操作はありません） |
 | 409 | `encryption_key_unavailable` | 鍵が90日間使われず利用できない。自動では作り直しません |
 | 429 | `rate_limited` | 取得の試行が多すぎる（1分60回・UTCの1日1000回、初回の作成は1分3回・1日10回）。`Retry-After`の秒数だけ待ってください |
 | 503 | `temporarily_unavailable` | 保存・保護鍵・処理期限の一時的な障害。専用の保護鍵の障害で平文の送信を止めることはありません。共有のデータベースなど、既存の送信と共通の部品の障害は、従来どおり平文の送信にも影響することがあります |
@@ -116,6 +116,7 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 - 本文はJWE Compact Serialization（RFC 7516）の5セグメントのASCIIだけで、全体12288byte以下です。`alg`は`RSA-OAEP-256`、`enc`は`A256GCM`だけを受け付けます。CEKは要求ごとに32byteの乱数、IVは12byteで、RSA-OAEPのhashとMGF1はSHA-256、labelは空です。base64urlはpaddingなしです。
 - protected headerはちょうど次の9項目です。`{"alg":"RSA-OAEP-256","enc":"A256GCM","typ":"sttd-command+jwe","kid":"<取得したkid>","sttdVersion":1,"scope":"<取得したscope>","commandId":"<UUID>","createdAt":"<日時>","expiresAt":"<日時>"}`。重複・未知の項目、圧縮（`zip`）、他の方式は拒否します。AADはprotected headerセグメントのASCII bytesで、9項目は全て暗号の認証の対象です。
 - 暗号化する平文は送る`text`のUTF-8だけです（4096byte以下、空・空白のみは不可）。`commandId`・`createdAt`・`expiresAt`の条件と`Idempotency-Key`との一致は、平文の送信と同じです。改行・空白・Unicodeの表現は変えずに届きます。
+- 実装の照合用に、合成専用の鍵で作った固定ベクトル（正例と、tag・AAD・nonce・kid・UTF-8・最大長の負例）を`test/fixtures/encrypted-payload-vectors.json`に置いています。この鍵は試験専用で、配置で使ってはいけません。
 - Dotsへ送る署名付きeventの本文は、受信の上限とは別に最大25088byteです（本文4096byteの全文字がJSONの`\u00XX`へ展開される場合を含む）。受信側（Dots）がこの大きさを受け付けるかは、このAPIでは保証しません。
 - 応答は平文の送信と同じ状態応答（`commandId`/`state`等）です。同じ`commandId`で同じ内容なら、平文・暗号文・暗号化し直し・別の鍵のどれで送っても同じ状態に収束し、重複して送りません。内容が違えば`409 idempotency_conflict`です。状態の照会・取消は`/v2/commands/{commandId}`を使います。
 

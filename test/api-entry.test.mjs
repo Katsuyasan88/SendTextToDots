@@ -4,6 +4,8 @@
 //     close・元期限、secret・markerの失敗後清掃とsecret bufferの消去、timer・signal listener・envの復元を確かめる。
 //   - process.envはその呼出しの間だけ合成Proxyへ置き換え、finallyで必ず元へ戻す（製品のenv変更0・子process 0）。
 //   - 実socket・DNS・HTTP(S)・HTTP/2・TLS・fetch・listen・metadata・実SDK RPC・資格readは0（拒否して数え、0であることをassert）。
+//   - L01/L02（末尾）: 本文暗号化を有効にした合成配置の隔離copyで、同じSDK代替を通して起動時の専用secret読取り0・最初のGETでの遅延読取りと
+//     ring初期化・close後の503を確かめる（SDK代替のin-memory transaction・合成token・専用secretはこの群のplanだけで有効）。
 
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
@@ -19,7 +21,7 @@ import tls from 'node:tls';
 
 const DEV_URL = new URL('../dist/google-runtime/development.js', import.meta.url);
 const requireFromDev = createRequire(DEV_URL);
-const LIMITS = Object.freeze({ groups: 8, port: 5000, fixtureBytes: 2 * 1024 * 1024 });
+const LIMITS = Object.freeze({ groups: 9, port: 5000, fixtureBytes: 2 * 1024 * 1024 });
 const used = { groups: 0, port: 0, fixtureBytes: 0, sdkSets: 0, computes: 0 };
 const results = {};
 function take(kind, amount = 1) {
@@ -180,10 +182,23 @@ class FakeFirestore {
     return new CollRef(this, name);
   }
   /** 既存kms-runtimeが組立て前に存在だけを要求する（methodOf）。この試験では呼ばれない（呼ばれたら数えて投げる）。 */
-  runTransaction() {
+  runTransaction(fn) {
     take('port');
     rpc.transactions += 1;
-    throw new Error('api-entry: transactions are not used in this unit');
+    // 本文暗号化の有効構成（L01/L02）だけ: docsの上のin-memory transaction。それ以外の群では従来どおり使わない（投げる）。
+    if (plan.memoryTx !== true) throw new Error('api-entry: transactions are not used in this unit');
+    const writes = [];
+    const tx = {
+      get: async (ref) => new Snapshot(ref, docs.get(ref.path)),
+      getAll: async (...refs) => refs.map((ref) => new Snapshot(ref, docs.get(ref.path))),
+      set: (ref, data) => (writes.push([ref.path, clone(data), false]), tx),
+      create: (ref, data) => (writes.push([ref.path, clone(data), false]), tx),
+      update: (ref, data) => (writes.push([ref.path, clone(data), true]), tx),
+    };
+    return Promise.resolve(fn(tx)).then((result) => {
+      for (const [path, data, merge] of writes) docs.set(path, merge ? { ...docs.get(path), ...data } : data);
+      return result;
+    });
   }
   terminate() {
     take('port');
@@ -237,6 +252,12 @@ const FakeKms = gapic(
 const FakeSecrets = gapic('secrets', [['locationsClient', 'locationsStub']], () => ({
   accessSecretVersion: (request) => {
     take('port');
+    // 本文暗号化の有効構成（L01/L02）の専用secretの固定版だけ。読取りを数え、43文字の合成payloadを返す。
+    if (plan.encryptionSecret !== undefined && request.name === plan.encryptionSecret.name) {
+      plan.encryptionSecret.reads += 1;
+      const data = Buffer.from(plan.encryptionSecret.value, 'latin1');
+      return gaxPromise(() => Promise.resolve([{ name: request.name, payload: { data, dataCrc32c: crc32c(data) } }, undefined, undefined]));
+    }
     const purpose = purposeOf(request.name);
     rpc.access.push(purpose);
     const mode = plan.secret?.[purpose];
@@ -252,8 +273,10 @@ const FakeSecrets = gapic('secrets', [['locationsClient', 'locationsStub']], () 
   },
 }));
 const fakeAuth = {
-  async verifyIdToken() {
+  async verifyIdToken(token) {
     take('port');
+    // 本文暗号化の有効構成（L01/L02）だけ: 合成の検証済みtoken。それ以外は従来どおり拒否。
+    if (typeof plan.idToken === 'function') return plan.idToken(token);
     throw Object.assign(new Error('invalid'), { code: 'auth/invalid-id-token' });
   },
   async getUser() {
@@ -832,4 +855,123 @@ group('A8 timers / signals / env: a failing and a ready entry leave no timer and
   const afterCount = timers();
   assert.deepEqual([afterCount - before, addedSignalListeners('SIGTERM').length, addedSignalListeners('SIGINT').length, JSON.stringify(Object.keys(process.env).sort()) === realEnvKeysBefore, Object.hasOwn(process.env, 'NODE_OPTIONS'), net0.refused, unhandled], [0, 0, 0, true, false, 0, 0]);
   results.A8 = { timersBefore: before, timersAfter: afterCount, envSwaps };
+});
+
+// ---------- 本文暗号化の有効構成（T075 L01/L02） ----------
+// 有効な配置設定（合成）を隔離copy（候補rootの.tmp/test-encryption-bootstrap-<UUID>、終了時に削除）のdistへ置き、そのcopyの実
+// startOwnedIngressDevelopmentDeliveryFunctionを、上と同じ外部SDKの代替（require cache）・合成env・合成HTTPで通す。製品へ試験専用の口は足さない。
+//   L01 起動時の専用secretの読取り0、認証済みGETで専用secretの固定版を1回読み、実ringを初期化して公開鍵を返す。
+//   L02 close（清掃1回）の後のGETは固定503で、専用secretの追加読取り0。
+// 元のsrc/distの配置設定のbytesは前後で同じ（run-testsの検査に加えてここでも確かめる）。
+group('L01/L02 payload encryption on: the owned bootstrap reads the dedicated secret only on the first authenticated GET, initializes a real ring, and after close answers 503 with no further secret read', async () => {
+  const { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } = await import('node:fs');
+  const { basename, dirname, join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const { randomUUID } = await import('node:crypto');
+  const { connectIdentityHash } = await import('../dist/connect/firestore.js');
+  const { createHmacHasher } = await import('../dist/secrets.js');
+  const { DEPLOYMENT_CONFIG: SYNTHETIC } = await import('./fixtures/synthetic-deployment.mjs');
+  const work = fileURLToPath(new URL('..', import.meta.url));
+  const root = basename(dirname(work.replace(/[\\/]$/, ''))) === '.tmp' ? dirname(dirname(work.replace(/[\\/]$/, ''))) : work;
+  const guarded = [join(work, 'dist', 'config', 'deployment.js'), join(root, 'src', 'config', 'deployment.ts')];
+  const digest = () => guarded.map((file) => createHash('sha256').update(readFileSync(file)).digest('hex')).join(',');
+  const before = digest();
+  const copy = join(root, '.tmp', `test-encryption-bootstrap-${randomUUID()}`);
+  const secretName = `projects/${M.projectNumber}/secrets/synthetic-payload-protection/versions/1`;
+  const enabled = {
+    ...structuredClone(SYNTHETIC),
+    payloadEncryption: {
+      mode: 'jwe-rsa-oaep-256-a256gcm-v1',
+      namespace: `t280_${randomUUID()}`,
+      secret: `projects/${M.projectNumber}/secrets/synthetic-payload-protection`,
+      writeSecretVersion: 1,
+      readSecretVersions: [1],
+    },
+  };
+  const docsAtStart = new Map(docs);
+  try {
+    mkdirSync(copy, { recursive: true });
+    cpSync(join(work, 'dist'), join(copy, 'dist'), { recursive: true });
+    cpSync(join(work, 'package.json'), join(copy, 'package.json'));
+    writeFileSync(join(copy, 'dist', 'config', 'deployment.js'), `export const DEPLOYMENT_CONFIG = ${JSON.stringify(enabled)};\n`);
+    // copyの実moduleを、元のdistと同じ順序で実SDKへ束縛してから読み込み（require cacheを一時的に元へ戻す）、SDKの代替を置き直す。
+    const fakes = new Map([...cacheBefore.keys()].map((filename) => [filename, Module._cache[filename]]));
+    for (const [filename, original] of cacheBefore) {
+      if (original === undefined) delete Module._cache[filename];
+      else Module._cache[filename] = original;
+    }
+    const copyUrl = (path) => new URL(`file:///${join(copy, 'dist', path).replace(/\\/g, '/')}`).href;
+    try {
+      for (const path of ['connect/firestore.js', 'connect/kms-port.js', 'connect/kms-server.js', 'connect/google-kms-server.js', 'delivery/kms-functions.js', 'delivery/kms-store.js', 'egress/product.js', 'keys/google-secret-reader.js', 'oauth/request-auth-runtime.js', 'protection/google-kms-transport.js', 'identity/firebase.js']) {
+        await import(copyUrl(path));
+      }
+    } finally {
+      for (const [filename, fake] of fakes) Module._cache[filename] = fake;
+    }
+    const enabledBootstrap = await import(copyUrl('google-runtime/delivery-development.js'));
+
+    // 合成の本人（既存owner・明示許可）。identityHashは同じidentifierKeyのHMAC。
+    const uid = 'synthetic-apple-uid-encryption';
+    const identityHash = connectIdentityHash(createHmacHasher(PAYLOADS.identifierKey), M.connectNamespace, { projectId: M.projectId, uid });
+    const ownerId = randomUUID();
+    const now = Date.now();
+    const connectRoot = `sttdConnect/${M.connectNamespace}`;
+    docs.set(`${connectRoot}/access/${identityHash}`, { version: 1, state: 'active', generation: randomUUID(), updatedAt: now });
+    docs.set(`${connectRoot}/identities/${identityHash}`, { ownerId, createdAt: now });
+    docs.set(`${connectRoot}/owners/${ownerId}`, { identityHash, sealedUid: 'synthetic-sealed', createdAt: now, lastActiveAt: now, revokedAt: null });
+    const encryptionSecret = { name: secretName, value: randomBytes(32).toString('base64url'), reads: 0 };
+    plan = {
+      memoryTx: true,
+      encryptionSecret,
+      idToken: (token) => {
+        if (token !== 'tok.synthetic-encryption.sig') throw Object.assign(new Error('invalid'), { code: 'auth/invalid-id-token' });
+        return { aud: M.projectId, iss: `https://securetoken.google.com/${M.projectId}`, sub: uid, uid, auth_time: Math.floor(Date.now() / 1000), firebase: { sign_in_provider: 'apple.com' } };
+      },
+    };
+    const options = optionsFor({
+      ingress: () => {
+        const at = Date.now();
+        return { receivedAt: at, deadlineAt: at + 20_000, signal: new AbortController().signal };
+      },
+    });
+    const get = async (ready) => {
+      const { req, res } = exchange('GET', '/v2/encryption-key');
+      req.headers.authorization = 'Bearer tok.synthetic-encryption.sig';
+      req.rawHeaders.push('Authorization', 'Bearer tok.synthetic-encryption.sig');
+      req.rawBody = Buffer.alloc(0);
+      await ready.handler(req, res);
+      return { status: res.statusCode, json: res.body === null ? null : JSON.parse(res.body.toString('utf8')) };
+    };
+    const env = makeEnv(baseEnv(), {});
+    const outcome = await withEnv(env, async () => {
+      const ready = await enabledBootstrap.startOwnedIngressDevelopmentDeliveryFunction(options);
+      const atStartup = encryptionSecret.reads;
+      const first = await get(ready);
+      const afterFirst = encryptionSecret.reads;
+      const ring = [...docs.keys()].filter((path) => path.startsWith(`sttdEncryption/${enabled.payloadEncryption.namespace}/rings/`));
+      const closedFrom = events.length;
+      await ready.close();
+      const closes = closeCounts(events.slice(closedFrom));
+      const second = await get(ready);
+      return { atStartup, first, afterFirst, ring: ring.length, closes, second, afterClose: encryptionSecret.reads };
+    });
+    // L01: 起動時0、最初のGETで固定版を1回読み、ringを1つ作って公開鍵を返す。
+    assert.equal(outcome.atStartup, 0);
+    assert.equal(outcome.first.status, 200);
+    assert.equal(outcome.first.json.alg, 'RSA-OAEP-256');
+    assert.equal(outcome.afterFirst, 1);
+    assert.equal(outcome.ring, 1);
+    // L02: closeで所有SDKを各1回清掃し、その後のGETは固定503で追加読取り0。
+    assert.deepEqual(outcome.closes, [1, 1, 1, 1]);
+    assert.equal(outcome.second.status, 503);
+    assert.deepEqual(outcome.second.json, UNAVAILABLE);
+    assert.equal(outcome.afterClose, 1);
+    results.L01 = { startupReads: outcome.atStartup, firstGetReads: outcome.afterFirst };
+  } finally {
+    plan = {};
+    docs.clear();
+    for (const [path, value] of docsAtStart) docs.set(path, value);
+    rmSync(copy, { recursive: true, force: true, maxRetries: 3 });
+  }
+  assert.equal(digest(), before, 'the original deployment config bytes are unchanged');
 });
