@@ -59,6 +59,39 @@ Deadlines: the processing budget is the shorter of 20 seconds from receipt and t
 
 The local send screen `/console` sends the text the user typed into its empty input to the API through the local helper in the same five-field form (there is no direction or preset selection). It also shows the connection state and disconnects through the existing `/v1/web/disconnect` after an explicit confirmation. The helper forwards the user's Bearer token to the fixed API/MCP origins, without forwarding the browser's Origin, cookies, or local nonce. The API CORS still allows only the three routes above from the configured MCP origin (allowed headers: authorization, content-type, idempotency-key; `Retry-After` exposed; no wildcard or credential cookies). There is no need to add localhost to the Cloud service's allowed origins. Old v1 routes with an Origin and other origins get a fixed 403; requests without an Origin proceed to normal processing without CORS headers (v1 is 404).
 
+<a id="encryption-key"></a>
+### Fetching your own public key (payload encryption, off by default)
+
+Available only on deployments that enable payload encryption in the [deployment configuration](CONFIGURATION_EN.md#payload-encryption). On deployments where it is off, the response is `404 not_found`. The current version provides only this fetch; sending encrypted text and reissuing keys are not provided yet.
+
+`GET /v2/encryption-key` (`Authorization: Bearer <Firebase ID token>`, no body or query)
+
+- There is one key per authenticated user unit (UID). Multiple devices of the same UID receive the same key, and a different UID gets a different key. The first fetch creates the key; later fetches return the same key. Repeated fetches never recreate the key.
+- You cannot select anyone else's key. Specifying a user or key in the query or body returns `400 invalid_request`.
+- Success is `200` and returns only the following public information (`Cache-Control: no-store`). Keep it in client memory for at most 5 minutes, and fetch again after receiving a 409 below.
+
+```json
+{
+  "version": 1,
+  "kid": "<lower-case UUID>",
+  "alg": "RSA-OAEP-256",
+  "enc": "A256GCM",
+  "scope": "<43-character base64url>",
+  "publicJwk": { "kty": "RSA", "n": "<base64url>", "e": "AQAB", "kid": "<kid>", "alg": "RSA-OAEP-256", "use": "enc" },
+  "publicKeySpki": "<base64url of the SPKI DER>",
+  "createdAt": "<ISO 8601>"
+}
+```
+
+| status | `error.code` | Meaning |
+| --- | --- | --- |
+| 401 | `authentication_required` | No Bearer token, or identity could not be verified |
+| 403 | `access_denied` | The operator has not granted access, or access is suspended |
+| 409 | `connection_required` | There is no connection (owner), it was revoked, or it has not been used for 90 days. Connect again (fetching a key never creates a connection) |
+| 409 | `encryption_key_unavailable` | The key has not been used for 90 days and is unavailable. It is not recreated automatically |
+| 429 | `rate_limited` | Too many fetch attempts (60 per minute and 1000 per UTC day; first creation 3 per minute and 10 per day). Wait for the `Retry-After` seconds |
+| 503 | `temporarily_unavailable` | Temporary failure of storage, the protection key or the processing deadline. A failure of the dedicated protection key does not stop plaintext sending. Failures of components shared with existing sending, such as the shared database, can affect plaintext sending as before |
+
 ## 3. Send screen and connection state
 
 The send screen is served by the local helper on your computer ([LOCAL_CONSOLE_EN.md](LOCAL_CONSOLE_EN.md)), not by Cloud Run. The MCP service serves only the OAuth interaction pages; `/console`, `/connect` and their assets are 404 there like any unknown path. The helper relays the pressed actions to the routes below with your Bearer token.

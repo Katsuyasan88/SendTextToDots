@@ -72,7 +72,7 @@ See the English [security policy and reporting channel status](../SECURITY.md). 
 
 ## Key storage for payload encryption (in development)
 
-The current version contains only the foundation for storing and protecting keys; there is no entry yet for fetching the public key, sending encrypted text or reissuing keys ([configuration](CONFIGURATION_EN.md#payload-encryption)).
+The current version provides only key storage and protection and [fetching your own public key](API_EN.md#encryption-key); there is no entry yet for sending encrypted text or reissuing keys ([configuration](CONFIGURATION_EN.md#payload-encryption)). The fetch returns only the verified user's own key; the query or body cannot select another person or key. The response contains only public information and never returns the UID, internal IDs, Secret references or the private key (including its protected form).
 
 - Each authenticated Firebase user unit (UID) has its own RSA 3072 key: multiple devices of the same UID share it, and the UID of a new code connection gets a separate key. A key is created only for a user explicitly registered by the operator who already has a connection (owner). Fetching a key never creates an owner or an access permission.
 - Only the private key encrypted with AES-256-GCM under a dedicated protection key (a fixed numeric version of a dedicated Secret Manager secret) is stored in Firestore. The deployment, user, key ID, public key and protection key version are included as authenticated data, so a stored record copied to another user, environment or version cannot be opened. The raw private key, the protection key and the UID are never stored or returned.

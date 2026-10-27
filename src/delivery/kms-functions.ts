@@ -16,6 +16,7 @@ import type { HttpsFunction } from 'firebase-functions/https';
 
 import { createCommandDeliveryAttempt, type CommandDeliveryAttempt, type CommandDeliveryEgress } from '../commands/delivery-attempt.js';
 import type { ConnectStorage } from '../connect/firestore.js';
+import type { EncryptionKeyEndpoint } from '../encryption/api.js';
 import type { IdentityVerifier, VerifiedIdentity } from '../identity/firebase.js';
 import type { Clock } from '../policy.js';
 import type { SecretHasher } from '../secrets.js';
@@ -24,7 +25,7 @@ import { createRequestDeliveryFunction } from './functions.js';
 import { createKmsRequestDeliveryRuntime, type KmsRequestDeliveryRuntime, type KmsRequestDeliveryRuntimeOptions } from './kms-runtime.js';
 
 const REQUIRED = ['db', 'connect', 'hasher', 'digestKey', 'kms', 'identity', 'egress', 'clock', 'namespace', 'ingress'] as const;
-const OPTIONAL = ['log'] as const;
+const OPTIONAL = ['log', 'encryptionKeys'] as const;
 
 export type KmsDeliveryFunctionErrorCode = 'delivery_function_invalid' | 'delivery_function_close_failed';
 
@@ -56,6 +57,8 @@ export interface KmsRequestDeliveryFunctionOptions {
   /** 要求固有storeから元のHTTP ingressを返すtrustedな内部source（起動時には呼ばない）。 */
   readonly ingress: () => DeliveryHttpIngress;
   readonly log?: ((entry: Record<string, unknown>) => void) | undefined;
+  /** 本文暗号化が有効な配置だけ: 公開鍵取得のport（借用。HTTP入口が形を検査する）。無ければ/v2/encryption-keyは404。 */
+  readonly encryptionKeys?: EncryptionKeyEndpoint | undefined;
 }
 
 export interface KmsRequestDeliveryFunction {
@@ -176,6 +179,7 @@ export function createIngressKmsRequestDeliveryFunction(options: KmsRequestDeliv
       clock,
       log,
       lifetime: lifetime.signal,
+      ...(fields.has('encryptionKeys') ? { encryptionKeys: fields.get('encryptionKeys') as EncryptionKeyEndpoint } : {}),
     };
     handler = createRequestDeliveryFunction(createIngressOperationDeliveryRequestHandler({ ...apiDeps, ingress }));
   } catch {

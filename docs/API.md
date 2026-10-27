@@ -59,6 +59,39 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 
 ローカル送信画面 `/console` は、空の入力欄に利用者が入力した本文を同じ5項目の形でローカルhelper経由でAPIへ送ります（方向・定型文の選択はありません）。接続状態の表示と、明示の確認後に既存の `/v1/web/disconnect` で行う接続解除も同じ画面にあります。helperは利用者のBearer tokenを固定のAPI/MCP originへ中継し、ブラウザのOrigin・cookie・local nonceは転送しません。APIのCORSは引き続き設定のMCP originからの上の3 routeだけを許可します（許可header: authorization・content-type・idempotency-key、`Retry-After` を公開、wildcard・credential cookieなし）。localhostをCloud側の許可originへ追加する必要はありません。Originが付いた旧v1 routeや他のoriginは固定の403、Originの無い要求はCORS headerを付けずに通常の処理（v1は404）へ進みます。
 
+<a id="encryption-key"></a>
+### 本人の公開鍵の取得（本文暗号化、既定off）
+
+[配置設定](CONFIGURATION.md#payload-encryption)で本文暗号化を有効にした配置だけで使えます。offの配置では`404 not_found`です。現在の版で提供するのはこの取得だけで、暗号文の送信と鍵の再発行はまだ提供していません。
+
+`GET /v2/encryption-key`（`Authorization: Bearer <Firebase ID token>`、本文・queryなし）
+
+- 認証済みの利用単位（UID）ごとの鍵です。同じUIDの複数の端末は同じ鍵を受け取り、別のUIDは別の鍵です。初回の取得で鍵を作り、以後は同じ鍵を返します。取得の繰り返しで鍵を作り直しません。
+- 本人以外の鍵は選べません。queryや本文で利用者・鍵を指定すると`400 invalid_request`です。
+- 成功は`200`で、次の公開情報だけを返します（`Cache-Control: no-store`）。clientのメモリ上の保持は最大5分にし、下の409を受けたら取り直してください。
+
+```json
+{
+  "version": 1,
+  "kid": "<小文字UUID>",
+  "alg": "RSA-OAEP-256",
+  "enc": "A256GCM",
+  "scope": "<base64url 43文字>",
+  "publicJwk": { "kty": "RSA", "n": "<base64url>", "e": "AQAB", "kid": "<kid>", "alg": "RSA-OAEP-256", "use": "enc" },
+  "publicKeySpki": "<SPKI DERのbase64url>",
+  "createdAt": "<ISO 8601>"
+}
+```
+
+| status | `error.code` | 意味 |
+| --- | --- | --- |
+| 401 | `authentication_required` | Bearer tokenがない、または本人確認ができない |
+| 403 | `access_denied` | 運営者の利用許可がない、または停止中 |
+| 409 | `connection_required` | 接続（owner）がない、失効した、または90日間使われていない。接続し直してください（鍵の取得では接続を作りません） |
+| 409 | `encryption_key_unavailable` | 鍵が90日間使われず利用できない。自動では作り直しません |
+| 429 | `rate_limited` | 取得の試行が多すぎる（1分60回・UTCの1日1000回、初回の作成は1分3回・1日10回）。`Retry-After`の秒数だけ待ってください |
+| 503 | `temporarily_unavailable` | 保存・保護鍵・処理期限の一時的な障害。専用の保護鍵の障害で平文の送信を止めることはありません。共有のデータベースなど、既存の送信と共通の部品の障害は、従来どおり平文の送信にも影響することがあります |
+
 ## 3. 送信画面と接続状態
 
 送信画面はCloud Runではなく、自分のパソコンで動くローカルhelperが配信します（[LOCAL_CONSOLE.md](LOCAL_CONSOLE.md)）。MCP serviceはOAuth interaction画面だけを配信し、`/console`・`/connect`とそのassetは未知pathと同じ404です。helperは押した操作だけを下のrouteへBearer tokenつきで中継します。

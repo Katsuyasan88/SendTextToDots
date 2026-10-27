@@ -38,6 +38,7 @@ import { ConnectStorage, isConnectNamespace } from '../connect/firestore.js';
 import { createConnectKmsSealingPort } from '../connect/kms-port.js';
 import type { DeliveryHttpIngress } from '../delivery/api.js';
 import { createIngressKmsRequestDeliveryFunction, type KmsRequestDeliveryFunction } from '../delivery/kms-functions.js';
+import { createEncryptionKeyRuntime, type EncryptionKeyRuntime } from '../encryption/api.js';
 import { isKmsDeliveryNamespace } from '../delivery/kms-store.js';
 import { createProductEgress } from '../egress/product.js';
 import type { LogSink } from '../http/log.js';
@@ -337,6 +338,8 @@ interface Owned {
   transport: GoogleKmsTransport | undefined;
   context: RequestAuthContext | undefined;
   app: KmsRequestDeliveryFunction | undefined;
+  /** 本文暗号化が有効な配置だけ: 公開鍵取得（専用Secretのadapterを所有）。 */
+  encryption?: EncryptionKeyRuntime | undefined;
   readonly buffers: Buffer[];
 }
 
@@ -348,7 +351,7 @@ async function cleanup(owned: Owned): Promise<boolean> {
   let ok = true;
   const app = owned.app;
   if (app !== undefined) ok = (await settledWithin(() => app.close(), CLOSE_STEP_MS)) && ok;
-  for (const dispose of [() => owned.context?.dispose(), () => owned.reader?.dispose(), () => owned.transport?.dispose()]) {
+  for (const dispose of [() => owned.context?.dispose(), () => owned.reader?.dispose(), () => owned.encryption?.dispose(), () => owned.transport?.dispose()]) {
     try {
       dispose();
     } catch {
@@ -616,6 +619,10 @@ async function startWith(config: Captured): Promise<OwnedDevelopmentDeliveryFunc
       interactionTtlMs: PRODUCT_POLICY.interactionTtlMs,
       grantInactivityMs: PRODUCT_POLICY.refreshFamilyMaxSec * 1000,
     });
+    // 本文暗号化（配置設定で有効な時だけ）: 同じdb・hasher・clockで公開鍵取得を組み立てる。起動時の専用Secret読取り0（要求時だけ）。
+    // offはnullで、専用Secretのclient・新しい秘密に触れない。
+    const encryption = createEncryptionKeyRuntime({ db: sdk.db, secretClient: sdk.secretClient, deployment: config.deployment, hasher, clock }) ?? undefined;
+    owned.encryption = encryption;
     live();
     try {
       const appOptions = {
@@ -629,6 +636,7 @@ async function startWith(config: Captured): Promise<OwnedDevelopmentDeliveryFunc
         clock,
         namespace: config.deliveryNamespace,
         ...(config.log !== undefined ? { log: config.log } : {}),
+        ...(encryption !== undefined ? { encryptionKeys: encryption.endpoint } : {}),
       };
       owned.app = createIngressKmsRequestDeliveryFunction({ ...appOptions, ingress: config.ingress });
     } finally {

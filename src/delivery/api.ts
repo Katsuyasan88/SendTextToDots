@@ -2,7 +2,9 @@
 //   POST /v2/commands                 新規は要求内の結果を200＋state、同ID処理中は202＋in_flight
 //   GET  /v2/commands/{commandId}     読取りだけ。不在と他ownerは同じ404
 //   POST /v2/commands/{commandId}/cancel
+//   GET  /v2/encryption-key           本人の公開鍵（本文暗号化が有効な配置だけ。offは404。body・queryは400）
 // 旧v1の3 routeはroute外（404 not_found、serviceを呼ばない）。新旧の変換・redirectはしない。
+// 公開鍵の取得は検証済みidentityだけを鍵service（encryption/api.ts）へ渡す。ownerはserviceが作らずに読む（findOwnerは呼ばない）。
 // 本人確認はBearer Firebase ID token（verifyIdToken・失効確認・apple.com）だけで、UID→ownerは接続保存（ConnectStorage.findOwner）から引く
 // （作らない）。Node標準のreq/resだけを使う。本文は、frameworkが既に読んだrawBody（wireのbytes）があればそれを使い、無ければ通常のstreamを
 // 上限・元期限つきで自分で読む（途中の切断・超過・期限は処理せず拒否）。
@@ -14,6 +16,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { types } from 'node:util';
 
+import type { EncryptionKeyEndpoint } from '../encryption/api.js';
 import { IdentityError, type IdentityVerifier, type VerifiedIdentity } from '../identity/firebase.js';
 import { MAX_COMMAND_BODY_BYTES, type Clock } from '../policy.js';
 import { isRealSignal } from '../protection/google-sdk-call.js';
@@ -22,6 +25,7 @@ import { errorResponse, type DeliveryResponse } from './event.js';
 const BEARER_ID_TOKEN = /^Bearer ([A-Za-z0-9._-]{1,4096})$/;
 const UUID = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
 const COMMAND_PATH = new RegExp(`^/v2/commands/(${UUID})(/cancel)?$`);
+const ENCRYPTION_KEY_PATH = '/v2/encryption-key';
 
 /** onRequestのreqが持つwireの本文。 */
 export type DeliveryRequest = IncomingMessage & { readonly rawBody?: Buffer | undefined };
@@ -92,6 +96,8 @@ export interface IngressOperationDeliveryApiDeps {
   readonly lifetime: AbortSignal;
   /** 要求固有storeから元ingressを返すtrustedな内部source。 */
   readonly ingress: () => DeliveryHttpIngress;
+  /** 本文暗号化が有効な配置だけ: 本人の公開鍵取得（frozenでown dataの`get`関数を持つobject）。無ければ/v2/encryption-keyは404。 */
+  readonly encryptionKeys?: EncryptionKeyEndpoint | undefined;
 }
 
 /** depsの不正（ingress sourceが関数でない・Proxy・accessor）。固定のmessageだけ。 */
@@ -238,7 +244,22 @@ export function createIngressOperationDeliveryRequestHandler(deps: IngressOperat
     throw new DeliveryIngressConfigError();
   }
   const source = descriptor.value as Function;
-  return buildOperationHandler(deps, () => Reflect.apply(source, undefined, []) as unknown);
+  const encryptionKeys = captureEncryptionKeys(deps);
+  return buildOperationHandler(deps, () => Reflect.apply(source, undefined, []) as unknown, encryptionKeys);
+}
+
+/** 任意のencryptionKeys（欠落/undefinedは無効）。own dataのfrozen objectで、own dataの`get`関数だけを捕捉する（Proxy・accessorは拒否）。 */
+function captureEncryptionKeys(deps: object): EncryptionKeyEndpoint | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(deps, 'encryptionKeys');
+  if (descriptor === undefined) return undefined;
+  if (!('value' in descriptor)) throw new DeliveryIngressConfigError();
+  const value: unknown = descriptor.value;
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null || types.isProxy(value) || !Object.isFrozen(value)) throw new DeliveryIngressConfigError();
+  const get = Object.getOwnPropertyDescriptor(value, 'get');
+  if (get === undefined || !('value' in get) || typeof get.value !== 'function' || types.isProxy(get.value)) throw new DeliveryIngressConfigError();
+  const fn = get.value as Function;
+  return Object.freeze({ get: (identity: VerifiedIdentity, operation: DeliveryRequestOperation) => Reflect.apply(fn, value, [identity, operation]) as Promise<DeliveryResponse> });
 }
 
 /** 1つの要求の開始（受信時刻・元期限・timerの残り・結ぶ親signal）。不成立はundefined（固定503）。 */
@@ -272,7 +293,11 @@ function ingressStart(source: () => unknown, clock: Clock): RequestStart | undef
   }
 }
 
-function buildOperationHandler(deps: IngressOperationDeliveryApiDeps, ingress: () => unknown): (req: DeliveryRequest, res: ServerResponse) => Promise<void> {
+function buildOperationHandler(
+  deps: IngressOperationDeliveryApiDeps,
+  ingress: () => unknown,
+  encryptionKeys: EncryptionKeyEndpoint | undefined,
+): (req: DeliveryRequest, res: ServerResponse) => Promise<void> {
   const { identity, findOwner, service, clock, lifetime } = deps;
   const log = (entry: Record<string, unknown>) => {
     try {
@@ -326,21 +351,31 @@ function buildOperationHandler(deps: IngressOperationDeliveryApiDeps, ingress: (
 
       const method = req.method ?? '';
       let path: string;
+      let search: string;
       try {
-        path = new URL(req.url ?? '/', 'http://function.invalid').pathname;
+        const url = new URL(req.url ?? '/', 'http://function.invalid');
+        path = url.pathname;
+        search = url.search;
       } catch {
         response = errorResponse(400, 'invalid_request');
         return;
       }
       const match = COMMAND_PATH.exec(path);
       label = path === '/v2/commands' ? 'commands.post' : match ? (match[2] ? 'commands.cancel' : 'commands.get') : 'not_found';
+      // 公開鍵の取得は暗号化が有効な配置だけ（offは他の未知pathと同じ404。鍵service・Secretを呼ばない）。
+      if (path === ENCRYPTION_KEY_PATH && encryptionKeys !== undefined) label = 'encryption_key.get';
       if (label === 'not_found') {
         response = errorResponse(404, 'not_found');
         return;
       }
-      const allowed = label === 'commands.get' ? 'GET' : 'POST';
+      const allowed = label === 'commands.get' || label === 'encryption_key.get' ? 'GET' : 'POST';
       if (method !== allowed) {
         response = errorResponse(405, 'method_not_allowed');
+        return;
+      }
+      // 公開鍵の取得はqueryで本人・鍵・Secretを選ばせない（空でなければ400）。
+      if (label === 'encryption_key.get' && search !== '') {
+        response = errorResponse(400, 'invalid_request');
         return;
       }
 
@@ -399,6 +434,11 @@ function buildOperationHandler(deps: IngressOperationDeliveryApiDeps, ingress: (
     } else if (body.length > 0) {
       return errorResponse(400, 'invalid_request');
     }
+    if (label === 'encryption_key.get') {
+      const verified = await verifiedWith(req, operation, live);
+      if (!('uid' in verified)) return verified;
+      return adopted(() => encryptionKeys!.get(verified, operation), operation, live);
+    }
     const resolved = await ownerWith(req, operation, live);
     if (typeof resolved !== 'string') return resolved;
     if (!live()) return unavailable();
@@ -420,6 +460,24 @@ function buildOperationHandler(deps: IngressOperationDeliveryApiDeps, ingress: (
     const result = await untilStopped(start, operation.signal);
     if (result === STOPPED || !live()) return unavailable();
     return result;
+  }
+
+  /** Bearer tokenの本人確認だけ（owner照会なし）。不成立は401/503の応答。 */
+  async function verifiedWith(req: IncomingMessage, operation: DeliveryRequestOperation, live: () => boolean): Promise<VerifiedIdentity | DeliveryResponse> {
+    const match = BEARER_ID_TOKEN.exec(header(req, 'authorization') ?? '');
+    if (!match) return errorResponse(401, 'authentication_required');
+    if (!live()) return unavailable();
+    let verified: VerifiedIdentity | typeof STOPPED;
+    try {
+      verified = await untilStopped(() => identity.verifyIdToken(match[1]!), operation.signal);
+    } catch (error) {
+      if (!live()) return unavailable();
+      const code = error instanceof IdentityError ? error.code : 'unavailable';
+      log({ event: 'identity.rejected', code });
+      return code === 'unavailable' ? unavailable() : errorResponse(401, 'authentication_required');
+    }
+    if (verified === STOPPED || !live()) return unavailable();
+    return verified;
   }
 
   async function ownerWith(req: IncomingMessage, operation: DeliveryRequestOperation, live: () => boolean): Promise<string | DeliveryResponse> {
