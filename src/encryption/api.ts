@@ -16,19 +16,73 @@ import type { VerifiedIdentity } from '../identity/firebase.js';
 import type { SecretHasher } from '../secrets.js';
 import { createEncryptedCommandEndpoint, type EncryptedCommandEndpoint, type ValidatedCommandDelivery } from './commands.js';
 import { createEncryptionSecretProvider, createGoogleEncryptionSecretSource } from './secret-provider.js';
-import { EncryptionKeyService, type KeyServiceOutcome } from './service.js';
+import { readFlatJsonObject } from '../commands/input.js';
+import type { ReissueMode } from './contract.js';
+import { EncryptionKeyService, type KeyServiceOutcome, type ReissueServiceOutcome } from './service.js';
 import { EncryptionKeyStore } from './store.js';
 
 /** 送信APIの入口が使う公開鍵取得のport（T073の暗号文入口も同じ入口へ別portで足す）。 */
 export interface EncryptionKeyEndpoint {
   get(identity: VerifiedIdentity, operation: DeliveryRequestOperation): Promise<DeliveryResponse>;
+  /** 本人の明示再発行（requestIdは小文字へ揃えた検証済みのUUID）。 */
+  reissue(identity: VerifiedIdentity, request: ReissueRequest, operation: DeliveryRequestOperation): Promise<DeliveryResponse>;
+}
+
+export interface ReissueRequest {
+  readonly requestId: string;
+  readonly mode: ReissueMode;
 }
 
 export interface EncryptionKeySource {
   getOrInitialize(identity: { readonly projectId: string; readonly uid: string }, operation: DeliveryRequestOperation): Promise<KeyServiceOutcome>;
+  reissue(identity: { readonly projectId: string; readonly uid: string }, request: ReissueRequest, operation: DeliveryRequestOperation): Promise<ReissueServiceOutcome>;
 }
 
-function responseOf(outcome: KeyServiceOutcome): DeliveryResponse {
+/** 再発行の本文の上限（バイト）。 */
+export const REISSUE_BODY_MAX_BYTES = 1024;
+const REISSUE_FIELDS: ReadonlySet<string> = new Set(['requestId', 'mode']);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * 再発行の本文（HTTP入口が本人確認・DBより前に呼ぶ）: BOMなしのfatal UTF-8、exact {requestId, mode}（重複・未知key・型違いは拒否）、
+ * requestIdはUUIDでIdempotency-Keyと大小無視で一致、modeはnormal/compromised。不成立はnull。
+ */
+export function parseReissueBody(body: Buffer, idempotencyKey: string | undefined): ReissueRequest | null {
+  try {
+    if (body.length < 1 || body.length > REISSUE_BODY_MAX_BYTES) return null;
+    if (body.length >= 3 && body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf) return null;
+    const members = readFlatJsonObject(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(body), REISSUE_FIELDS);
+    const requestId = members.get('requestId');
+    const mode = members.get('mode');
+    if (members.size !== 2 || typeof requestId !== 'string' || !UUID.test(requestId)) return null;
+    if (mode !== 'normal' && mode !== 'compromised') return null;
+    if (idempotencyKey === undefined || idempotencyKey.toLowerCase() !== requestId.toLowerCase()) return null;
+    return Object.freeze({ requestId: requestId.toLowerCase(), mode });
+  } catch {
+    return null;
+  }
+}
+
+function reissueResponseOf(outcome: ReissueServiceOutcome, requestId: string): DeliveryResponse {
+  switch (outcome.kind) {
+    case 'ok':
+      return responseOf(outcome);
+    case 'in_flight':
+      return { status: 202, body: { requestId, state: 'in_flight' }, headers: { 'Retry-After': '1' } };
+    case 'conflict':
+      return errorResponse(409, 'idempotency_conflict');
+    case 'in_progress':
+      return errorResponse(409, 'key_reissue_in_progress', true);
+    case 'failed':
+      return errorResponse(409, 'key_reissue_failed');
+    case 'key_not_initialized':
+      return errorResponse(409, 'key_not_initialized');
+    default:
+      return responseOf(outcome);
+  }
+}
+
+function responseOf(outcome: KeyServiceOutcome | Exclude<ReissueServiceOutcome, { readonly kind: 'in_flight' | 'conflict' | 'in_progress' | 'failed' | 'key_not_initialized' }>): DeliveryResponse {
   switch (outcome.kind) {
     case 'ok': {
       const key = outcome.key;
@@ -68,6 +122,14 @@ export function createEncryptionKeyEndpoint(source: EncryptionKeySource): Encryp
         Object.freeze({ deadlineAt: operation.deadlineAt, signal: operation.signal }),
       );
       return responseOf(outcome);
+    },
+    async reissue(identity: VerifiedIdentity, request: ReissueRequest, operation: DeliveryRequestOperation): Promise<DeliveryResponse> {
+      const outcome = await source.reissue(
+        { projectId: identity.projectId, uid: identity.uid },
+        Object.freeze({ requestId: request.requestId, mode: request.mode }),
+        Object.freeze({ deadlineAt: operation.deadlineAt, signal: operation.signal }),
+      );
+      return reissueResponseOf(outcome, request.requestId);
     },
   });
 }

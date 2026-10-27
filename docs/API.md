@@ -62,7 +62,7 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 <a id="encryption-key"></a>
 ### 本人の公開鍵の取得（本文暗号化、既定off）
 
-[配置設定](CONFIGURATION.md#payload-encryption)で本文暗号化を有効にした配置だけで使えます。offの配置では`404 not_found`です。現在の版で提供するのはこの取得と下の[暗号文の送信](#encrypted-commands)で、鍵の再発行はまだ提供していません。
+[配置設定](CONFIGURATION.md#payload-encryption)で本文暗号化を有効にした配置だけで使えます。offの配置では`404 not_found`です。この取得のほか、下の[鍵の再発行](#encryption-key-reissue)と[暗号文の送信](#encrypted-commands)を提供します。
 
 `GET /v2/encryption-key`（`Authorization: Bearer <Firebase ID token>`、本文・queryなし）
 
@@ -91,6 +91,22 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 | 409 | `encryption_key_unavailable` | 鍵が90日間使われず利用できない。自動では作り直しません |
 | 429 | `rate_limited` | 取得の試行が多すぎる（1分60回・UTCの1日1000回、初回の作成は1分3回・1日10回）。`Retry-After`の秒数だけ待ってください |
 | 503 | `temporarily_unavailable` | 保存・保護鍵・処理期限の一時的な障害。専用の保護鍵の障害で平文の送信を止めることはありません。共有のデータベースなど、既存の送信と共通の部品の障害は、従来どおり平文の送信にも影響することがあります |
+
+<a id="encryption-key-reissue"></a>
+### 鍵の再発行（本文暗号化、既定off）
+
+`POST /v2/encryption-key/reissue`（`Authorization: Bearer <Firebase ID token>`、`Content-Type: application/json`、`Idempotency-Key: <requestId>`）。本文はちょうど`{"requestId":"<UUID>","mode":"normal"}`または`"mode":"compromised"`で、1024byte以下です。`requestId`は`Idempotency-Key`と一致させてください。queryや他の項目は`400 invalid_request`です。本人の鍵だけを作り直し、他人の鍵は選べません。offの配置では`404`です。
+
+- 成功は`200`で、新しい鍵の公開情報を返します（形は公開鍵の取得と同じ。秘密鍵は保護された形も含めて返しません）。
+- `normal`: 直前の鍵は120秒だけ復号に使え、その後は使えません。それより前の古い鍵はすぐ使えなくなります。`compromised`（漏えいの疑い）: 以前の鍵は全てすぐ使えなくなります。どちらも、送出権の確定より前に鍵が使えなくなった送信は送られません。確定した後の送出は撤回できません。
+- 同じ`requestId`と`mode`で送り直すと、元の結果をそのまま返します（その後さらに再発行されていても、その時の結果です。現在の鍵は公開鍵の取得で確かめてください）。処理中は`202`（`{"requestId":…,"state":"in_flight"}`、`Retry-After: 1`）で、鍵を追加で作りません。同じ`requestId`で`mode`が違えば`409 idempotency_conflict`です。
+- 処理が期限内（受信から最大20秒）に終わらなかった場合や、生成・保存に失敗した場合は、その`requestId`は`409 key_reissue_failed`になり、自動で作り直しません。旧鍵はそのまま使えます。もう一度再発行する場合は、新しい`requestId`で明示的に送ってください。応答が分からない（`503`等）場合は、まず同じ`requestId`で送り直して結果を確かめてください。
+- 別の`requestId`の再発行が処理中なら`409 key_reissue_in_progress`、鍵がまだ無ければ`409 key_not_initialized`です。
+- 回数: 再発行は24時間に4回まで（失敗・処理中も数えます）、前の再発行から60秒以上空けてください。異なる`requestId`の試行は1分3回・UTCの1日10回までです。同じ`requestId`の送り直しはこれらを使いませんが、HTTP要求として公開鍵の取得と同じ枠（1分60回・UTCの1日1000回）を使います。超えた場合は`429`と`Retry-After`です。
+- 他の端末は、公開鍵を最大5分保持した後か、`409 encryption_key_unavailable`を受けた時に公開鍵を取り直して追従してください。
+- 保持: 使えなくなった過去の鍵は切替から24時間後、再発行の記録は24時間後に、その利用者の鍵の次の正常な更新の時に消します。物理的な削除の時刻は保証しません。
+
+401・403・`409 connection_required`・`409 encryption_key_unavailable`（90日使われていない鍵）・`503`は公開鍵の取得と同じです。
 
 <a id="encrypted-commands"></a>
 ### 暗号文の送信（本文暗号化、既定off）

@@ -17,7 +17,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { types } from 'node:util';
 
-import type { EncryptionKeyEndpoint } from '../encryption/api.js';
+import { parseReissueBody, REISSUE_BODY_MAX_BYTES, type EncryptionKeyEndpoint, type ReissueRequest } from '../encryption/api.js';
 import { ENCRYPTED_CONTENT_TYPE, ENCRYPTED_WIRE_MAX_BYTES, type EncryptedCommandEndpoint } from '../encryption/commands.js';
 import { IdentityError, type IdentityVerifier, type VerifiedIdentity } from '../identity/firebase.js';
 import { MAX_COMMAND_BODY_BYTES, type Clock } from '../policy.js';
@@ -29,6 +29,7 @@ const UUID = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-
 const COMMAND_PATH = new RegExp(`^/v2/commands/(${UUID})(/cancel)?$`);
 const ENCRYPTION_KEY_PATH = '/v2/encryption-key';
 const ENCRYPTED_COMMANDS_PATH = '/v2/encrypted-commands';
+const REISSUE_PATH = '/v2/encryption-key/reissue';
 
 /** onRequestのreqが持つwireの本文。 */
 export type DeliveryRequest = IncomingMessage & { readonly rawBody?: Buffer | undefined };
@@ -270,7 +271,13 @@ function capturePort(deps: object, name: string, method: string): ((...args: unk
 
 function captureEncryptionKeys(deps: object): EncryptionKeyEndpoint | undefined {
   const get = capturePort(deps, 'encryptionKeys', 'get');
-  return get === undefined ? undefined : Object.freeze({ get: (identity: VerifiedIdentity, operation: DeliveryRequestOperation) => get(identity, operation) as Promise<DeliveryResponse> });
+  if (get === undefined) return undefined;
+  const reissue = capturePort(deps, 'encryptionKeys', 'reissue');
+  if (reissue === undefined) throw new DeliveryIngressConfigError();
+  return Object.freeze({
+    get: (identity: VerifiedIdentity, operation: DeliveryRequestOperation) => get(identity, operation) as Promise<DeliveryResponse>,
+    reissue: (identity: VerifiedIdentity, request: ReissueRequest, operation: DeliveryRequestOperation) => reissue(identity, request, operation) as Promise<DeliveryResponse>,
+  });
 }
 
 function captureEncryptedCommands(deps: object): EncryptedCommandEndpoint | undefined {
@@ -387,6 +394,7 @@ function buildOperationHandler(
       // 公開鍵の取得は暗号化が有効な配置だけ（offは他の未知pathと同じ404。鍵service・Secretを呼ばない）。
       if (path === ENCRYPTION_KEY_PATH && encryptionKeys !== undefined) label = 'encryption_key.get';
       if (path === ENCRYPTED_COMMANDS_PATH && encryptedCommands !== undefined) label = 'encrypted_commands.post';
+      if (path === REISSUE_PATH && encryptionKeys !== undefined) label = 'encryption_key.reissue';
       if (label === 'not_found') {
         response = errorResponse(404, 'not_found');
         return;
@@ -397,8 +405,8 @@ function buildOperationHandler(
         response = errorResponse(405, 'method_not_allowed');
         return;
       }
-      // 公開鍵の取得はqueryで本人・鍵・Secretを選ばせない（空でなければ400）。
-      if (label === 'encryption_key.get' && search !== '') {
+      // 公開鍵の取得・再発行はqueryで本人・鍵・Secretを選ばせない（空でなければ400）。
+      if ((label === 'encryption_key.get' || label === 'encryption_key.reissue') && search !== '') {
         response = errorResponse(400, 'invalid_request');
         return;
       }
@@ -409,7 +417,7 @@ function buildOperationHandler(
       }
       const now = readClock(clock);
       // 暗号文のwireは平文の8192とは別の12288で、超過は本人確認・DB・復号試行の前に読み出しを打ち切って400（暗号処理・rate消費0）。
-      const max = encrypted ? ENCRYPTED_WIRE_MAX_BYTES : MAX_COMMAND_BODY_BYTES;
+      const max = encrypted ? ENCRYPTED_WIRE_MAX_BYTES : label === 'encryption_key.reissue' ? REISSUE_BODY_MAX_BYTES : MAX_COMMAND_BODY_BYTES;
       const read = await operationBodyOf(req, max, now === undefined ? 0 : operation.deadlineAt - now, signal);
       if (read === STOPPED || !live()) {
         if (read !== STOPPED && read !== undefined && read.owned) read.body.fill(0);
@@ -457,8 +465,16 @@ function buildOperationHandler(
   ): Promise<DeliveryResponse> {
     if (label === 'commands.post') {
       if (!isJson(req) || body.length < 1) return errorResponse(400, 'invalid_request');
-    } else if (label !== 'encrypted_commands.post' && body.length > 0) {
+    } else if (label !== 'encrypted_commands.post' && label !== 'encryption_key.reissue' && body.length > 0) {
       return errorResponse(400, 'invalid_request');
+    }
+    if (label === 'encryption_key.reissue') {
+      // 本文の形・Idempotency-Keyとの一致は、本人確認・DBより前に確かめる。
+      const request = isJson(req) ? parseReissueBody(body, header(req, 'idempotency-key')) : null;
+      if (request === null) return errorResponse(400, 'invalid_request');
+      const verified = await verifiedWith(req, operation, live);
+      if (!('uid' in verified)) return verified;
+      return adopted(() => encryptionKeys!.reissue(verified, request, operation), operation, live);
     }
     if (label === 'encryption_key.get') {
       const verified = await verifiedWith(req, operation, live);

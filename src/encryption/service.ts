@@ -9,7 +9,7 @@
 import { connectIdentityHash } from '../connect/firestore.js';
 import type { SecretHasher } from '../secrets.js';
 import type { DeploymentConfig } from '../config/validate.js';
-import { publicKeyResultOf, RING_SCHEMA_VERSION, SCOPE_PURPOSE, WRAP_FORMAT_VERSION, type KeyRecord, type PublicKeyResult, type RingRecord } from './contract.js';
+import { publicKeyResultOf, RING_SCHEMA_VERSION, SCOPE_PURPOSE, WRAP_FORMAT_VERSION, type KeyRecord, type PublicKeyResult, type ReissueMode, type RingRecord } from './contract.js';
 import { createKeyCandidate, generateRsaKeyPair, unwrapPrivateKey, wrapPrivateKey, type KeyPairGenerator, type WrapBinding } from './crypto.js';
 import type { EncryptionSecretOperation, EncryptionSecretProvider, EncryptionSecretSession } from './secret-provider.js';
 import type { EncryptionKeyStore, RingBinding } from './store.js';
@@ -42,7 +42,12 @@ export type KeyServiceOutcome =
   | { readonly kind: 'key_expired' }
   | { readonly kind: 'unavailable' };
 
-const UNAVAILABLE: KeyServiceOutcome = Object.freeze({ kind: 'unavailable' });
+const UNAVAILABLE = Object.freeze({ kind: 'unavailable' as const });
+
+export type ReissueServiceOutcome =
+  | { readonly kind: 'ok'; readonly key: PublicKeyResult }
+  | { readonly kind: 'in_flight' | 'conflict' | 'in_progress' | 'failed' | 'key_not_initialized' | 'key_expired' | 'connection_required' | 'access_denied' | 'unavailable' }
+  | { readonly kind: 'rate_limited'; readonly retryAfterSec: number };
 
 class DeadlineError extends Error {}
 
@@ -115,6 +120,90 @@ export class EncryptionKeyService {
         }
       }
       return begun;
+    } catch {
+      return UNAVAILABLE;
+    }
+  }
+
+  /**
+   * 本人の明示的な鍵の再発行（T074）。予約（pending）→transactionの外で候補生成・保護・自己開封→期待generation/同じ操作へのCAS。
+   * 同IDの完了は元の公開結果、進行中は202相当、期限後のpendingは失敗（再生成しない）。commit応答不明は同じ操作の記録を1回だけ読み直す。
+   * 失敗では旧鍵を変えず、元operationの中で記録できる時だけfailedにする。新しいIDでのやり直しはしない。
+   */
+  async reissue(
+    identity: { readonly projectId: string; readonly uid: string },
+    request: { readonly requestId: string; readonly mode: ReissueMode },
+    operation: EncryptionSecretOperation,
+  ): Promise<ReissueServiceOutcome> {
+    const env = this.#d.environment;
+    const live = (): void => {
+      if (operation.signal.aborted) throw new DeadlineError();
+      const now = this.#d.clock.now();
+      if (!Number.isSafeInteger(now) || now <= 0 || now >= operation.deadlineAt) throw new DeadlineError();
+    };
+    try {
+      live();
+      if (identity.projectId !== env.projectId) return UNAVAILABLE;
+      const identityHash = connectIdentityHash(this.#d.hasher, env.connectNamespace, identity);
+      const begun = await this.#d.store.beginReissue(
+        identityHash,
+        (ownerId) => encryptionScope(this.#d.hasher, env, identityHash, ownerId),
+        { requestId: request.requestId, mode: request.mode, deadlineAt: operation.deadlineAt },
+        live,
+      );
+      live();
+      if (begun.kind === 'completed') return { kind: 'ok', key: begun.key };
+      if (begun.kind !== 'reserved') return begun;
+      const { binding } = begun;
+      const session = this.#d.secrets.open(operation);
+      let candidate: Awaited<ReturnType<typeof createKeyCandidate>> | undefined;
+      try {
+        candidate = await createKeyCandidate(this.#d.generate ?? generateRsaKeyPair);
+        live();
+        const writeVersion = session.writeVersion;
+        const protectionKey = await session.get(writeVersion);
+        live();
+        const wrapBinding = this.#wrapBinding(binding, candidate.kid, writeVersion, candidate.publicKeySpki);
+        const wrappedPrivateKey = wrapPrivateKey(candidate.pkcs8, protectionKey, wrapBinding);
+        unwrapPrivateKey(wrappedPrivateKey, protectionKey, wrapBinding).fill(0);
+        const key: KeyRecord = {
+          kid: candidate.kid,
+          publicJwk: candidate.publicJwk,
+          publicKeySpki: candidate.publicKeySpki,
+          createdAt: this.#d.clock.now(),
+          state: 'active',
+          decryptUntil: null,
+          retireAfter: null,
+          secretVersion: writeVersion,
+          formatVersion: WRAP_FORMAT_VERSION,
+          wrappedPrivateKey,
+        };
+        live();
+        let outcome: Awaited<ReturnType<EncryptionKeyStore['commitReissue']>>;
+        try {
+          outcome = await this.#d.store.commitReissue(binding, request.requestId, request.mode, begun.ring.generation, key, live);
+        } catch (error) {
+          if (error instanceof DeadlineError) throw error;
+          // commit応答不明: 同じ操作の記録を1回だけ読み直す（新しいID・再生成はしない）。
+          const again = await this.#d.store.readReissue(binding, request.requestId, live);
+          return again.kind === 'completed' ? { kind: 'ok', key: again.key } : again.kind === 'unknown' ? UNAVAILABLE : again;
+        }
+        live();
+        return outcome.kind === 'completed' ? { kind: 'ok', key: outcome.key } : outcome;
+      } catch (error) {
+        // 生成・保護・Secretの失敗。旧鍵は変えず、元operationの中で記録できる時だけfailedにする。
+        if (!(error instanceof DeadlineError)) {
+          try {
+            await this.#d.store.failReissue(binding, request.requestId, live);
+          } catch {
+            // 記録できなくても、pendingは期限後に論理的な失敗になる。
+          }
+        }
+        return UNAVAILABLE;
+      } finally {
+        candidate?.dispose();
+        session.dispose();
+      }
     } catch {
       return UNAVAILABLE;
     }

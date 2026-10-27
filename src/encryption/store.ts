@@ -18,6 +18,10 @@ import {
   CONTROLS_COLLECTION,
   ENCRYPTION_STORAGE_ROOT,
   EncryptionRecordError,
+  MAX_REISSUES,
+  REISSUE_PENDING_MAX_MS,
+  REISSUE_SPACING_MS,
+  REISSUE_WINDOW_MS,
   RING_INACTIVITY_MS,
   RINGS_COLLECTION,
   consumeRate,
@@ -26,9 +30,17 @@ import {
   keyUsable,
   parseControlsRecord,
   parseRingRecord,
+  pruneRing,
+  reissuedResultOf,
+  rotateKeys,
   type ControlsRecord,
   type KeyRecord,
+  type PublicKeyResult,
   type RateKind,
+  type RateWindow,
+  type ReissuedKey,
+  type ReissueMode,
+  type ReissueRecord,
   type RingRecord,
 } from './contract.js';
 
@@ -69,6 +81,31 @@ export type CommitOutcome =
 
 /** commit応答不明の後の採用read。 */
 export type AdoptedOutcome = AdmissionDenied | { readonly kind: 'key_expired' } | { readonly kind: 'absent' } | { readonly kind: 'adopted'; readonly ring: RingRecord };
+
+export type ReissueBeginOutcome =
+  | AdmissionDenied
+  | { readonly kind: 'rate_limited'; readonly retryAfterSec: number }
+  | { readonly kind: 'key_not_initialized' | 'key_expired' | 'conflict' | 'in_flight' | 'in_progress' | 'failed' }
+  | { readonly kind: 'completed'; readonly key: PublicKeyResult }
+  | { readonly kind: 'reserved'; readonly binding: RingBinding; readonly ring: RingRecord };
+
+export type ReissueCommitOutcome = AdmissionDenied | { readonly kind: 'key_expired' | 'failed' } | { readonly kind: 'completed'; readonly key: PublicKeyResult };
+
+/** 保存用の写し（plain dataだけ。呼出し側のobjectと共有しない）。 */
+function ringDocument(ring: RingRecord): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(ring)) as Record<string, unknown>;
+}
+
+/** 同IDのpendingを失敗にした写し（旧鍵・generationは変えない）。 */
+function markFailed(ring: RingRecord, requestId: string, now: number): RingRecord {
+  return {
+    ...ring,
+    reissues: ring.reissues.map((entry): ReissueRecord =>
+      entry.requestId === requestId ? { requestId, mode: entry.mode, status: 'failed', reservedAt: entry.reservedAt } : entry,
+    ),
+    updatedAt: now,
+  };
+}
 
 export type DecryptBeginOutcome =
   | AdmissionDenied
@@ -207,8 +244,10 @@ export class EncryptionKeyStore {
       tx.set(controlsRef, { ...controls, windows });
       if (ring === null) return { kind: 'initialize', binding };
       if (expired) return { kind: 'key_expired' };
-      if (ring.keys.some((key) => key.secretVersion !== this.#d.writeSecretVersion)) return { kind: 'rewrap', binding, ring };
-      const touched: RingRecord = { ...ring, lastUsedAt: now };
+      // 期限済みの過去鍵・24hを過ぎた操作は、Secret版のrewrapより先に回収する（不要な旧Secretを読まない）。
+      const current = pruneRing(ring, now);
+      if (current.keys.some((key) => key.secretVersion !== this.#d.writeSecretVersion)) return { kind: 'rewrap', binding, ring: current };
+      const touched: RingRecord = { ...current, lastUsedAt: now };
       tx.set(ringRef, { ...touched });
       tx.update(admission.ownerRef, { lastActiveAt: now });
       return { kind: 'ready', binding, ring: touched };
@@ -237,6 +276,156 @@ export class EncryptionKeyStore {
       live();
       tx.set(controlsRef, { ...controls, windows: { ...controls.windows, decrypt: used.next } });
       return { kind: 'admitted', binding, ring, now };
+    });
+  }
+
+  /**
+   * 再発行の予約（T074）: 認可・有効ring・取得のHTTP枠（GETと共用）を確かめ、同IDの記録があればその状態を返す（再発行枠・鍵生成枠を
+   * 追加消費しない）。新しいIDは再発行の試行枠（分3/UTC日10）を消費し、activeなpendingが無く、24hに4件・60秒間隔の条件を満たす時だけ
+   * 元operationの期限までのpendingを予約する。旧鍵は変えない。閉包の中で乱数・鍵生成・Secretを使わない。
+   */
+  async beginReissue(
+    identityHash: string,
+    scopeOf: (ownerId: string) => string,
+    request: { readonly requestId: string; readonly mode: ReissueMode; readonly deadlineAt: number },
+    live: Live,
+  ): Promise<ReissueBeginOutcome> {
+    return this.#run(live, async (tx): Promise<ReissueBeginOutcome> => {
+      const admission = await this.#admit(tx, identityHash, live);
+      if (admission.kind !== 'admitted') return admission;
+      const binding: RingBinding = { identityHash, ownerId: admission.ownerId, scope: scopeOf(admission.ownerId) };
+      const ringRef = this.#ringRef(binding.scope);
+      const controlsRef = this.#controlsRef(binding.scope);
+      const ringSnapshot = await this.#get(tx, ringRef, live);
+      const controlsSnapshot = await this.#get(tx, controlsRef, live);
+      const now = this.#now();
+      const ring = this.#ringOf(ringSnapshot, binding);
+      const controls = this.#controlsOf(controlsSnapshot, binding);
+      // 429は全て非消費（fetch・試行枠・予約数を変えない）。同時に適用される制約の待ち（秒）を全て集め、最長をRetry-Afterにする。
+      const waits: number[] = [];
+      const fetch = consumeRate(controls.windows.fetch, 'fetch', now);
+      if ('retryAfterSec' in fetch) waits.push(fetch.retryAfterSec);
+      const limited = (): ReissueBeginOutcome => ({ kind: 'rate_limited', retryAfterSec: Math.max(1, ...waits) });
+      const windows: Record<RateKind, RateWindow> = { ...controls.windows };
+      if (!('retryAfterSec' in fetch)) windows.fetch = fetch.next;
+      const writeControls = (): void => {
+        live();
+        tx.set(controlsRef, { ...controls, windows });
+      };
+      if (ring === null || this.#ringExpired(ring, now)) {
+        if (waits.length > 0) return limited();
+        writeControls();
+        return { kind: ring === null ? 'key_not_initialized' : 'key_expired' };
+      }
+      const current = pruneRing(ring, now);
+      const same = current.reissues.find((entry) => entry.requestId === request.requestId);
+      if (same !== undefined) {
+        // 同IDは新しい予約をしないので、HTTPの取得枠（fetch）だけを課す（試行枠・60秒・24h4件は課さない）。
+        if (waits.length > 0) return limited();
+        writeControls();
+        if (same.mode !== request.mode) return { kind: 'conflict' };
+        if (same.status === 'completed') return { kind: 'completed', key: reissuedResultOf(current, same.result) };
+        if (same.status === 'pending' && now < same.deadlineAt) return { kind: 'in_flight' };
+        return { kind: 'failed' };
+      }
+      const attempt = consumeRate(windows.reissueAttempt, 'reissueAttempt', now);
+      if ('retryAfterSec' in attempt) waits.push(attempt.retryAfterSec);
+      // activeなpendingがある時は新規予約をしないので、HTTP枠と試行枠だけを課す（60秒・24h4件は課さない）。
+      if (current.reissues.some((entry) => entry.status === 'pending' && now < entry.deadlineAt)) {
+        if (waits.length > 0) return limited();
+        if (!('retryAfterSec' in attempt)) windows.reissueAttempt = attempt.next;
+        writeControls();
+        return { kind: 'in_progress' };
+      }
+      // 新規予約の時だけ、60秒間隔と24hに4件も含めた最長の待ちを評価する。
+      if (current.reissues.length >= MAX_REISSUES) {
+        waits.push(Math.ceil((Math.min(...current.reissues.map((entry) => entry.reservedAt)) + REISSUE_WINDOW_MS - now) / 1000));
+      }
+      if (current.reissues.length > 0) {
+        const latestAt = Math.max(...current.reissues.map((entry) => entry.reservedAt));
+        if (now - latestAt < REISSUE_SPACING_MS) waits.push(Math.ceil((latestAt + REISSUE_SPACING_MS - now) / 1000));
+      }
+      if (waits.length > 0) return limited();
+      if (!('retryAfterSec' in attempt)) windows.reissueAttempt = attempt.next;
+      const deadlineAt = Math.min(request.deadlineAt, now + REISSUE_PENDING_MAX_MS);
+      if (!(deadlineAt > now)) throw new EncryptionUnavailableError();
+      const pending: ReissueRecord = { requestId: request.requestId, mode: request.mode, status: 'pending', reservedAt: now, deadlineAt };
+      const next: RingRecord = { ...current, reissues: [...current.reissues, pending], updatedAt: now };
+      writeControls();
+      tx.set(ringRef, ringDocument(next));
+      return { kind: 'reserved', binding, ring: next };
+    });
+  }
+
+  /**
+   * 再発行の確定（CAS）: 同じpending ID/mode・元operationの期限内・期待generation・最新の認可と有効なringを確かめ、新鍵・旧鍵の状態・
+   * 完了の操作記録を一括で保存する。generationの競合や過去鍵の上限は再生成せずfailedを記録する。lastUsedAt等の並行更新は最新を保つ。
+   */
+  async commitReissue(binding: RingBinding, requestId: string, mode: ReissueMode, expectedGeneration: number, key: KeyRecord, live: Live): Promise<ReissueCommitOutcome> {
+    return this.#run(live, async (tx): Promise<ReissueCommitOutcome> => {
+      const admission = await this.#readmit(tx, binding, live);
+      if (admission.kind !== 'admitted') return admission;
+      const ringRef = this.#ringRef(binding.scope);
+      const latest = this.#ringOf(await this.#get(tx, ringRef, live), binding);
+      if (latest === null) throw new EncryptionUnavailableError();
+      const now = this.#now();
+      if (this.#ringExpired(latest, now)) return { kind: 'key_expired' };
+      const current = pruneRing(latest, now);
+      const op = current.reissues.find((entry) => entry.requestId === requestId);
+      if (op === undefined || op.mode !== mode) throw new EncryptionUnavailableError();
+      if (op.status === 'completed') return { kind: 'completed', key: reissuedResultOf(current, op.result) };
+      if (op.status === 'failed' || now >= op.deadlineAt) return { kind: 'failed' };
+      const keys = current.generation === expectedGeneration ? rotateKeys(current.keys, key, mode, now) : null;
+      if (keys === null) {
+        live();
+        tx.set(ringRef, ringDocument(markFailed(current, requestId, now)));
+        return { kind: 'failed' };
+      }
+      const result: ReissuedKey = { kid: key.kid, publicJwk: key.publicJwk, publicKeySpki: key.publicKeySpki, createdAt: key.createdAt };
+      const reissues = current.reissues.map((entry): ReissueRecord =>
+        entry.requestId === requestId ? { requestId, mode, status: 'completed', reservedAt: entry.reservedAt, result } : entry,
+      );
+      const next: RingRecord = {
+        ...current,
+        generation: current.generation + 1,
+        activeKid: key.kid,
+        keys,
+        reissues,
+        updatedAt: now,
+        lastUsedAt: Math.max(current.lastUsedAt, now),
+      };
+      live();
+      tx.set(ringRef, ringDocument(next));
+      tx.update(admission.ownerRef, { lastActiveAt: now });
+      return { kind: 'completed', key: reissuedResultOf(next, result) };
+    });
+  }
+
+  /** 元operationの中で、同IDのpendingを失敗として記録する（期限後・中断後は書かない。旧鍵は変えない）。 */
+  async failReissue(binding: RingBinding, requestId: string, live: Live): Promise<void> {
+    await this.#run(live, async (tx): Promise<void> => {
+      const ringRef = this.#ringRef(binding.scope);
+      const latest = this.#ringOf(await this.#get(tx, ringRef, live), binding);
+      if (latest === null) return;
+      const now = this.#now();
+      const op = latest.reissues.find((entry) => entry.requestId === requestId);
+      if (op === undefined || op.status !== 'pending' || now >= op.deadlineAt) return;
+      live();
+      tx.set(ringRef, ringDocument(markFailed(latest, requestId, now)));
+    });
+  }
+
+  /** commit応答不明の後の有限な読直し（書込み0）: 最新の認可と同じ操作の記録。completedなら元の公開結果。 */
+  async readReissue(binding: RingBinding, requestId: string, live: Live): Promise<ReissueCommitOutcome | { readonly kind: 'unknown' }> {
+    return this.#run(live, async (tx) => {
+      const admission = await this.#readmit(tx, binding, live);
+      if (admission.kind !== 'admitted') return admission;
+      const ring = this.#ringOf(await this.#get(tx, this.#ringRef(binding.scope), live), binding);
+      if (ring === null) return { kind: 'unknown' as const };
+      const op = ring.reissues.find((entry) => entry.requestId === requestId);
+      if (op?.status === 'completed') return { kind: 'completed' as const, key: reissuedResultOf(ring, op.result) };
+      if (op?.status === 'failed') return { kind: 'failed' as const };
+      return { kind: 'unknown' as const };
     });
   }
 
@@ -269,10 +458,11 @@ export class EncryptionKeyStore {
       const admission = await this.#readmit(tx, binding, live);
       if (admission.kind !== 'admitted') return admission;
       const ringRef = this.#ringRef(binding.scope);
-      const current = this.#ringOf(await this.#get(tx, ringRef, live), binding);
-      if (current === null) throw new EncryptionUnavailableError();
+      const latest = this.#ringOf(await this.#get(tx, ringRef, live), binding);
+      if (latest === null) throw new EncryptionUnavailableError();
       const now = this.#now();
-      if (this.#ringExpired(current, now)) return { kind: 'key_expired' };
+      if (this.#ringExpired(latest, now)) return { kind: 'key_expired' };
+      const current = pruneRing(latest, now);
       if (current.generation !== expectedGeneration) return { kind: 'conflict', ring: current };
       const sameKeys = keys.length === current.keys.length && keys.every((key, index) => {
         const was = current.keys[index];

@@ -67,12 +67,32 @@ export interface KeyRecord {
   readonly wrappedPrivateKey: string;
 }
 
-export interface ReissueRecord {
-  readonly requestId: string;
-  readonly mode: 'normal' | 'compromised';
+export type ReissueMode = 'normal' | 'compromised';
+
+/** 再発行で公開した結果（元の公開結果を同IDの再試行へ返すため。秘密要素なし）。 */
+export interface ReissuedKey {
   readonly kid: string;
-  readonly at: number;
+  readonly publicJwk: PublicJwk;
+  readonly publicKeySpki: string;
+  readonly createdAt: number;
 }
+
+/**
+ * 再発行の操作記録（ring内に最大4件、予約から24hで回収可能）。pendingは元operationの期限（deadlineAt）まで有効で、
+ * 期限後は論理的な失敗（再生成しない）。completedは元の公開結果を持つ。
+ */
+export type ReissueRecord =
+  | { readonly requestId: string; readonly mode: ReissueMode; readonly status: 'pending'; readonly reservedAt: number; readonly deadlineAt: number }
+  | { readonly requestId: string; readonly mode: ReissueMode; readonly status: 'completed'; readonly reservedAt: number; readonly result: ReissuedKey }
+  | { readonly requestId: string; readonly mode: ReissueMode; readonly status: 'failed'; readonly reservedAt: number };
+
+/** 通常再発行の旧activeの復号猶予（120秒）・旧鍵の回収可能までの期間（24h）・再発行の連続予約の間隔（60秒）・操作の保持（24h）。 */
+export const REISSUE_GRACE_MS = 120_000;
+export const RETIRE_AFTER_MS = 24 * 60 * 60 * 1000;
+export const REISSUE_SPACING_MS = 60_000;
+export const REISSUE_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** pendingの予約は元operationの期限まで（最大20秒）。 */
+export const REISSUE_PENDING_MAX_MS = 20_000;
 
 export interface RingRecord {
   readonly schemaVersion: typeof RING_SCHEMA_VERSION;
@@ -184,7 +204,10 @@ function need(condition: boolean): void {
 
 const JWK_KEYS = ['kty', 'n', 'e', 'kid', 'alg', 'use'] as const;
 const KEY_KEYS = ['kid', 'publicJwk', 'publicKeySpki', 'createdAt', 'state', 'decryptUntil', 'retireAfter', 'secretVersion', 'formatVersion', 'wrappedPrivateKey'] as const;
-const REISSUE_KEYS = ['requestId', 'mode', 'kid', 'at'] as const;
+const PENDING_KEYS = ['requestId', 'mode', 'status', 'reservedAt', 'deadlineAt'] as const;
+const COMPLETED_KEYS = ['requestId', 'mode', 'status', 'reservedAt', 'result'] as const;
+const FAILED_KEYS = ['requestId', 'mode', 'status', 'reservedAt'] as const;
+const RESULT_KEYS = ['kid', 'publicJwk', 'publicKeySpki', 'createdAt'] as const;
 const RING_KEYS = ['schemaVersion', 'scope', 'identityHash', 'ownerId', 'generation', 'activeKid', 'keys', 'reissues', 'createdAt', 'updatedAt', 'lastUsedAt'] as const;
 const CONTROLS_KEYS = ['schemaVersion', 'scope', 'identityHash', 'ownerId', 'windows'] as const;
 const WINDOW_KEYS = ['minuteStart', 'minuteCount', 'dayStart', 'dayCount'] as const;
@@ -252,11 +275,32 @@ export function parseKeyRecord(value: unknown): KeyRecord {
   };
 }
 
+function parseReissuedKey(value: unknown): ReissuedKey {
+  const f = exact(value, RESULT_KEYS);
+  const publicJwk = parsePublicJwk(f.get('publicJwk'));
+  const spki = canonicalBase64url(f.get('publicKeySpki'), SPKI_MAX);
+  need(isKid(f.get('kid')) && publicJwk.kid === f.get('kid') && spki !== null && samePublicKey(publicJwk, spki) && isTime(f.get('createdAt')));
+  return { kid: f.get('kid') as string, publicJwk, publicKeySpki: f.get('publicKeySpki') as string, createdAt: f.get('createdAt') as number };
+}
+
 function parseReissue(value: unknown): ReissueRecord {
-  const f = exact(value, REISSUE_KEYS);
+  const descriptor = Object.getOwnPropertyDescriptor(plain(value), 'status');
+  const status: unknown = descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+  const keys = status === 'pending' ? PENDING_KEYS : status === 'completed' ? COMPLETED_KEYS : status === 'failed' ? FAILED_KEYS : null;
+  need(keys !== null);
+  const f = exact(value, keys as readonly string[]);
+  const requestId = f.get('requestId');
   const mode = f.get('mode');
-  need(isKid(f.get('requestId')) && (mode === 'normal' || mode === 'compromised') && isKid(f.get('kid')) && isTime(f.get('at')));
-  return { requestId: f.get('requestId') as string, mode: mode as ReissueRecord['mode'], kid: f.get('kid') as string, at: f.get('at') as number };
+  const reservedAt = f.get('reservedAt');
+  need(isKid(requestId) && (mode === 'normal' || mode === 'compromised') && isTime(reservedAt));
+  const base = { requestId: requestId as string, mode: mode as ReissueMode, reservedAt: reservedAt as number };
+  if (status === 'pending') {
+    const deadlineAt = f.get('deadlineAt');
+    need(isTime(deadlineAt) && (deadlineAt as number) > base.reservedAt && (deadlineAt as number) <= base.reservedAt + REISSUE_PENDING_MAX_MS);
+    return { ...base, status: 'pending', deadlineAt: deadlineAt as number };
+  }
+  if (status === 'completed') return { ...base, status: 'completed', result: parseReissuedKey(f.get('result')) };
+  return { ...base, status: 'failed' };
 }
 
 /** 束縛（scope/identityHash/ownerId）の期待値と一致するring文書だけを写す。 */
@@ -270,6 +314,7 @@ export function parseRingRecord(value: unknown, expected: { readonly scope: stri
   const reissues = items(f.get('reissues'), 0, MAX_REISSUES).map(parseReissue);
   const kids = new Set(keys.map((key) => key.kid));
   need(kids.size === keys.length);
+  need(new Set(reissues.map((entry) => entry.requestId)).size === reissues.length);
   const actives = keys.filter((key) => key.state === 'active');
   need(actives.length === 1 && actives[0]?.kid === f.get('activeKid'));
   need(isTime(f.get('createdAt')) && isTime(f.get('updatedAt')) && isTime(f.get('lastUsedAt')));
@@ -351,6 +396,48 @@ export interface PublicKeyResult {
   readonly publicJwk: PublicJwk;
   readonly publicKeySpki: string;
   readonly createdAt: number;
+}
+
+/** 再発行で公開した結果（同IDの再試行へ返す元の公開結果）。scopeはringのもの。 */
+export function reissuedResultOf(ring: RingRecord, result: ReissuedKey): PublicKeyResult {
+  return Object.freeze({
+    version: 1,
+    kid: result.kid,
+    alg: KEY_ALG,
+    enc: KEY_ENC,
+    scope: ring.scope,
+    publicJwk: Object.freeze({ ...result.publicJwk }),
+    publicKeySpki: result.publicKeySpki,
+    createdAt: result.createdAt,
+  });
+}
+
+/**
+ * 正常な同ringの更新時のbounded回収（純粋）: 回収可能時刻（retireAfter）を過ぎた過去鍵と、予約から24hを過ぎた操作記録を除く。
+ * activeの鍵は除かない。失効・無活動の判定・修復はしない（呼出し側が有効なringにだけ使う）。
+ */
+export function pruneRing(ring: RingRecord, now: number): RingRecord {
+  const keys = ring.keys.filter((key) => key.state === 'active' || key.retireAfter === null || now < key.retireAfter);
+  const reissues = ring.reissues.filter((entry) => now - entry.reservedAt < REISSUE_WINDOW_MS);
+  return keys.length === ring.keys.length && reissues.length === ring.reissues.length ? ring : { ...ring, keys, reissues };
+}
+
+/**
+ * 再発行の鍵の切替（純粋）。normalは直前のactiveだけを120秒のgraceへ、既存のgraceはrevokedへ。compromisedは全ての旧鍵を即時revoked。
+ * activeから旧鍵になった鍵だけretireAfterを24h後にし、既存の旧鍵のretireAfterは延ばさない。新鍵を先頭に置く。過去鍵が4を超えればnull。
+ */
+export function rotateKeys(keys: readonly KeyRecord[], next: KeyRecord, mode: ReissueMode, now: number): KeyRecord[] | null {
+  const old = keys.map((key): KeyRecord => {
+    if (key.state === 'active') {
+      return mode === 'normal'
+        ? { ...key, state: 'grace', decryptUntil: now + REISSUE_GRACE_MS, retireAfter: now + RETIRE_AFTER_MS }
+        : { ...key, state: 'revoked', decryptUntil: now, retireAfter: now + RETIRE_AFTER_MS };
+    }
+    if (key.state === 'grace') return { ...key, state: 'revoked', decryptUntil: Math.min(key.decryptUntil ?? now, now) };
+    return key;
+  });
+  if (old.length > MAX_KEYS - 1) return null;
+  return [next, ...old];
 }
 
 export function publicKeyResultOf(ring: RingRecord): PublicKeyResult {

@@ -62,7 +62,7 @@ The local send screen `/console` sends the text the user typed into its empty in
 <a id="encryption-key"></a>
 ### Fetching your own public key (payload encryption, off by default)
 
-Available only on deployments that enable payload encryption in the [deployment configuration](CONFIGURATION_EN.md#payload-encryption). On deployments where it is off, the response is `404 not_found`. The current version provides this fetch and [sending encrypted text](#encrypted-commands) below; reissuing keys is not provided yet.
+Available only on deployments that enable payload encryption in the [deployment configuration](CONFIGURATION_EN.md#payload-encryption). On deployments where it is off, the response is `404 not_found`. Besides this fetch, [reissuing the key](#encryption-key-reissue) and [sending encrypted text](#encrypted-commands) below are provided.
 
 `GET /v2/encryption-key` (`Authorization: Bearer <Firebase ID token>`, no body or query)
 
@@ -91,6 +91,22 @@ Available only on deployments that enable payload encryption in the [deployment 
 | 409 | `encryption_key_unavailable` | The key has not been used for 90 days and is unavailable. It is not recreated automatically |
 | 429 | `rate_limited` | Too many fetch attempts (60 per minute and 1000 per UTC day; first creation 3 per minute and 10 per day). Wait for the `Retry-After` seconds |
 | 503 | `temporarily_unavailable` | Temporary failure of storage, the protection key or the processing deadline. A failure of the dedicated protection key does not stop plaintext sending. Failures of components shared with existing sending, such as the shared database, can affect plaintext sending as before |
+
+<a id="encryption-key-reissue"></a>
+### Reissuing the key (payload encryption, off by default)
+
+`POST /v2/encryption-key/reissue` (`Authorization: Bearer <Firebase ID token>`, `Content-Type: application/json`, `Idempotency-Key: <requestId>`). The body is exactly `{"requestId":"<UUID>","mode":"normal"}` or `"mode":"compromised"`, 1024 bytes or less. `requestId` must match `Idempotency-Key`. A query or other items return `400 invalid_request`. Only your own key is recreated; you cannot select anyone else's key. On deployments where encryption is off, the response is `404`.
+
+- Success is `200` with the public information of the new key (the same shape as fetching the public key; the private key is never returned, including its protected form).
+- `normal`: the previous key can still decrypt for 120 seconds and then cannot. Older keys stop being usable immediately. `compromised` (suspected leak): all previous keys stop being usable immediately. In both cases, a send whose key became unusable before the right to send was confirmed is not sent. A send after that confirmation cannot be withdrawn.
+- Resending the same `requestId` and `mode` returns the original result as is (even if a later reissue happened, it is the result of that time; check the current key with the fetch). While processing, the response is `202` (`{"requestId":…,"state":"in_flight"}`, `Retry-After: 1`) and no extra key is created. The same `requestId` with a different `mode` returns `409 idempotency_conflict`.
+- If processing does not finish within its deadline (at most 20 seconds from receipt) or generation/storage fails, that `requestId` returns `409 key_reissue_failed` and is not recreated automatically. The old key stays usable. To reissue again, send explicitly with a new `requestId`. When the response is unknown (such as `503`), first resend the same `requestId` to confirm the result.
+- If a reissue with another `requestId` is in progress, the response is `409 key_reissue_in_progress`; if there is no key yet, `409 key_not_initialized`.
+- Limits: at most 4 reissues per 24 hours (failures and in-progress ones count), and at least 60 seconds after the previous reissue. Attempts with different `requestId`s are limited to 3 per minute and 10 per UTC day. Resending the same `requestId` does not use these, but as an HTTP request it shares the fetch limit (60 per minute and 1000 per UTC day). Exceeding a limit returns `429` with `Retry-After`.
+- Other devices follow by fetching the public key again after keeping it for at most 5 minutes, or when they receive `409 encryption_key_unavailable`.
+- Retention: past keys that became unusable are removed 24 hours after the switch, and reissue records after 24 hours, at the next normal update of that user's keys. The physical deletion time is not guaranteed.
+
+401, 403, `409 connection_required`, `409 encryption_key_unavailable` (a key unused for 90 days) and `503` are the same as fetching the public key.
 
 <a id="encrypted-commands"></a>
 ### Sending encrypted text (payload encryption, off by default)
