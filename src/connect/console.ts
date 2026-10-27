@@ -643,6 +643,8 @@ function chooseLanguage(next) {
   copyFor = '';
   applyLanguage();
   document.cookie = LANGUAGE_COOKIE + '=' + next + '; ' + COOKIE_ATTRIBUTES;
+  // operator modeの部品へ言語の変化を伝える（状態のlang。通信・進捗は変えない）
+  codeState();
 }
 
 // ---- 手順の省略（右上の補助操作）。skippedはdoneと別に持ち、正規controllerのgateだけで次へ進める ----
@@ -1363,7 +1365,7 @@ function isCodeUser(user) {
 }
 
 function codeState() {
-  const state = Object.freeze({ method, epoch: codeEpoch, signedIn, step, codeIssued, resumed: skipped[1] });
+  const state = Object.freeze({ method, epoch: codeEpoch, signedIn, step, codeIssued, resumed: skipped[1], lang });
   for (const listener of codeListeners) {
     try {
       listener(state);
@@ -1533,7 +1535,7 @@ globalThis.sttdConsoleCode = Object.freeze({
   subscribe(listener) {
     if (typeof listener !== 'function') return;
     codeListeners.push(listener);
-    listener(Object.freeze({ method, epoch: codeEpoch, signedIn, step, codeIssued, resumed: skipped[1] }));
+    listener(Object.freeze({ method, epoch: codeEpoch, signedIn, step, codeIssued, resumed: skipped[1], lang }));
   },
 });
 

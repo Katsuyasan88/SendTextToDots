@@ -278,7 +278,7 @@ test('U1 step 1 method choice: off shows not-configured; on has explicit buttons
   assert.ok(codePanel.includes(OPERATOR_TEXT.en.codeGuide));
   assert.ok(codePanel.includes('id="sttd-code-panel" hidden'));
   // native radio（fieldset/legend/label、初期値は既存のApple方式）と共通の「続ける」1つ。別のApple実行ボタンは置かない
-  assert.ok(/<fieldset class="sttd-method-choice"><legend>/.test(on));
+  assert.ok(/<fieldset class="sttd-method-choice"><legend id="sttd-method-legend">/.test(on));
   assert.ok(/<label class="sttd-radio"><input type="radio" name="sttd-method" id="sttd-method-apple" value="apple" checked>/.test(on));
   assert.ok(/<input type="radio" name="sttd-method" id="sttd-method-code" value="code">/.test(on));
   assert.equal((on.match(/<button/g) ?? []).filter(Boolean).length, (on.match(/id="sttd-method-continue"|id="sttd-code-(reissue|confirm|cancel)"/g) ?? []).length, 'no other buttons');
@@ -345,13 +345,14 @@ const gate = () => {
 
 const CODE_UID = `sttdc_${'A'.repeat(32)}`;
 
-async function runConsoleWithOperator({ onOperator, restoredCode = false, restoredClaims = null, restoredHold = null } = {}) {
+async function runConsoleWithOperator({ onOperator, restoredCode = false, restoredClaims = null, restoredHold = null, language = 'en' } = {}) {
   const html = consoleAsset('/console', WEB, {
     nonce: NONCE,
     secure: false,
-    operatorSection: renderOperatorSection({ language: 'en', enabled: true, nonce: NONCE, web: WEB }),
+    language,
+    operatorSection: renderOperatorSection({ language, enabled: true, nonce: NONCE, web: WEB }),
     operatorFirst: true,
-    operatorCodePanel: renderOperatorCodePanel({ language: 'en', enabled: true }),
+    operatorCodePanel: renderOperatorCodePanel({ language, enabled: true }),
   }).body;
   const dom = domFromHtml(html);
   const base = syntheticSdk();
@@ -696,4 +697,35 @@ test('B12 after a resume, an explicit Continue issues a new code and its normal 
   const reissues = () => ui.fetches.filter((entry) => entry.url.endsWith('/reissue')).length;
   await ui.click('sttd-code-reissue');
   assert.equal(reissues(), 1, 'reissue works for the page-owned session');
+});
+
+test('B13 the operator controls follow the page language: initial ja, then a live ja→en→ja switch updates the static labels and the shown messages without changing the code, the timer, the step, any request or the SDK', async () => {
+  const JA = OPERATOR_TEXT.ja;
+  const EN = OPERATOR_TEXT.en;
+  let fail = true;
+  const ui = await runConsoleWithOperator({ language: 'ja', onOperator: async (action) => (action === 'issue' ? (fail ? { status: 503, json: { error: { code: 'issue_failed' } } } : issuedJson()) : { status: 200, json: { state: 'pending' } }) });
+  const ids = ['sttd-method-legend', 'sttd-method-apple-label', 'sttd-method-code-label', 'sttd-method-desc-code', 'sttd-method-continue', 'sttd-code-guide', 'sttd-code-confirm', 'sttd-code-reissue', 'sttd-code-cancel', 'sttd-code-label', 'sttd-code-remaining-label'];
+  const labels = (L) => [L.methodTitle, L.methodApple, L.methodCode, L.descCode, L.continue, L.codeGuide, L.confirm, L.reissue, L.cancel, L.codeLabel, L.remaining];
+  const shown = () => ids.map((id) => ui.el(id).textContent);
+  assert.deepEqual(shown(), labels(JA), 'initial ja');
+  await ui.click('sttd-method-code');
+  await ui.click('sttd-method-continue');
+  assert.equal(ui.el('sttd-method-message').textContent, `${JA.issueFailed} ${JA.unchanged}`);
+  await ui.click('sttd-lang-en');
+  assert.equal(ui.el('sttd-method-message').textContent, `${EN.issueFailed} ${EN.unchanged}`, 'an error already shown is re-rendered');
+  await ui.click('sttd-lang-ja');
+  fail = false;
+  await ui.click('sttd-method-continue');
+  await ui.click('sttd-code-confirm');
+  assert.deepEqual([ui.el('sttd-code-message').textContent, ui.el('sttd-method-message').textContent], [JA.pending, '']);
+  const snapshot = () => [ui.el('sttd-code-value').textContent, ui.el('sttd-code-remaining').textContent, ui.stepState(1), ui.stepState(2), ui.fetches.length, ui.base.calls.loads, ui.custom.calls];
+  const before = snapshot();
+  await ui.click('sttd-lang-en');
+  assert.deepEqual(shown(), labels(EN), 'live ja→en');
+  assert.equal(ui.el('sttd-code-message').textContent, EN.pending);
+  assert.deepEqual(snapshot(), before, 'no change to the code, the timer, the steps, requests or the SDK');
+  await ui.click('sttd-lang-ja');
+  assert.deepEqual(shown(), labels(JA), 'live en→ja');
+  assert.equal(ui.el('sttd-code-message').textContent, JA.pending);
+  assert.deepEqual(snapshot(), before);
 });

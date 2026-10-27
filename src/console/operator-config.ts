@@ -161,9 +161,9 @@ export function renderOperatorSection(input: {
   }
   const data = ` data-sttd-operator-nonce="${escapeHtml(input.nonce)}" data-sttd-operator-language="${lang}" data-sttd-operator-firebase="${escapeHtml(JSON.stringify(input.web))}"`;
   return `<section id="sttd-method"${data}>
-<fieldset class="sttd-method-choice"><legend>${t('methodTitle')}</legend>
-<label class="sttd-radio"><input type="radio" name="sttd-method" id="sttd-method-apple" value="apple" checked> ${t('methodApple')}</label>
-<label class="sttd-radio"><input type="radio" name="sttd-method" id="sttd-method-code" value="code"> ${t('methodCode')}</label>
+<fieldset class="sttd-method-choice"><legend id="sttd-method-legend">${t('methodTitle')}</legend>
+<label class="sttd-radio"><input type="radio" name="sttd-method" id="sttd-method-apple" value="apple" checked> <span id="sttd-method-apple-label">${t('methodApple')}</span></label>
+<label class="sttd-radio"><input type="radio" name="sttd-method" id="sttd-method-code" value="code"> <span id="sttd-method-code-label">${t('methodCode')}</span></label>
 </fieldset>
 <p id="sttd-method-desc-apple" class="sttd-note">${t('descApple')}</p>
 <p id="sttd-method-desc-code" class="sttd-note" hidden>${t('descCode')}</p>
@@ -183,7 +183,7 @@ export function renderOperatorCodePanel(input: { readonly language?: Language | 
   const lang = isLanguage(input.language) ? input.language : DEFAULT_LANGUAGE;
   const t = (key: OperatorTextKey) => escapeHtml(OPERATOR_TEXT[lang][key]);
   return `<div id="sttd-code-panel" hidden>
-<p id="sttd-code-display" hidden>${t('codeLabel')}: <code id="sttd-code-value"></code> <span>${t('remaining')}: <span id="sttd-code-remaining"></span></span></p>
+<p id="sttd-code-display" hidden><span id="sttd-code-label">${t('codeLabel')}</span>: <code id="sttd-code-value"></code> <span><span id="sttd-code-remaining-label">${t('remaining')}</span>: <span id="sttd-code-remaining"></span></span></p>
 <p id="sttd-code-guide" hidden>${t('codeGuide')}</p>
 <div class="sttd-actions"><button type="button" id="sttd-code-confirm" hidden>${t('confirm')}</button>
 <button type="button" id="sttd-code-reissue" hidden>${t('reissue')}</button>
@@ -202,7 +202,8 @@ export function operatorScript(nonceHeader: string): string {
   return `const root = document.getElementById('sttd-method');
 const bridge = globalThis.sttdConsoleCode;
 const TEXT = ${JSON.stringify(OPERATOR_TEXT)};
-const lang = root && Object.hasOwn(TEXT, root.dataset.sttdOperatorLanguage) ? root.dataset.sttdOperatorLanguage : 'en';
+// 表示言語は初期値で始め、本体の言語切替（bridgeの状態のlang）に合わせて差し替える
+let lang = root && Object.hasOwn(TEXT, root.dataset.sttdOperatorLanguage) ? root.dataset.sttdOperatorLanguage : 'en';
 const T = (key) => (Object.hasOwn(TEXT[lang], key) ? TEXT[lang][key] : '');
 const el = (id) => document.getElementById(id);
 let expiresAt = 0;
@@ -212,7 +213,21 @@ let epoch = -1;
 let issuedOnce = false;
 let pending = false;
 
-function say(text) { el('sttd-code-message').textContent = text; }
+// 静的な文言（idとkey）。表示中の結果メッセージはkeyで持ち、言語を変えたら同じkeyで描き直す（進捗・期限・コード・通信は変えない）
+const STATIC_TEXT = [['sttd-method-legend', 'methodTitle'], ['sttd-method-apple-label', 'methodApple'], ['sttd-method-code-label', 'methodCode'], ['sttd-method-desc-apple', 'descApple'], ['sttd-method-desc-code', 'descCode'], ['sttd-method-continue', 'continue'], ['sttd-switch-notice', 'switchNotice'], ['sttd-code-label', 'codeLabel'], ['sttd-code-remaining-label', 'remaining'], ['sttd-code-guide', 'codeGuide'], ['sttd-code-confirm', 'confirm'], ['sttd-code-reissue', 'reissue'], ['sttd-code-cancel', 'cancel']];
+let codeMessage = [];
+let methodMessage = [];
+function renderMessages() {
+  el('sttd-code-message').textContent = codeMessage.map(T).join(' ');
+  el('sttd-method-message').textContent = methodMessage.map(T).join(' ');
+}
+function applyText(next) {
+  if (!Object.hasOwn(TEXT, next) || next === lang) return;
+  lang = next;
+  for (const [id, key] of STATIC_TEXT) { const node = el(id); if (node) node.textContent = T(key); }
+  renderMessages();
+}
+function say(...keys) { codeMessage = keys; renderMessages(); }
 function show(id, visible) { const node = el(id); if (node) node.hidden = !visible; }
 // 選んだ方式のradio・説明・操作だけを表示する（未選択は既存のApple方式）。operator modeでは下のApple操作を出さず、共通の「続ける」1つで始める。
 let selected = 'apple';
@@ -229,7 +244,7 @@ function reflect(m) {
 // 認証済み・発行済み等の進捗がある時だけ、方式切替で旧pluginの削除/再追加を案内する（初期・空の切替では出さない）。
 function hasProgress() { return (typeof bridge.progressed === 'function' && bridge.progressed() === true) || issuedOnce || (last !== null && (last.signedIn || last.codeIssued)); }
 // 発行の失敗は手順1（続ける の近く）にも出す。コードの結果・接続確認は手順2のコード操作に出す
-function sayIssue(text) { el('sttd-method-message').textContent = text; say(text); }
+function sayIssue(...keys) { methodMessage = keys; say(...keys); }
 function current(at) { return chosen === 'code' && at === epoch; }
 
 async function call(action) {
@@ -269,7 +284,7 @@ function tick() {
   const left = Math.max(0, expiresAt - Date.now());
   const s = Math.ceil(left / 1000);
   el('sttd-code-remaining').textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
-  if (left === 0) { hideCode(); say(T('expired')); }
+  if (left === 0) { hideCode(); say('expired'); }
 }
 
 function showCode(code, authExpiresAt, at) {
@@ -279,12 +294,13 @@ function showCode(code, authExpiresAt, at) {
   controls();
   show('sttd-code-display', true);
   show('sttd-code-guide', true);
-  el('sttd-method-message').textContent = '';
+  methodMessage = [];
+  renderMessages();
   stopTimer();
   timer = setInterval(tick, 1000);
   tick();
   // 手順2の解放は本体の内部状態で（この世代のコード方式だけ）。送信はログイン・許可・同意・購読の確認まで本体が封鎖する。
-  if (bridge.issued(at)) say(T('step2Unlocked'));
+  if (bridge.issued(at)) say('step2Unlocked');
 }
 
 // このページ（helperのRAM）が所有するコードsessionがあるか。保存済みログインの復元だけでは所有しない（再発行・照会・取消の要求0）
@@ -310,9 +326,9 @@ async function issue(action) {
       issuedOnce = true;
       controls();
     }
-    sayIssue(T('issueFailed') + ' ' + T('unchanged'));
+    sayIssue('issueFailed', 'unchanged');
   } catch {
-    if (current(at)) sayIssue(T('issueFailed') + ' ' + T('unchanged'));
+    if (current(at)) sayIssue('issueFailed', 'unchanged');
   } finally {
     pending = false;
   }
@@ -329,12 +345,12 @@ async function confirmConnection() {
       const ok = await bridge.signIn(at, body.customToken);
       if (!current(at)) return;
       if (ok) hideCode();
-      say(T(ok ? 'connected' : 'ended'));
+      say(ok ? 'connected' : 'ended');
       return;
     }
-    say(T(status === 200 && body.state === 'pending' ? 'pending' : 'ended'));
+    say(status === 200 && body.state === 'pending' ? 'pending' : 'ended');
   } catch {
-    if (current(at)) say(T('ended'));
+    if (current(at)) say('ended');
   } finally {
     pending = false;
   }
@@ -351,10 +367,10 @@ async function cancelCode() {
       hideCode();
       issuedOnce = false;
       controls();
-      say(T('cancelled'));
-    } else say(T('ended'));
+      say('cancelled');
+    } else say('ended');
   } catch {
-    say(T('ended'));
+    say('ended');
   } finally {
     pending = false;
   }
@@ -369,8 +385,9 @@ async function choose(next) {
     show('sttd-switch-notice', progressed);
     hideCode();
     issuedOnce = false;
-    say('');
-    el('sttd-method-message').textContent = '';
+    say();
+    methodMessage = [];
+    renderMessages();
   }
   reflect(next);
   if (next === 'code') controls();
@@ -387,6 +404,7 @@ async function proceed() {
 
 if (root && bridge) {
   bridge.subscribe((state) => {
+    if (typeof state.lang === 'string') applyText(state.lang);
     if (state.epoch !== epoch && chosen === 'code') hideCode();
     epoch = state.epoch;
     chosen = state.method;
