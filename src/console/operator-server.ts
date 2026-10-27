@@ -25,7 +25,7 @@ import {
 } from '../identity/developer-login.js';
 import { Firestore } from '@google-cloud/firestore';
 import { SecretManagerServiceClient } from '@google-cloud/secret-manager';
-import { applicationDefault, initializeApp } from 'firebase-admin/app';
+import { applicationDefault, initializeApp, type App } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 
 import { DeveloperLoginStore } from '../identity/developer-login-store.js';
@@ -202,12 +202,34 @@ export function parseOperatorArgs(argv: readonly string[]): { readonly configPat
   return { configPath, operatorPath, port };
 }
 
-async function main(argv: readonly string[]): Promise<void> {
+/** CLIが使う資格・SDKの生成口（試験は合成を渡し、実SDK・資格・networkに触れずに結線と順序を確かめる）。 */
+export interface OperatorSdk {
+  readonly readFile: (path: string) => string;
+  readonly secretManager: () => Pick<SecretManagerServiceClient, 'accessSecretVersion'>;
+  readonly applicationDefault: typeof applicationDefault;
+  readonly initializeApp: typeof initializeApp;
+  readonly getAuth: (app: App) => Pick<CodeAuthAdmin, 'createCustomToken'>;
+  readonly firestore: (settings: { readonly projectId: string; readonly databaseId: string }) => Firestore;
+  readonly startLocalConsole: typeof startLocalConsole;
+}
+
+const REAL_SDK: OperatorSdk = Object.freeze({
+  readFile: (path: string) => readFileSync(path, 'utf8'),
+  secretManager: () => new SecretManagerServiceClient(),
+  applicationDefault,
+  initializeApp,
+  getAuth,
+  firestore: (settings: { readonly projectId: string; readonly databaseId: string }) => new Firestore({ ...settings }),
+  startLocalConsole,
+});
+
+export async function startOperatorConsole(argv: readonly string[], sdk: OperatorSdk = REAL_SDK): Promise<{ readonly origin: string }> {
   const args = parseOperatorArgs(argv);
-  const operator = parseOperatorConfig(JSON.parse(readFileSync(args.operatorPath, 'utf8')) as unknown);
-  const consoleConfig = JSON.parse(readFileSync(args.configPath, 'utf8')) as unknown;
+  // 設定の検証（署名SAを含む）は資格・SDK生成・秘密読取りより前。不正なら固定errorで止まり、値を出さない。
+  const operator = parseOperatorConfig(JSON.parse(sdk.readFile(args.operatorPath)) as unknown);
+  const consoleConfig = JSON.parse(sdk.readFile(args.configPath)) as unknown;
   // 管理SDKの呼出しはoperator modeのCLI起動時だけ（通常の配信modeはこのmoduleをimportしない。API/MCP包装の閉包にも入らない）。
-  const secrets = new SecretManagerServiceClient();
+  const secrets = sdk.secretManager();
   // 接続server・送信APIと同じidentifierKey（32byte）。値はこのprocessのRAMだけで、鍵を導いた後に消す。
   const [version] = await secrets.accessSecretVersion({ name: operator.identifierKeySecretVersion });
   const data = version.payload?.data;
@@ -215,9 +237,13 @@ async function main(argv: readonly string[]): Promise<void> {
   if (secret === null || secret.length !== 32) throw new Error('operator: identifier key unavailable');
   const keys = developerLoginKeys(secret);
   secret.fill(0);
-  const app = initializeApp({ credential: applicationDefault(), projectId: operator.projectId }, `sttd-operator-${process.pid}`);
-  const auth = getAuth(app);
-  const db = new Firestore({ projectId: operator.projectId, databaseId: operator.databaseId });
+  // custom tokenの署名先は設定で明示したSAだけ（ADCのclient_emailやmetadata serverへのfallbackに頼らない）。
+  const app = sdk.initializeApp(
+    { credential: sdk.applicationDefault(), projectId: operator.projectId, serviceAccountId: operator.signingServiceAccount },
+    `sttd-operator-${process.pid}`,
+  );
+  const auth = sdk.getAuth(app);
+  const db = sdk.firestore({ projectId: operator.projectId, databaseId: operator.databaseId });
   const clock: Clock = { now: () => Date.now() };
   const store = new DeveloperLoginStore({
     db,
@@ -228,12 +254,13 @@ async function main(argv: readonly string[]): Promise<void> {
     random: defaultRandom,
   });
   const routes = createOperatorRoutes({ store, auth: { createCustomToken: (uid, claims) => auth.createCustomToken(uid, claims) }, clock });
-  const started = await startLocalConsole({ config: consoleConfig as never, port: args.port, operator: routes });
-  process.stdout.write(`SendTextToDots operator console: ${started.origin}/console\n`);
+  return sdk.startLocalConsole({ config: consoleConfig as never, port: args.port, operator: routes });
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main(process.argv.slice(2)).catch(() => {
+  startOperatorConsole(process.argv.slice(2)).then((started) => {
+    process.stdout.write(`SendTextToDots operator console: ${started.origin}/console\n`);
+  }).catch(() => {
     process.stderr.write('operator console: failed to start\n');
     process.exitCode = 1;
   });

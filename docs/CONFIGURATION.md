@@ -108,5 +108,8 @@ operator modeの設定ファイル（例: `operator.local.json`、commitしな�
 | projectId / databaseId | 配置設定と同じFirebase project・Firestore database |
 | namespace | 配置設定と同じ接続保存のnamespace（`t256_<UUID>`） |
 | identifierKeySecretVersion | 配置設定の`secretVersions.identifierKey`と同じSecret Manager版名（`projects/<projectNumber>/secrets/<id>/versions/<n>`）。値をファイル・ブラウザ・配布物へ書かない |
+| signingServiceAccount | custom tokenの署名に使う同projectの専用service account（`<name>@<projectId>.iam.gserviceaccount.com`、nameは小文字6〜30文字。例: `sttd-signer@sample-project.iam.gserviceaccount.com`）。他project・compute既定SA・URL・鍵JSONは受けません。必須で、欠落・不正なら資格・SDK・秘密の読取り前に固定errorで止まります |
+
+helperは既定のADCで動き、custom tokenの署名はFirebase Adminの`serviceAccountId`へ渡した`signingServiceAccount`だけを使います（ADCやmetadata serverから署名先を推測しません。自分のGoogleユーザーのADCにはservice accountのemailが無いためです）。helperを動かす資格に、そのservice accountへの`iam.serviceAccounts.signBlob`（例: Service Account Token Creator）が必要です。service accountの鍵JSONは配布しないでください。
 
 初期値（小規模な自己配置向け）: コード10分・予約は発行から24時間以上、発行候補20個・DB transaction最大5回・全体15秒。同時有効コードはnamespace 5・発行元1、発行は発行元3回/時・namespace 20回/時、入力はinteraction 5回・送信元5回・namespace全体の失敗5回/10分。onにする配置では、接続serverのservice accountにFirebaseユーザー作成とcustom token署名の権限が要ります（送信APIは照合の読取りだけ）。operator helperの資格もユーザー情報の署名・該当collectionの読み書き・identifierKeyの読取りに限ってください。TTLを使う場合は`developerLoginCodeReservations.deleteAfter`等へ配置側で設定します（認証期限の判定にはTTLを使いません）。

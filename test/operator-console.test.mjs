@@ -1,6 +1,7 @@
 // 開発者向けコード（T-065）の画面・operator helperの合成検証。
 //   - O: operator設定のexact schema、限定4操作（Origin必須/nonce/認証header拒否/小本文/JSON/未知route/method）、二重クリックの直列化、
 //        照会による発行結果の再表示（再発行しない）、再発行失敗で現在のコードを維持、active時だけcustom token、取消。
+//        CLIは同projectの署名SAだけをFirebase Adminの`serviceAccountId`へ渡し、不正なら資格・SDK・Secretの前に止まる（合成のSDK生成口）。
 //   - U: ステップ1の方式選択（operator off=未設定の案内）、日英、秘密/コードをHTMLへ入れない、自動poll無し、プラグイン接続画面のコード入力
 //        （feature offでは出さない）、固定の失敗案内、送信元consoleのpanel 1への統合。
 // 合成のstore/auth・127.0.0.1のlocal serverだけ。実SDK・Cloud・資格・外部network 0。
@@ -11,7 +12,7 @@ import { createServer } from 'node:http';
 import { test } from 'node:test';
 
 import { OPERATOR_TEXT, operatorScript, parseOperatorConfig, renderOperatorSection } from '../dist/console/operator-config.js';
-import { createOperatorRoutes, parseOperatorArgs } from '../dist/console/operator-server.js';
+import { createOperatorRoutes, parseOperatorArgs, startOperatorConsole } from '../dist/console/operator-server.js';
 import { CODE_TEXT, INTERACTION_SCRIPT, renderInteractionLogin } from '../dist/connect/pages.js';
 import { renderConsolePage } from '../dist/connect/console.js';
 import { DeveloperLoginError } from '../dist/identity/developer-login.js';
@@ -69,15 +70,45 @@ async function withHelper(store, fn) {
   }
 }
 
+const OPERATOR_CONFIG = Object.freeze({
+  version: 1,
+  projectId: 'sttd-synthetic',
+  databaseId: '(default)',
+  namespace: 't256_0b2c9a1e-4d5f-4a6b-8c7d-9e0f1a2b3c4d',
+  identifierKeySecretVersion: 'projects/123456789012/secrets/sttd-identifier/versions/1',
+  signingServiceAccount: 'sttd-signer@sttd-synthetic.iam.gserviceaccount.com',
+});
+
+/** 署名SAの不正値（欠落・空・別project・compute/App Engine既定・URL・大文字・長さ・型）。 */
+const BAD_SIGNERS = [
+  '',
+  'sttd-signer@other-project.iam.gserviceaccount.com',
+  'sttd-signer@sttd-synthetic.iam.gserviceaccount.com.evil.example',
+  '123456789012-compute@developer.gserviceaccount.com',
+  'sttd-synthetic@appspot.gserviceaccount.com',
+  'default',
+  'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sttd-signer@sttd-synthetic.iam.gserviceaccount.com',
+  'projects/-/serviceAccounts/sttd-signer@sttd-synthetic.iam.gserviceaccount.com',
+  'Sttd-Signer@sttd-synthetic.iam.gserviceaccount.com',
+  'abcde@sttd-synthetic.iam.gserviceaccount.com',
+  `s${'a'.repeat(30)}@sttd-synthetic.iam.gserviceaccount.com`,
+  'sttd-signer-@sttd-synthetic.iam.gserviceaccount.com',
+  'a@b@sttd-synthetic.iam.gserviceaccount.com',
+  ' sttd-signer@sttd-synthetic.iam.gserviceaccount.com',
+  ['sttd-signer@sttd-synthetic.iam.gserviceaccount.com'],
+  null,
+];
+
 test('O1 operator config is exact and contains no secret value', () => {
-  const good = {
-    version: 1,
-    projectId: 'sttd-synthetic',
-    databaseId: '(default)',
-    namespace: 't256_0b2c9a1e-4d5f-4a6b-8c7d-9e0f1a2b3c4d',
-    identifierKeySecretVersion: 'projects/123456789012/secrets/sttd-identifier/versions/1',
-  };
+  const good = OPERATOR_CONFIG;
   assert.equal(parseOperatorConfig(good).identifierKeySecretVersion, good.identifierKeySecretVersion);
+  assert.equal(parseOperatorConfig(good).signingServiceAccount, good.signingServiceAccount);
+  // 境界: SA名6文字・30文字は受ける（配置設定のserviceAccountと同じ規則）。
+  for (const name of ['abcdef', `s${'a'.repeat(29)}`]) {
+    const value = `${name}@sttd-synthetic.iam.gserviceaccount.com`;
+    assert.equal(parseOperatorConfig({ ...good, signingServiceAccount: value }).signingServiceAccount, value);
+  }
+  const { signingServiceAccount: _omitted, ...withoutSigner } = good;
   for (const bad of [
     { ...good, extra: 1 },
     { ...good, version: 2 },
@@ -86,10 +117,89 @@ test('O1 operator config is exact and contains no secret value', () => {
     { ...good, purpose: 'plugin-connect' },
     { ...good, namespace: 'replace-me' },
     { ...good, dedupeKey: 'inline-secret' },
-  ]) assert.throws(() => parseOperatorConfig(bad));
+    withoutSigner,
+    { ...withoutSigner, serviceAccountId: good.signingServiceAccount },
+    { ...good, privateKey: 'synthetic-key-data' },
+    ...BAD_SIGNERS.map((signingServiceAccount) => ({ ...good, signingServiceAccount })),
+  ]) assert.throws(() => parseOperatorConfig(bad), (error) => error.name === 'OperatorConfigError' && error.message === 'operator config: invalid');
   assert.deepEqual(parseOperatorArgs(['--config', 'a.json', '--operator', 'b.json']), { configPath: 'a.json', operatorPath: 'b.json', port: undefined });
   assert.throws(() => parseOperatorArgs(['--config', 'a.json']));
   assert.throws(() => parseOperatorArgs(['--config', 'a.json', '--operator', 'b.json', '--url', 'https://x']));
+});
+
+/** CLIの資格・SDK生成口の合成（呼出し順を記録する。実SDK・ADC探索・Secret・network 0）。 */
+function fakeSdk(operatorConfig) {
+  const calls = [];
+  const credential = Object.freeze({ synthetic: 'adc' });
+  const app = Object.freeze({ name: 'synthetic-app' });
+  const sdk = {
+    calls,
+    readFile(path) {
+      calls.push(['readFile', path]);
+      return path === 'operator.json' ? JSON.stringify(operatorConfig) : JSON.stringify({ synthetic: 'console' });
+    },
+    secretManager() {
+      calls.push(['secretManager']);
+      return { async accessSecretVersion(request) { calls.push(['accessSecretVersion', request.name]); return [{ payload: { data: new Uint8Array(32).fill(7) } }]; } };
+    },
+    applicationDefault() {
+      calls.push(['applicationDefault']);
+      return credential;
+    },
+    initializeApp(options, name) {
+      calls.push(['initializeApp', options, name]);
+      return app;
+    },
+    getAuth(received) {
+      calls.push(['getAuth', received]);
+      return { async createCustomToken() { return 'synthetic-custom-token'; } };
+    },
+    firestore(settings) {
+      calls.push(['firestore', settings]);
+      // storeの生成が参照を組むだけの最小chain（DB操作は0）。
+      const ref = { collection: () => ref, doc: () => ref };
+      return ref;
+    },
+    async startLocalConsole(input) {
+      calls.push(['startLocalConsole', input]);
+      return { origin: 'http://localhost:0' };
+    },
+  };
+  return { sdk, calls, credential, app };
+}
+
+test('O5 CLI passes only the configured same-project signer to Firebase Admin; invalid signer stops before credentials, SDK or secret I/O', async () => {
+  const argv = ['--config', 'console.json', '--operator', 'operator.json'];
+  const ok = fakeSdk(OPERATOR_CONFIG);
+  assert.deepEqual(await startOperatorConsole(argv, ok.sdk), { origin: 'http://localhost:0' });
+  const init = ok.calls.filter(([name]) => name === 'initializeApp');
+  assert.equal(init.length, 1);
+  const [, options] = init[0];
+  // 署名先は設定値そのもの（ADC/metadata/UIDからの推測ではない）。serviceAccountIdがあるとSDKのIAMSignerはmetadata serverへ進まない。
+  assert.deepEqual(Object.keys(options).sort(), ['credential', 'projectId', 'serviceAccountId']);
+  assert.equal(options.serviceAccountId, OPERATOR_CONFIG.signingServiceAccount);
+  assert.equal(options.projectId, OPERATOR_CONFIG.projectId);
+  assert.equal(options.credential, ok.credential);
+  assert.equal(ok.calls.find(([name]) => name === 'getAuth')[1], ok.app);
+  assert.deepEqual(ok.calls.find(([name]) => name === 'firestore')[1], { projectId: OPERATOR_CONFIG.projectId, databaseId: OPERATOR_CONFIG.databaseId });
+  assert.equal(typeof ok.calls.find(([name]) => name === 'startLocalConsole')[1].operator.handle, 'function');
+  // 署名SAの別名は同じ規則で受け、そのまま渡る（固定値の写しではない）。
+  const other = fakeSdk({ ...OPERATOR_CONFIG, signingServiceAccount: 'sttd-mcp-runtime@sttd-synthetic.iam.gserviceaccount.com' });
+  await startOperatorConsole(argv, other.sdk);
+  assert.equal(other.calls.find(([name]) => name === 'initializeApp')[1].serviceAccountId, 'sttd-mcp-runtime@sttd-synthetic.iam.gserviceaccount.com');
+
+  const { signingServiceAccount: _omitted, ...withoutSigner } = OPERATOR_CONFIG;
+  for (const config of [withoutSigner, ...BAD_SIGNERS.map((signingServiceAccount) => ({ ...OPERATOR_CONFIG, signingServiceAccount }))]) {
+    const bad = fakeSdk(config);
+    await assert.rejects(startOperatorConsole(argv, bad.sdk), (error) => {
+      // 固定error。設定値（SA・project・Secret版名）を含まない。
+      assert.equal(error.message, 'operator config: invalid');
+      assert.ok(!error.message.includes('sttd-'));
+      return true;
+    });
+    // operator設定を読んだだけで止まる（console設定・資格・Secret・SDK・DB・serverは0）。
+    assert.deepEqual(bad.calls, [['readFile', 'operator.json']]);
+  }
 });
 
 test('O2 helper refuses missing Origin, wrong nonce, auth header, wrong method/type/body, unknown action', async () => {

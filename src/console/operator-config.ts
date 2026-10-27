@@ -1,6 +1,6 @@
 // ローカル送信画面の明示operator mode（開発者向け6桁コードの発行）の設定・画面部品・ブラウザscript。I/O・管理SDK 0。
 //   - 通常の配信mode（public client設定だけ）は変えない。operator modeは`node dist/console/operator-server.js`で明示的に起動した時だけ。
-//   - 設定は固定の配置値（project/database/namespaceとidentifierKeyのSecret Manager版名）だけで、秘密の値・管理鍵JSONを持たない。
+//   - 設定は固定の配置値（project/database/namespace、identifierKeyのSecret Manager版名、custom tokenの署名SA）だけで、秘密の値・管理鍵JSONを持たない。
 //   - 画面: ステップ1で「Appleでログイン」「コードで接続」を選ぶ。選択だけでは発行しない。発行・接続確認・再発行・取消は本人の明示操作だけで、
 //     自動pollしない（残り時間の表示更新は端末内だけ）。送信はFirebaseのログイン・利用許可・同意・購読の確認まで封鎖のまま。
 
@@ -19,7 +19,15 @@ const DATABASE_ID = /^(?:\(default\)|[a-z][a-z0-9-]{0,61}[a-z0-9])$/;
 const NAMESPACE = /^t256_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 /** 配置設定のsecretVersions.identifierKeyと同じ形（project番号・固定の版番号。latestは不可）。 */
 const SECRET_VERSION = /^projects\/[1-9][0-9]{0,19}\/secrets\/[A-Za-z0-9_-]{1,255}\/versions\/[1-9][0-9]{0,9}$/;
-const CONFIG_KEYS = ['version', 'projectId', 'databaseId', 'namespace', 'identifierKeySecretVersion'] as const;
+/** 配置設定のserviceAccountと同じ規則のSA名（小文字6〜30文字）。 */
+const SA_LOCAL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
+const CONFIG_KEYS = ['version', 'projectId', 'databaseId', 'namespace', 'identifierKeySecretVersion', 'signingServiceAccount'] as const;
+
+/** 同projectの専用SA（`<name>@<projectId>.iam.gserviceaccount.com`）だけ。compute既定SA・他project・URLは形で拒否される。 */
+function isProjectServiceAccount(value: string, projectId: string): boolean {
+  const suffix = `@${projectId}.iam.gserviceaccount.com`;
+  return value.endsWith(suffix) && SA_LOCAL.test(value.slice(0, -suffix.length));
+}
 
 export class OperatorConfigError extends Error {
   constructor() {
@@ -39,6 +47,12 @@ export interface OperatorConfig {
    * 用途分離して導く（接続server・送信APIと同じ）。値はhelperのRAMだけに読む。
    */
   readonly identifierKeySecretVersion: string;
+  /**
+   * custom tokenの署名先（Firebase Adminの`serviceAccountId`）。同projectの専用SA emailを配置者が明示する。ADC・metadata・UIDから推測しない
+   * （通常のユーザーADCにはSA emailが無く、metadata serverへ進むと手元では署名先が決まらない）。helperの資格がこのSAへの
+   * `iam.serviceAccounts.signBlob`を持つ必要がある。
+   */
+  readonly signingServiceAccount: string;
 }
 
 /** 正確なkey集合・形だけを受ける（未知key・欠落・placeholderは拒否）。 */
@@ -52,12 +66,14 @@ export function parseOperatorConfig(value: unknown): OperatorConfig {
   if (typeof v.databaseId !== 'string' || !DATABASE_ID.test(v.databaseId)) throw new OperatorConfigError();
   if (typeof v.namespace !== 'string' || !NAMESPACE.test(v.namespace)) throw new OperatorConfigError();
   if (typeof v.identifierKeySecretVersion !== 'string' || !SECRET_VERSION.test(v.identifierKeySecretVersion)) throw new OperatorConfigError();
+  if (typeof v.signingServiceAccount !== 'string' || !isProjectServiceAccount(v.signingServiceAccount, v.projectId)) throw new OperatorConfigError();
   return Object.freeze({
     version: 1,
     projectId: v.projectId,
     databaseId: v.databaseId,
     namespace: v.namespace,
     identifierKeySecretVersion: v.identifierKeySecretVersion,
+    signingServiceAccount: v.signingServiceAccount,
   });
 }
 

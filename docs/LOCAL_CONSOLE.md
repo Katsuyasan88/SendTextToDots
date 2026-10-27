@@ -72,6 +72,8 @@ helperが上流を呼ぶ前に自分で拒否した応答（古い画面のnonce
 node dist/console/operator-server.js --config console.local.json --operator operator.local.json
 ```
 
+`operator.local.json`には署名用service accountの`signingServiceAccount`が必須です（[設定](CONFIGURATION.md)）。helperは既定のADCで動き、その資格にこのservice accountへの`iam.serviceAccounts.signBlob`が要ります。
+
 1. ステップ1で「コードで接続」を選びます（選ぶだけでは発行しません）。「コードを発行」を押すと6桁のコードと残り時間を表示します。
 2. 10分以内に、プラグインを追加した後の接続画面でコードを入力します。コードの使用は1回だけです。続けて通常の同意・購読を行います。
 3. コンソールで「接続を確認」を押すと、同じ利用単位でコンソールもログインします。自動での確認（poll）はしません。

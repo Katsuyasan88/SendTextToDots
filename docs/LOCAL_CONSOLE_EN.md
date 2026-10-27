@@ -72,6 +72,8 @@ The regular `npm run console` keeps the Sign in with Apple delivery mode and has
 node dist/console/operator-server.js --config console.local.json --operator operator.local.json
 ```
 
+`operator.local.json` requires `signingServiceAccount`, the service account that signs custom tokens ([configuration](CONFIGURATION_EN.md)). The helper runs with Application Default Credentials, which need `iam.serviceAccounts.signBlob` on that service account.
+
 1. In step 1 choose "Connect with a code" (choosing does not issue a code). "Generate a code" shows a 6-digit code and the time left.
 2. Within 10 minutes, enter the code in the plugin connection screen after adding the plugin. A code works once. Then complete the normal consent and subscription.
 3. Press "Check connection" in the console to sign the console in to the same account. There is no automatic polling.
