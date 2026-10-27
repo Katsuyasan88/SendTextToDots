@@ -3,12 +3,14 @@
 //     ログイン操作で初めてimport()し、復元済みsessionの確認・ID token取得・接続状態の確認もその後にだけ行う。popupは明示操作だけ。
 //   - 認証後の操作（接続確認・解除・送信・中止・同ID確認）は同origin（localhost helper）の限定pathへ、Authorization: Bearer と起動ごとのlocal nonce
 //     （X-Sttd-Local-Nonce）を付けて送る。helperが固定のMCP/API originへ中継する。本文はRAM/DOMだけ、保存0。
-//   - 5段階wizard: 1 ログイン → 2 接続確認（手動1回。プラグイン追加・OAuth接続の展開ガイドと、helperの検証済みMCP originから作る登録先URLを
-//     表示するだけで通信しない） → 3 テスト用Dotsプロンプト（コピー＋本人の「貼り付けて次へ」） → 4 送信（単回POST・同ID・取消。
-//     本人の「Dotsで本文一致を確認して次へ」） → 5 運用用Dotsプロンプト（コピー＋「貼り付けて完了」）。初期は1だけ有効。完了済みの前stepは薄く
-//     表示して再選択でき、再表示だけでは証跡を消さない。再ログイン開始時は2以降、受信を確認できない時は3以降、テスト設定の再適用は4/5を戻す。
-//     未解放のstepはクリックしても進めず通信しない。古いasync結果（世代が違うログイン/確認）で後続を解放しない。完了後は4で通常送信を繰り返せる。
-//   - HTTP受領（delivered）だけでwizardを進めない。4の完了は利用者がDotsで一致を確認した明示操作。不明（delivery_unknown/結果不明）はAPI結果を
+//   - 6段階wizard: 1 ログイン → 2 プラグイン追加と接続許可の確認（手動1回。linked/subscribed＋access allowedで3へ。プラグイン追加・OAuth接続の
+//     展開ガイドと、helperの検証済みMCP originから作る登録先URLは表示だけで通信しない） → 3 テスト用Dotsプロンプト（受信開始。コピー＋本人の
+//     「貼り付けて次へ」） → 4 受信状態の確認（手動1回。subscribed＋allowedだけが5を開く。linkedは4に留めて受信開始を案内） → 5 送信（単回POST・
+//     同ID・取消。本人の「Dotsで本文一致を確認して次へ」） → 6 運用用Dotsプロンプト（コピー＋「貼り付けて完了」）。初期は1だけ有効。完了済みの前step
+//     は薄く表示して再選択でき、再表示だけでは証跡を消さない。再ログイン開始時は2以降、接続許可を確認できない時は3以降、受信中を確認できない時と
+//     テスト設定の再適用は4以降を戻す。未解放のstepはクリックしても進めず通信しない。古いasync結果（世代が違うログイン/確認）で後続を解放しない。
+//     完了後は5で通常送信を繰り返せる。
+//   - HTTP受領（delivered）だけでwizardを進めない。5の完了は利用者がDotsで一致を確認した明示操作。不明（delivery_unknown/結果不明）はAPI結果を
 //     成功へ書き換えず、利用者の確認だけで進める。進行中（in-flight・中止確認中・同ID確認中）は完了不可。
 //   - 本文欄は空で始まりplaceholderに非機密の例文、主buttonはja「送信」/en「Send」。空・空白だけ・対にならないsurrogate・4096 UTF-8 byte超は通信前に拒否。
 //     送信POSTは最大25秒（元期限内）、二重クリックでPOSTを増やさない。終端後は「新しい送信」まで再送しない。自動再送・定期poll 0。
@@ -120,7 +122,7 @@ export function consoleSecurityHeaders(web: FirebaseWebConfig): Record<string, s
   };
 }
 
-/** /consoleのHTML（5段階wizard、1画面）。値はdata属性へescapeして渡す。文言は選択言語の辞書から入れ、scriptが同じキーで差し替える。 */
+/** /consoleのHTML（6段階wizard、1画面）。値はdata属性へescapeして渡す。文言は選択言語の辞書から入れ、scriptが同じキーで差し替える。 */
 export function renderConsolePage(web: FirebaseWebConfig, options: ConsolePageOptions): string {
   checkWeb(web);
   const nonce = checkLocalNonce(options?.nonce);
@@ -222,10 +224,19 @@ ${options.operatorCodePanel ?? ''}
 <h2 id="sttd-panel-3-title" class="sttd-panel-title"${i18n('wizard.step3')}>${t('wizard.step3')}</h2>
 <p id="sttd-guide-intro"${i18n('guide.intro')}>${t('guide.intro')}</p>
 <p id="sttd-guide-step1"${i18n('guide.step1')}>${t('guide.step1')}</p>
+<p id="sttd-receive-start"${i18n('wizard.receiveStart')}>${t('wizard.receiveStart')}</p>
 ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wizard.pastedTestNext')}
 </section>
 <section id="sttd-panel-4" class="sttd-panel" aria-labelledby="sttd-panel-4-title" data-sttd-state="locked" tabindex="0">
 <h2 id="sttd-panel-4-title" class="sttd-panel-title"${i18n('wizard.step4')}>${t('wizard.step4')}</h2>
+<p id="sttd-receive-intro"${i18n('wizard.receiveIntro')}>${t('wizard.receiveIntro')}</p>
+<div class="sttd-actions">
+<button type="button" id="sttd-receive-check" disabled${i18n('wizard.receiveCheck')}>${t('wizard.receiveCheck')}</button>
+</div>
+<p id="sttd-receive-text" role="status"></p>
+</section>
+<section id="sttd-panel-5" class="sttd-panel" aria-labelledby="sttd-panel-5-title" data-sttd-state="locked" tabindex="0">
+<h2 id="sttd-panel-5-title" class="sttd-panel-title"${i18n('wizard.step5')}>${t('wizard.step5')}</h2>
 <p id="sttd-send-intro"${i18n('wizard.sendIntro')}>${t('wizard.sendIntro')}</p>
 <label id="sttd-text-label" for="sttd-text"${i18n('console.textLabel')}>${t('console.textLabel')}</label>
 <textarea id="sttd-text" rows="4" maxlength="4096" placeholder="${t('console.textPlaceholder')}" disabled></textarea>
@@ -240,8 +251,8 @@ ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wi
 <button type="button" id="sttd-verify-send" disabled${i18n('wizard.sendVerified')}>${t('wizard.sendVerified')}</button>
 <p id="sttd-verify-hint" class="sttd-note"${i18n('wizard.sendNotVerifiable')}>${t('wizard.sendNotVerifiable')}</p>
 </section>
-<section id="sttd-panel-5" class="sttd-panel" aria-labelledby="sttd-panel-5-title" data-sttd-state="locked" tabindex="0">
-<h2 id="sttd-panel-5-title" class="sttd-panel-title"${i18n('wizard.step5')}>${t('wizard.step5')}</h2>
+<section id="sttd-panel-6" class="sttd-panel" aria-labelledby="sttd-panel-6-title" data-sttd-state="locked" tabindex="0">
+<h2 id="sttd-panel-6-title" class="sttd-panel-title"${i18n('wizard.step6')}>${t('wizard.step6')}</h2>
 <p id="sttd-guide-step3"${i18n('guide.step3')}>${t('guide.step3')}</p>
 ${instructions('operation', 'guide.showOperation', 'guide.operationText', 'guide.copyOperation', 'wizard.pastedOperationFinish')}
 </section>
@@ -290,7 +301,7 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 `;
 
 /**
- * 画面のscript（固定asset）。5段階wizardの状態・単回送信・中止・同ID確認・確認後の解除・固定プロンプトのコピー・言語切替。
+ * 画面のscript（固定asset）。6段階wizardの状態・単回送信・中止・同ID確認・確認後の解除・固定プロンプトのコピー・言語切替。
  * Firebase SDKは手順1の明示操作でだけimport()する。文言は埋め込んだ固定辞書（connect/i18n.ts）からキーで引く。
  */
 export const CONSOLE_SCRIPT = `const body = document.body;
@@ -315,7 +326,7 @@ const ACCESS_STATES = ['allowed', 'denied', 'unavailable'];
 const ERROR_STATUSES = [400, 401, 403, 409, 422, 429];
 const TERMINAL = ['delivered', 'failed', 'cancelled', 'expired', 'delivery_unknown'];
 const RANK = { in_flight: 1, delivery_unknown: 2, failed: 3, expired: 3, cancelled: 3, delivered: 4 };
-const STEPS = [1, 2, 3, 4, 5];
+const STEPS = [1, 2, 3, 4, 5, 6];
 /** Firebase SDKの読込み（明示ログイン時だけ。固定CDNの2 module）。 */
 const loadSdkModules = () => Promise.all([import(SDK_BASE + 'firebase-app.js'), import(SDK_BASE + 'firebase-auth.js')]);
 
@@ -337,8 +348,12 @@ let access = null;
 let connectionKey = '';
 let guideKey = '';
 let checking = false;
+// 実行中の確認の手順（2=接続許可の確認、4=受信状態の確認。どちらも同じ接続APIへの明示1回GET）。
+let checkFrom = 2;
+// 手順4の受信状態の確認結果（RAMだけ）。
+let receiveKey = '';
 let step = 1;
-const done = { 1: false, 2: false, 3: false, 4: false, 5: false };
+const done = { 1: false, 2: false, 3: false, 4: false, 5: false, 6: false };
 let noteKey = '';
 let test = null;
 let sendNote = '';
@@ -410,11 +425,17 @@ function available(n) {
   if (checking) return false;
   if (n === 3) return done[2];
   if (n === 4) return done[3];
-  return done[4];
+  if (n === 5) return done[4];
+  return done[5];
+}
+
+/** 手順nより後ろに戻すべき進捗があるか（reset時の注意に使う）。 */
+function doneAfter(n) {
+  return STEPS.some((k) => k > n && done[k]);
 }
 
 function sendableNow() {
-  return available(4) && signedIn && connection === 'subscribed' && access === 'allowed' && !busy();
+  return available(5) && signedIn && connection === 'subscribed' && access === 'allowed' && !busy();
 }
 
 function languageLocked() {
@@ -444,18 +465,19 @@ function resetFrom(n) {
     copied.test = false;
     manual.test = false;
   }
-  if (n <= 4) {
+  if (n <= 4) receiveKey = '';
+  if (n <= 5) {
     // 未確定の送信を消す時は重複注意を残す（同IDの自動照会・取消・再送はしない）。
     if (test !== null && uncertain(test)) duplicateWarning = true;
     test = null;
     sendNote = '';
     el('sttd-text').value = '';
   }
-  if (n <= 5) {
+  if (n <= 6) {
     copied.operation = false;
     manual.operation = false;
   }
-  if (copyFor !== '' && ((n <= 3 && copyFor === 'test') || (n <= 5 && copyFor === 'operation'))) {
+  if (copyFor !== '' && ((n <= 3 && copyFor === 'test') || (n <= 6 && copyFor === 'operation'))) {
     copyKey = '';
     copyFor = '';
   }
@@ -481,8 +503,8 @@ function render() {
   el('sttd-switch').hidden = !signedIn;
   el('sttd-switch').disabled = inactive(1) || busy() || inFlight() || confirming;
   // 2 接続確認
-  el('sttd-state-text').textContent = checking ? T('wizard.checking') : connection === null ? T(connectionKey) : T(connection === 'subscribed' ? 'console.state.subscribed' : 'common.state.' + connection);
-  el('sttd-state-guide').textContent = checking ? '' : T(guideKey);
+  el('sttd-state-text').textContent = checking && checkFrom === 2 ? T('wizard.checking') : connection === null ? T(connectionKey) : T(connection === 'subscribed' ? 'console.state.subscribed' : 'common.state.' + connection);
+  el('sttd-state-guide').textContent = checking && checkFrom === 2 ? '' : T(guideKey);
   el('sttd-refresh').disabled = inactive(2) || !available(2) || busy() || inFlight() || confirming;
   // コード方式で未認証の間は、コードの接続確認だけ（通常の接続確認は認証後に出す）。追加方法の認証説明も選んだ方式に合わせる
   el('sttd-refresh').hidden = method === 'code' && !signedIn;
@@ -493,28 +515,31 @@ function render() {
   el('sttd-disconnect-yes').disabled = inactive(2) || busy();
   el('sttd-disconnect-no').disabled = inactive(2) || busy();
   el('sttd-disconnect-result').textContent = T(disconnectKey);
-  // 3/5 プロンプト
+  // 3/6 プロンプト
   for (const kind of ['test', 'operation']) {
-    const n = kind === 'test' ? 3 : 5;
+    const n = kind === 'test' ? 3 : 6;
     el('sttd-copy-' + kind).disabled = inactive(n) || copying || !available(n);
     el('sttd-manual-' + kind).hidden = !(copyFor === kind && (copyKey === 'guide.copyUnavailable' || copyKey === 'guide.copyFailed')) || manual[kind];
     el('sttd-manual-' + kind).disabled = inactive(n) || copying || !available(n);
     el('sttd-copy-result-' + kind).textContent = copyFor === kind ? T(copyKey) : '';
     el('sttd-done-' + kind).disabled = inactive(n) || copying || !available(n) || !(copied[kind] || manual[kind]) || (kind === 'test' && inFlight());
   }
-  // 完了banner（panel5の外、画面下）: done5の間は手順4へ戻っても表示する。
-  el('sttd-complete').hidden = !done[5];
-  // 4 送信
-  const sendable = sendableNow() && !inactive(4);
+  // 完了banner（panel6の外、画面下）: done6の間は手順5へ戻っても表示する。
+  el('sttd-complete').hidden = !done[6];
+  // 4 受信状態の確認（明示1回GET。自動の再確認はしない）
+  el('sttd-receive-check').disabled = inactive(4) || !available(4) || !signedIn || busy() || inFlight() || confirming;
+  el('sttd-receive-text').textContent = checking && checkFrom === 4 ? T('wizard.receiveChecking') : T(receiveKey);
+  // 5 送信
+  const sendable = sendableNow() && !inactive(5);
   el('sttd-text').disabled = !sendable || test !== null;
   el('sttd-send').disabled = !sendable || test !== null;
   el('sttd-cancel').hidden = test === null || (phase !== 'sending' && phase !== 'unknown') || test.cancel === 'answered' || test.cancel === 'unconfirmed';
-  el('sttd-cancel').disabled = inactive(4) || (test !== null && test.cancel === 'pending');
+  el('sttd-cancel').disabled = inactive(5) || (test !== null && test.cancel === 'pending');
   el('sttd-check').hidden = test === null || !checkable(test);
-  el('sttd-check').disabled = inactive(4) || (test !== null && test.checking);
+  el('sttd-check').disabled = inactive(5) || (test !== null && test.checking);
   el('sttd-new').hidden = test === null || phase === 'sending' || test.cancel === 'pending' || test.checking;
-  el('sttd-new').disabled = inactive(4);
-  el('sttd-verify-send').disabled = inactive(4) || !available(4) || busy() || !verifiable();
+  el('sttd-new').disabled = inactive(5);
+  el('sttd-verify-send').disabled = inactive(5) || !available(5) || busy() || !verifiable();
   for (const code of ['en', 'ja']) {
     const link = el('sttd-lang-' + code);
     link.setAttribute('aria-current', code === lang ? 'true' : 'false');
@@ -786,64 +811,102 @@ async function checkConnection(internal) {
   if (!signedIn) return;
   if (!available(2) || busy() || inFlight() || confirming) return;
   if (!internal && !canAct(2)) return;
+  const json = await connectionGet(2);
+  if (json === undefined) return;
+  if (json === null) return render();
+  if ((json.state === 'linked' || json.state === 'subscribed') && access === 'allowed') {
+    // 接続許可（linked）で手順3へ。受信の開始と確認は手順3/4で行う（ここではsubscribedを要求しない）。
+    const first = !done[2];
+    done[2] = true;
+    noteKey = '';
+    if (json.state === 'linked' && done[4]) receiveLost();
+    if (first) step = 3;
+  } else if ((json.state === 'linked' || json.state === 'subscribed') && done[2]) {
+    // 接続のまま利用許可だけが無い: 進捗（前の送信の確認・中止を含む）は残し、新しい送信だけを止める（sendableNowがallowedを要求）。
+    if (json.state === 'linked' && done[4]) receiveLost();
+  } else {
+    connectionLost();
+  }
+  render();
+}
+
+/** 手順4: 受信状態の確認（明示1回GET）。subscribed＋allowedだけが手順5を開く。linkedは手順4に留めて受信開始を案内する。 */
+async function checkReceiving() {
+  if (!signedIn || !canAct(4) || busy() || inFlight() || confirming) return;
+  const json = await connectionGet(4);
+  if (json === undefined) return;
+  if (json === null) {
+    receiveKey = guideKey;
+    if (done[4]) receiveLost();
+    return render();
+  }
+  if (json.state === 'subscribed' && access === 'allowed') {
+    done[4] = true;
+    noteKey = '';
+    receiveKey = 'wizard.receive.ok';
+    step = 5;
+  } else if (json.state === 'linked') {
+    receiveKey = access === 'allowed' ? 'wizard.receive.linked' : 'wizard.access.' + access;
+    if (done[4]) receiveLost();
+  } else if (json.state === 'subscribed') {
+    // 受信中でも利用許可が無ければ5へ進めない。既にある進捗は残し、新しい送信だけを止める。
+    receiveKey = 'wizard.access.' + access;
+  } else {
+    connectionLost();
+  }
+  render();
+}
+
+/** 接続APIへの明示1回GET（手順2/4共通）。undefined=処理済み（古い結果・認証喪失）、null=状態不明（connection/guideを更新済み）、それ以外は既知のstateを持つ応答。 */
+async function connectionGet(from) {
   const gen = ++checkGeneration;
   const login = loginGeneration;
   checking = true;
+  checkFrom = from;
   render();
   const outcome = await request('/v1/web/connection', 'GET', CONNECTION_MS, {}, undefined);
-  if (gen !== checkGeneration || login !== loginGeneration) return;
+  if (gen !== checkGeneration || login !== loginGeneration) return undefined;
   checking = false;
-  if (outcome.kind === 'stale') return render();
-  if (outcome.kind === 'not_sent') {
-    // tokenを得られない（owner変更/失効/未ログイン）: ログインからやり直す。
-    authLost('common.loginRefresh');
-    return;
+  if (outcome.kind === 'stale') {
+    render();
+    return undefined;
   }
-  if (outcome.kind === 'local') {
-    // helperが送信前に拒否（古い画面等）: 状態は不明のまま。再読込みを案内する。
-    connection = null;
-    access = null;
-    connectionKey = 'console.connectionUnavailable';
-    guideKey = 'console.localRefused';
-    if (done[3] || done[4] || done[5]) noteKey = 'wizard.stateReset';
-    resetFrom(3);
-    done[2] = false;
-    step = 2;
-    return render();
+  if (outcome.kind === 'not_sent' || (outcome.kind === 'response' && outcome.status === 401)) {
+    // tokenを得られない（owner変更/失効/未ログイン）、または401（request()がauthLost済みが通常。念のため同じ処理）: ログインからやり直す。
+    authLost('common.loginRefresh');
+    return undefined;
   }
   const json = outcome.kind === 'response' ? outcome.json : null;
-  if (json && typeof json.state === 'string' && CONNECTION_STATES.includes(json.state)) {
+  if (outcome.kind !== 'local' && json && typeof json.state === 'string' && CONNECTION_STATES.includes(json.state)) {
     connection = json.state;
     // accessの欠落は利用許可に未対応の旧サービス（更新が必要）。未知の値は確認できないものとして扱う。どちらも新しい送信を解放しない。
     access = !Object.hasOwn(json, 'access') ? 'outdated' : ACCESS_STATES.includes(json.access) ? json.access : 'unavailable';
     guideKey = access === 'allowed' ? 'wizard.next.' + json.state : 'wizard.access.' + access;
-    if (json.state === 'subscribed' && access === 'allowed') {
-      const first = !done[2];
-      done[2] = true;
-      noteKey = '';
-      if (first) step = 3;
-    } else if (json.state === 'subscribed' && done[2]) {
-      // 受信中のまま利用許可だけが無い: 進捗（前の送信の確認・中止を含む）は残し、新しい送信だけを止める（sendableNowがallowedを要求）。
-    } else {
-      if (done[3] || done[4] || done[5]) noteKey = 'wizard.stateReset';
-      resetFrom(3);
-      done[2] = false;
-      step = 2;
-    }
-  } else if (outcome.kind === 'response' && outcome.status === 401) {
-    // request()がauthLostを実行済み（世代が進んで上で戻るのが通常。念のため同じ処理）。
-    authLost('common.loginRefresh');
-    return;
-  } else {
-    connection = null;
-    connectionKey = 'console.connectionUnavailable';
-    guideKey = 'wizard.next.unavailable';
-    if (done[3] || done[4] || done[5]) noteKey = 'wizard.stateReset';
-    resetFrom(3);
-    done[2] = false;
-    step = 2;
+    return json;
   }
-  render();
+  // helperが送信前に拒否（古い画面等）・不明な応答: 状態は不明のまま（成功として扱わない）。
+  connection = null;
+  if (outcome.kind === 'local') access = null;
+  connectionKey = 'console.connectionUnavailable';
+  guideKey = outcome.kind === 'local' ? 'console.localRefused' : 'wizard.next.unavailable';
+  if (from === 2) connectionLost();
+  return null;
+}
+
+/** 接続許可を確認できない: 手順3以降を戻し、手順2で確認し直す。 */
+function connectionLost() {
+  if (doneAfter(2)) noteKey = 'wizard.stateReset';
+  resetFrom(3);
+  done[2] = false;
+  step = 2;
+}
+
+/** 受信中を確認できない: 手順4以降を戻す（手順2/3の進捗は残す）。 */
+function receiveLost() {
+  const key = receiveKey;
+  noteKey = 'wizard.receiveReset';
+  resetFrom(4);
+  receiveKey = key;
 }
 
 // ---- 解除（確認→1回POST→2以降を戻して再確認） ----
@@ -874,7 +937,7 @@ function disconnect() {
     const json = outcome.kind === 'response' ? outcome.json : null;
     const ok = outcome.kind === 'response' && outcome.status >= 200 && outcome.status < 300 && json !== null && typeof json.state === 'string' && CONNECTION_STATES.includes(json.state);
     accountBusy = false;
-    if (done[3] || done[4] || done[5]) noteKey = 'wizard.stateReset';
+    if (doneAfter(2)) noteKey = 'wizard.stateReset';
     resetFrom(2);
     step = 2;
     disconnectKey = ok ? 'common.disconnectDone' : outcome.kind === 'local' ? 'console.localRefused' : 'common.disconnectFailed';
@@ -888,7 +951,7 @@ function disconnect() {
 // ---- 3/5 固定プロンプトのコピーと完了操作 ----
 
 function copyInstructions(kind) {
-  const n = kind === 'test' ? 3 : 5;
+  const n = kind === 'test' ? 3 : 6;
   if (copying || !canAct(n)) return;
   const text = T(kind === 'operation' ? 'guide.operationText' : 'guide.testText');
   // この結果はこのresetの世代に束縛する（pending中にreset/再ログイン/再確認があれば捨てる）。
@@ -922,7 +985,7 @@ function copyInstructions(kind) {
 }
 
 function confirmManualCopy(kind) {
-  const n = kind === 'test' ? 3 : 5;
+  const n = kind === 'test' ? 3 : 6;
   if (copying || !canAct(n)) return;
   manual[kind] = true;
   copyFor = kind;
@@ -950,28 +1013,28 @@ function completeTest() {
   render();
 }
 
-/** 4の完了操作: 本人がDotsで一致を確認した明示操作（受領/不明の終端だけ）。 */
+/** 5の完了操作: 本人がDotsで一致を確認した明示操作（受領/不明の終端だけ）。 */
 function verifySend() {
-  if (!canAct(4) || busy() || !verifiable()) return;
-  done[4] = true;
-  step = 5;
+  if (!canAct(5) || busy() || !verifiable()) return;
+  done[5] = true;
+  step = 6;
   render();
 }
 
-/** 5の完了操作。 */
+/** 6の完了操作。 */
 function completeOperation() {
-  if (copying || !canAct(5) || busy()) return;
+  if (copying || !canAct(6) || busy()) return;
   if (!(copied.operation || manual.operation)) {
     copyFor = 'operation';
     copyKey = 'wizard.copyRequired';
     return render();
   }
-  done[5] = true;
+  done[6] = true;
   noteKey = '';
   render();
 }
 
-// ---- 4 送信・中止・同ID確認 ----
+// ---- 5 送信・中止・同ID確認 ----
 
 function stateOf(current, outcome) {
   const json = outcome.kind === 'response' ? outcome.json : null;
@@ -985,7 +1048,7 @@ function apply(current, state) {
 }
 
 async function send() {
-  if (!sendableNow() || !canAct(4) || test !== null) return;
+  if (!sendableNow() || !canAct(5) || test !== null) return;
   const text = el('sttd-text').value;
   if (typeof text !== 'string' || text.trim() === '' || LONE_SURROGATE.test(text) || new TextEncoder().encode(text).length > MAX_TEXT_BYTES) {
     sendNote = 'console.inputInvalid';
@@ -1028,7 +1091,7 @@ function errorCode(json) {
 
 async function cancel() {
   const current = test;
-  if (!canAct(4) || current === null || current.cancel !== 'none' || phaseOf(current) === 'settled') return;
+  if (!canAct(5) || current === null || current.cancel !== 'none' || phaseOf(current) === 'settled') return;
   current.cancel = 'pending';
   render();
   const outcome = await request('/v2/commands/' + current.commandId + '/cancel', 'POST', CANCEL_MS, {}, undefined);
@@ -1046,7 +1109,7 @@ async function cancel() {
 
 async function check() {
   const current = test;
-  if (!canAct(4) || current === null || current.checking || !checkable(current)) return;
+  if (!canAct(5) || current === null || current.checking || !checkable(current)) return;
   current.checking = true;
   current.checkNote = '';
   render();
@@ -1063,7 +1126,7 @@ async function check() {
 
 function newTest() {
   const current = test;
-  if (!canAct(4) || current === null || phaseOf(current) === 'sending' || current.cancel === 'pending' || current.checking) return;
+  if (!canAct(5) || current === null || phaseOf(current) === 'sending' || current.cancel === 'pending' || current.checking) return;
   const warn = uncertain(current);
   test = null;
   sendNote = warn ? 'console.duplicateWarning' : '';
@@ -1238,6 +1301,7 @@ function start() {
   el('sttd-done-test').onclick = () => completeTest();
   el('sttd-done-operation').onclick = () => completeOperation();
   el('sttd-verify-send').onclick = () => verifySend();
+el('sttd-receive-check').onclick = () => checkReceiving();
   el('sttd-send').onclick = () => send();
   el('sttd-cancel').onclick = () => cancel();
   el('sttd-check').onclick = () => check();

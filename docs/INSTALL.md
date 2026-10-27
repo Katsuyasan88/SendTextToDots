@@ -205,12 +205,12 @@ MCPのCPU/memory/instance数は上記の開始例であり、負荷試験済み�
 
 ## 6. 接続・最初の送信・停止計画
 
-[Dotsの受信テストと応答設定](DOTS_GUIDE.md)の順に、受信先Dotsへテスト用の指示文を貼り、送信した本文の一致を確認した後、運用用の指示文を貼ります。ローカル送信画面の手順3と手順5で、選択言語の文面を表示・コピーできます。コピーだけではDotsへ送信されず、本文一致や切替完了を画面が自動判定することもありません。
+[Dotsの受信テストと応答設定](DOTS_GUIDE.md)の順に、受信先Dotsへテスト用の指示文を貼り、送信した本文の一致を確認した後、運用用の指示文を貼ります。ローカル送信画面の手順3と手順6で、選択言語の文面を表示・コピーできます。コピーだけではDotsへ送信されず、本文一致や切替完了を画面が自動判定することもありません。
 
 1. 自分のパソコンでローカル送信画面を起動します（[LOCAL_CONSOLE.md](LOCAL_CONSOLE.md)）: `console.config.example.json`を`console.local.json`へコピーしてAPI/MCPのoriginとFirebase Webの公開設定を入れ、`npm run console -- --config console.local.json`を実行し、`http://localhost:8765/console`を開きます（English/日本語。ボタンを押すまで読み込みも送信もしません）。Firebaseのauthorized domainsへ`localhost`を追加します。手順1でAppleログインします。Dots/ChatGPTのMCP server登録先は**MCP originの`/mcp`**です。ローカル画面やAPI originを登録先にしません。
-2. 接続の前に、使う本人（自分を含む）を運営者が管理CLIで明示登録します（[CONFIGURATION](CONFIGURATION.md#access-admin)）。手順1のAppleログインでFirebase利用者ができるので、Firebase consoleのAuthentication等で本人のUIDを確認して登録します。未登録・停止中はOAuthのログインで「このサービスの利用が許可されていません」と表示され、送信もできません。続いてDots/ChatGPT側からOAuth接続し、同じFirebase利用者として明示同意します。`text.submitted`を購読したら、手順2の「接続を確認」で「受信中」になることを確認します（他の状態では次にすることを画面が案内します）。送信画面を開くだけでは購読は作られません。 Dots/ChatGPTへの追加手順と登録先URLは、ローカル画面の手順2の「プラグインを追加・接続する」に表示されます（[LOCAL_CONSOLE](LOCAL_CONSOLE.md)）。
-3. 手順3でテスト用の指示文を受信先Dotsへ貼り付けて確認します。手順4で空欄に短い本文を入力して「送信」を押し、受信側で入力どおりの表示を確認してから画面で一致を確認します。手順5で運用用の指示文を貼り付けます。STTD自身は本文を実行しません。
-4. 直接APIを使う場合は[1件送信するclient例](API.md#direct-client-example)と[sessionの条件](API.md#firebase-sessions)を参照。Apple providerで認証した同じproject/UIDのFirebase ID tokenが必要です。Web画面のtokenを表示する管理toolは同梱しません。最初の確認とその後の通常送信（手順4）にはローカル画面を使えます。
+2. 接続の前に、使う本人（自分を含む）を運営者が管理CLIで明示登録します（[CONFIGURATION](CONFIGURATION.md#access-admin)）。手順1のAppleログインでFirebase利用者ができるので、Firebase consoleのAuthentication等で本人のUIDを確認して登録します。未登録・停止中はOAuthのログインで「このサービスの利用が許可されていません」と表示され、送信もできません。続いてDots/ChatGPT側からOAuth接続し、同じFirebase利用者として明示同意します。手順2の「接続を確認」で接続の許可を確認すると手順3へ進みます（他の状態では次にすることを画面が案内します）。`text.submitted`の購読（受信の開始）は手順3で行い、手順4で「受信中」になることを確認します。送信画面を開くだけでは購読は作られません。 Dots/ChatGPTへの追加手順と登録先URLは、ローカル画面の手順2の「プラグインを追加・接続する」に表示されます（[LOCAL_CONSOLE](LOCAL_CONSOLE.md)）。
+3. 手順3でテスト用の指示文を受信先Dotsへ貼り付け、受信を開始します。手順4で「受信状態を確認」を押し、「受信中」を確認します。手順5で空欄に短い本文を入力して「送信」を押し、受信側で入力どおりの表示を確認してから画面で一致を確認します。手順6で運用用の指示文を貼り付けます。STTD自身は本文を実行しません。
+4. 直接APIを使う場合は[1件送信するclient例](API.md#direct-client-example)と[sessionの条件](API.md#firebase-sessions)を参照。Apple providerで認証した同じproject/UIDのFirebase ID tokenが必要です。Web画面のtokenを表示する管理toolは同梱しません。最初の確認とその後の通常送信（手順5）にはローカル画面を使えます。
 5. `delivered`はcallbackの2xx受領で、受信側の処理完了ではありません。結果不明なら送信前に控えた同じcommandIdで状態照会し、新IDで自動再送しません。
 6. このaccountからの送信を止めるにはローカル画面の手順2の「接続を解除」を使います（画面で確認してから実行）。認可と購読が失効し、再開はChatGPTからの再接続です。Cloud Runは送信画面も別の接続画面も配信しません。
 

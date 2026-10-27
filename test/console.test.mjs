@@ -111,12 +111,12 @@ test('A1 /console assets (local page): fixed HTML/JS/CSS, empty textarea with an
   assert.equal(/<select|<option|sttd-direction|方向|上<\/|下<\/|左<\/|右<\/|direction/i.test(page.body), false, 'no direction UI');
   assert.ok(page.body.includes('id="sttd-guide-test-text"') && page.body.includes('id="sttd-guide-operation-text"') && page.body.includes('id="sttd-copy-test"') && page.body.includes('id="sttd-copy-operation"'));
   assert.equal(/<textarea[^>]*value=|<input/i.test(page.body), false, 'no preset input');
-  for (const n of [1, 2, 3, 4, 5]) assert.ok(page.body.includes(`id="sttd-panel-${n}"`), `step ${n}`);
+  for (const n of [1, 2, 3, 4, 5, 6]) assert.ok(page.body.includes(`id="sttd-panel-${n}"`), `step ${n}`);
   assert.equal((page.body.match(/data-sttd-state="current"/g) ?? []).length, 1, 'exactly one active step at start (its panel; no separate step list)');
   assert.ok(!page.body.includes('id="sttd-steps"') && !page.body.includes('sttd-step-1-head'), 'no separate step list');
-  assert.equal((page.body.match(/data-sttd-state="locked"/g) ?? []).length, 4, 'four locked steps (panels only; no separate step list)');
-  assert.equal((page.body.match(/<section id="sttd-panel-[1-5]"[^>]*>/g) ?? []).length, 5, 'all five panels present');
-  assert.equal(/<section id="sttd-panel-[1-5]"[^>]*\shidden/.test(page.body), false, 'no panel is hidden; inactive ones are gray');
+  assert.equal((page.body.match(/data-sttd-state="locked"/g) ?? []).length, 5, 'five locked steps (panels only; no separate step list)');
+  assert.equal((page.body.match(/<section id="sttd-panel-[1-6]"[^>]*>/g) ?? []).length, 6, 'all six panels present');
+  assert.equal(/<section id="sttd-panel-[1-6]"[^>]*\shidden/.test(page.body), false, 'no panel is hidden; inactive ones are gray');
   assert.ok(page.body.indexOf('id="sttd-complete"') > page.body.lastIndexOf('</section>'), 'the completion banner is below all panels');
   const style = consoleAsset('/console/app.css', WEB, PAGE).body;
   assert.equal(/select/.test(style), false, 'no select-only style');
@@ -184,7 +184,7 @@ test('R1 no automatic resend: one POST per click (the command is fixed before th
   const sendBody = s.slice(s.indexOf('async function send() {'), s.indexOf('async function cancel() {'));
   assert.equal((sendBody.match(/await request\(/g) ?? []).length, 1, 'send() awaits a single request');
   assert.ok(sendBody.indexOf('test = current;') < sendBody.indexOf('await request('), 'the command is fixed before the first await');
-  assert.ok(sendBody.includes('if (!sendableNow() || !canAct(4) || test !== null) return;'), 'a second click while one is pending (or from an inactive panel) does nothing');
+  assert.ok(sendBody.includes('if (!sendableNow() || !canAct(5) || test !== null) return;'), 'a second click while one is pending (or from an inactive panel) does nothing');
   assert.equal((sendBody.match(/el\('sttd-text'\)\.value/g) ?? []).length, 1, 'the textarea value is captured once per click');
   for (const banned of ['setInterval', 'for (;;)', 'while (true)']) assert.equal(s.includes(banned), false, `no ${banned}`);
   assert.equal(/setTimeout\([^)]*request\(/.test(s), false, 'no timer-driven request');

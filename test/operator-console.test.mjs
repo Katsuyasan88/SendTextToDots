@@ -432,7 +432,7 @@ test('B1 issue unlocks only step 2 from the controller state; sending stays lock
   assert.equal(ui.el('sttd-code-confirm').hidden, false);
   assert.ok(ui.el('sttd-plugin-step-3').textContent.includes('Connect with a code'), 'plugin guide matches the code method');
   assert.ok(!ui.el('sttd-plugin-step-3').textContent.includes('same Apple account'));
-  for (const n of [3, 4, 5]) assert.equal(ui.stepState(n), 'locked', `step ${n}`);
+  for (const n of [3, 4, 5, 6]) assert.equal(ui.stepState(n), 'locked', `step ${n}`);
   assert.equal(ui.base.calls.loads, 0, 'no SDK before an explicit sign-in');
   assert.equal(ui.fetches.filter((f) => !f.url.startsWith('/v1/operator/')).length, 0, 'no upstream call');
   assert.equal(ui.el('sttd-apple-panel').hidden, true, 'code mode shows only code operations');
@@ -462,7 +462,7 @@ test('B3 switching method resets to step 1, locks later steps and closes the cod
   await ui.click('sttd-panel-1');
   await ui.click('sttd-method-apple');
   assert.equal(ui.stepState(1), 'current');
-  for (const n of [2, 3, 4, 5]) assert.equal(ui.stepState(n), 'locked', `step ${n}`);
+  for (const n of [2, 3, 4, 5, 6]) assert.equal(ui.stepState(n), 'locked', `step ${n}`);
   assert.equal(ui.base.auth.currentUser, null, 'the code session is closed');
   assert.ok(ui.base.calls.signOuts > signOuts);
   assert.equal(ui.el('sttd-switch-notice').hidden, false, 'reinstall guidance shown');

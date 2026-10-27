@@ -36,7 +36,7 @@ MacはNode.js 22.23.2/npm 12.0.2で、`npm ci --ignore-scripts --no-audit --no-f
 | 表示言語 | 英語/日本語の画面と言語cookieは合成試験だけで確認。実ブラウザでの動作と他言語は未確認で、英語・日本語以外は英語になる |
 | 利用許可（明示登録） | 判定・同意/購読/送信の拒否・管理CLIの期待版/期限/後始末は合成のSDK・DBだけで確認。管理CLIの実起動（運営者のADC・実Firestore・Secret Manager）、実IAM権限、既存配置の更新時の再同意・再購読の流れは未確認 |
 | 手順2のプラグイン追加ガイド | 表示・展開・言語切替で通信しないことは合成DOMだけで確認。ChatGPTのPlugins画面の項目名・利用可否（account/workspaceによる）・実際の追加とOAuth接続は未確認 |
-| ローカル送信画面 | helper・5段階セットアップ・中継は合成SDK/DOM/fetchとloopbackだけで確認。実ブラウザでのログイン・clipboard・Apple popup・実配置への中継は未確認。作者の過去の実配送は旧Cloud Run `/console`（現在のsourceには含まれない。配置済み環境に残っているかは配置時期による）で行ったもの |
+| ローカル送信画面 | helper・6段階セットアップ・中継は合成SDK/DOM/fetchとloopbackだけで確認。実ブラウザでのログイン・clipboard・Apple popup・実配置への中継は未確認。作者の過去の実配送は旧Cloud Run `/console`（現在のsourceには含まれない。配置済み環境に残っているかは配置時期による）で行ったもの |
 
 ## 含まれないもの
 

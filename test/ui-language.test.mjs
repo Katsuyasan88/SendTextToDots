@@ -174,7 +174,7 @@ test('L3 rendering: every page carries html lang, title and body in the selected
   assert.ok(/<textarea id="sttd-text"[^>]*placeholder="例: SendTextToDotsからのテストです"[^>]*><\/textarea>/.test(consoleJa));
   assert.ok(/<textarea id="sttd-text"[^>]*placeholder="Example: Hello from SendTextToDots \(delivery test\)"[^>]*><\/textarea>/.test(consoleEn));
   assert.ok(consoleJa.includes('>送信</button>') && consoleEn.includes('>Send</button>'), 'main button');
-  for (const n of [1, 2, 3, 4, 5]) assert.ok(consoleEn.includes(`id="sttd-panel-${n}"`), `step ${n} present`);
+  for (const n of [1, 2, 3, 4, 5, 6]) assert.ok(consoleEn.includes(`id="sttd-panel-${n}"`), `step ${n} present`);
   assert.ok(/id="sttd-panel-1"[^>]*data-sttd-state="current"/.test(consoleEn) && /id="sttd-panel-2"[^>]*data-sttd-state="locked"/.test(consoleEn) && !consoleEn.includes('sttd-steps'), 'only step 1 starts active; no separate step list');
   for (const id of ['sttd-disconnect', 'sttd-disconnect-confirm', 'sttd-disconnect-yes', 'sttd-disconnect-no', 'sttd-disconnect-result']) assert.ok(consoleEn.includes(`id="${id}"`), id);
   assert.equal(consoleEn.includes('href="/connect"'), false, 'console no longer sends the user to /connect to disconnect');
@@ -190,11 +190,11 @@ test('L3 rendering: every page carries html lang, title and body in the selected
       assert.equal(own.includes(`id="sttd-copy-${kind}"`), false, `${lang}/${kind}: the copy button is outside the details`);
       assert.ok(html.indexOf(`id="sttd-copy-${kind}"`) > html.indexOf(own) + own.length, `${lang}/${kind}: copy button follows its details`);
     }
-    assert.ok(html.indexOf('id="sttd-panel-3"') < html.indexOf('id="sttd-panel-4"') && html.indexOf('id="sttd-panel-4"') < html.indexOf('id="sttd-panel-5"'), `${lang}: step panels in order`);
+    assert.ok(html.indexOf('id="sttd-panel-3"') < html.indexOf('id="sttd-panel-4"') && html.indexOf('id="sttd-panel-4"') < html.indexOf('id="sttd-panel-5"') && html.indexOf('id="sttd-panel-5"') < html.indexOf('id="sttd-panel-6"'), `${lang}: step panels in order`);
   }
   assert.ok(consoleJa.includes('>テスト用の指示文を表示</summary>') && consoleEn.includes('>Show the operational instructions</summary>'));
-  // 各panelの先頭に可視見出し（wizard.step1〜5）があり、sectionのaria-labelledbyはそれを指す。旧3段階ガイドの番号は画面文言に残らない。
-  for (const n of [1, 2, 3, 4, 5]) assert.ok(consoleEn.includes(`<section id="sttd-panel-${n}" class="sttd-panel" aria-labelledby="sttd-panel-${n}-title"`) && consoleEn.includes(`<h2 id="sttd-panel-${n}-title" class="sttd-panel-title" data-sttd-i18n="wizard.step${n}">${MESSAGES.en[`wizard.step${n}`]}</h2>`), `panel ${n} heading`);
+  // 各panelの先頭に可視見出し（wizard.step1〜6）があり、sectionのaria-labelledbyはそれを指す。旧3段階ガイドの番号は画面文言に残らない。
+  for (const n of [1, 2, 3, 4, 5, 6]) assert.ok(consoleEn.includes(`<section id="sttd-panel-${n}" class="sttd-panel" aria-labelledby="sttd-panel-${n}-title"`) && consoleEn.includes(`<h2 id="sttd-panel-${n}-title" class="sttd-panel-title" data-sttd-i18n="wizard.step${n}">${MESSAGES.en[`wizard.step${n}`]}</h2>`), `panel ${n} heading`);
   assert.equal(/\((step|Step) [1-3]\)|（手順[1-3]）|>(Step|手順) ?[1-3][:：]/.test(consoleEn.replace(/<h2[^>]*>[^<]*<\/h2>|<button type="button" id="sttd-step-[1-5]-head"[^>]*>[^<]*<\/button>/g, '') + consoleJa.replace(/<h2[^>]*>[^<]*<\/h2>|<button type="button" id="sttd-step-[1-5]-head"[^>]*>[^<]*<\/button>/g, '')), false, 'no legacy sub-step numbers outside the wizard headings');
   assert.equal(/開発用|development send|テスト送信|test send/i.test(consoleEn + consoleJa), false, 'console is presented as the send screen');
   // 旧接続画面は無い: 辞書にconnect.*キーが無く、どの画面も/connectへリンクしない。interaction画面はOAuth専用script（/interaction/app.js）だけを読む。
