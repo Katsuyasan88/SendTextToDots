@@ -88,6 +88,11 @@ export interface ConsolePageOptions {
   readonly mcpOrigin?: string | undefined;
   /** ステップ1の方式選択（Apple/コード）部品のHTML（console/operator-config.tsのrenderOperatorSectionが作るescape済みの値）。 */
   readonly operatorSection?: string | undefined;
+  /**
+   * operator modeで方式選択が有効な時だけtrue。方式選択をステップ1の先頭に置き、Appleの案内・ログイン操作は選んだ方式に応じて
+   * 部品のscriptが表示を切り替える。通常の配信modeでは従来どおりApple操作の後に「設定されていません」だけを置く。
+   */
+  readonly operatorFirst?: boolean | undefined;
 }
 
 /**
@@ -170,13 +175,16 @@ ${stepHead(5, 'wizard.step5')}
 <p id="sttd-wizard-note" role="status"></p>
 <section id="sttd-panel-1" class="sttd-panel" aria-labelledby="sttd-panel-1-title" data-sttd-state="current" tabindex="0">
 <h2 id="sttd-panel-1-title" class="sttd-panel-title"${i18n('wizard.step1')}>${t('wizard.step1')}</h2>
+${options.operatorFirst === true ? (options.operatorSection ?? '') : ''}
+<div id="sttd-apple-panel">
 <p id="sttd-login-intro"${i18n('wizard.loginIntro')}>${t('wizard.loginIntro')}</p>
 <p id="sttd-account-text" role="status">${t('console.accountSignedOut')}</p>
 <div class="sttd-actions">
 <button type="button" id="sttd-login"${i18n('common.appleLogin')}>${t('common.appleLogin')}</button>
 <button type="button" id="sttd-switch" hidden${i18n('common.switchAccount')}>${t('common.switchAccount')}</button>
 </div>
-${options.operatorSection ?? ''}
+</div>
+${options.operatorFirst === true ? '' : (options.operatorSection ?? '')}
 </section>
 <section id="sttd-panel-2" class="sttd-panel" aria-labelledby="sttd-panel-2-title" data-sttd-state="locked" tabindex="0">
 <h2 id="sttd-panel-2-title" class="sttd-panel-title"${i18n('wizard.step2')}>${t('wizard.step2')}</h2>
@@ -279,6 +287,8 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-instructions-details summary { cursor: pointer; font-weight: 600; min-height: 44px; display: flex; align-items: center; }
 .sttd-instructions { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; background: #f5f6f8; border: 1px solid #d9dce1; border-radius: 6px; padding: 0.75rem; margin: 0; }
 .sttd-actions { display: flex; flex-wrap: wrap; }
+.sttd-method-choice button[aria-pressed="true"] { font-weight: 700; outline: 2px solid currentColor; outline-offset: 2px; }
+.sttd-method-choice button[aria-pressed="false"] { font-weight: 400; }
 .sttd-plugin-url { overflow-wrap: anywhere; background: #f5f6f8; border: 1px solid #d9dce1; border-radius: 4px; padding: 0.1rem 0.3rem; }
 #sttd-result, #sttd-disconnect-result, #sttd-wizard-note { font-weight: 600; min-height: 1.5em; overflow-wrap: anywhere; }
 .sttd-note { font-size: 0.85rem; color: #4a5059; }

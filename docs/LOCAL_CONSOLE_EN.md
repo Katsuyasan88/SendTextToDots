@@ -74,7 +74,7 @@ node dist/console/operator-server.js --config console.local.json --operator oper
 
 `operator.local.json` requires `signingServiceAccount`, the service account that signs custom tokens ([configuration](CONFIGURATION_EN.md)). The helper runs with Application Default Credentials, which need `iam.serviceAccounts.signBlob` on that service account.
 
-1. In step 1 choose "Connect with a code" (choosing does not issue a code). "Generate a code" shows a 6-digit code and the time left.
+1. At the top of step 1, under "Choose how to connect", choose "Code" (choosing does not issue a code). Only the chosen method's controls are shown: "Apple" shows the Apple guidance and "Sign in with Apple" only, and "Code" shows the code controls only. "Generate a code" shows a 6-digit code and the time left.
 2. Within 10 minutes, enter the code in the plugin connection screen after adding the plugin. A code works once. Then complete the normal consent and subscription.
 3. Press "Check connection" in the console to sign the console in to the same account. There is no automatic polling.
 4. "Generate a new code" ends the current code and its connection and creates a new one. If a new code cannot be secured, the current code and connection stay unchanged.

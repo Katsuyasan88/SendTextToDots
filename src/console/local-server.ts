@@ -286,7 +286,7 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
       const language = selectLanguage({ query, cookie: req.headers.cookie, acceptLanguage: req.headers['accept-language'] });
       const extra: Record<string, string> = path === CONSOLE_PATH && isLanguage(query) ? { 'Set-Cookie': languageCookie(language, false) } : {};
       const operatorSection = renderOperatorSection({ language, enabled: options.operator !== undefined, nonce, web });
-      const asset = consoleAsset(path, web, { language, nonce, secure: false, mcpOrigin: config.mcpOrigin, operatorSection })!;
+      const asset = consoleAsset(path, web, { language, nonce, secure: false, mcpOrigin: config.mcpOrigin, operatorSection, operatorFirst: options.operator !== undefined })!;
       log({ event: 'local.asset', route: path });
       return send(res, 200, asset.type, asset.body, { ...asset.headers, ...extra });
     }

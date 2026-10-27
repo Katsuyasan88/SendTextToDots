@@ -271,6 +271,12 @@ test('U1 step 1 method choice: off shows not-configured; on has explicit buttons
   for (const id of ['sttd-method-apple', 'sttd-method-code', 'sttd-code-issue', 'sttd-code-confirm', 'sttd-code-reissue']) assert.ok(on.includes(`id="${id}"`), id);
   assert.ok(on.includes(OPERATOR_TEXT.en.codeGuide));
   assert.ok(on.includes('id="sttd-code-panel" hidden'));
+  // 選択肢は認証の実行ボタンと別の文言。初期値は既存のApple方式で、選択中はaria-pressed
+  assert.ok(on.includes('id="sttd-method-apple" aria-pressed="true"'));
+  assert.ok(on.includes('id="sttd-method-code" aria-pressed="false"'));
+  assert.equal(OPERATOR_TEXT.ja.methodApple, 'Apple');
+  assert.equal(OPERATOR_TEXT.ja.methodCode, 'コード');
+  for (const lang of ['ja', 'en']) assert.ok(!/ログイン|Sign in|接続/.test(OPERATOR_TEXT[lang].methodApple + OPERATOR_TEXT[lang].methodCode), lang);
   assert.ok(!/[0-9]{6}<\/code>/.test(on));
   assert.ok(OPERATOR_TEXT.ja.switchNotice.includes('ステップ2'));
   assert.deepEqual(Object.keys(OPERATOR_TEXT.ja).sort(), Object.keys(OPERATOR_TEXT.en).sort());
@@ -297,6 +303,20 @@ test('U3 console page panel 1 includes the method section', () => {
   const html = renderConsolePage(WEB, { language: 'en', nonce: NONCE, secure: false, operatorSection: section });
   const panel1 = html.slice(html.indexOf('id="sttd-panel-1"'), html.indexOf('id="sttd-panel-2"'));
   assert.ok(panel1.includes('id="sttd-code-not-configured"'));
+  // 通常の配信modeは従来どおりApple操作が先（方式選択は無い）
+  assert.ok(panel1.indexOf('id="sttd-login"') < panel1.indexOf('id="sttd-code-not-configured"'));
+  assert.ok(!panel1.includes('id="sttd-method-apple"'));
+});
+
+test('U4 operator mode puts the method choice first in step 1; Apple guidance and sign-in are one group after it', () => {
+  const section = renderOperatorSection({ language: 'ja', enabled: true, nonce: NONCE, web: WEB });
+  const html = renderConsolePage(WEB, { language: 'ja', nonce: NONCE, secure: false, operatorSection: section, operatorFirst: true });
+  const panel1 = html.slice(html.indexOf('id="sttd-panel-1"'), html.indexOf('id="sttd-panel-2"'));
+  const at = (id) => panel1.indexOf(`id="${id}"`);
+  assert.ok(at('sttd-method') > 0 && at('sttd-method') < at('sttd-apple-panel'), 'method choice first');
+  assert.ok(at('sttd-apple-panel') < at('sttd-login-intro') && at('sttd-login-intro') < at('sttd-login'), 'Apple guidance and sign-in inside the Apple group');
+  assert.equal((panel1.match(/id="sttd-login"/g) ?? []).length, 1);
+  assert.equal((panel1.match(/id="sttd-method-apple"/g) ?? []).length, 1);
 });
 
 // ---------- B: 送信画面の本体controllerとoperator部品を同じ合成DOMで実行（既存fixture console-browser.mjs） ----------
@@ -320,6 +340,7 @@ async function runConsoleWithOperator({ onOperator, restoredCode = false } = {})
     nonce: NONCE,
     secure: false,
     operatorSection: renderOperatorSection({ language: 'en', enabled: true, nonce: NONCE, web: WEB }),
+    operatorFirst: true,
   }).body;
   const dom = domFromHtml(html);
   const base = syntheticSdk();
@@ -373,8 +394,15 @@ const activeJson = () => ({ status: 200, json: { state: 'active', customToken: '
 test('B1 issue unlocks only step 2 from the controller state; sending stays locked; no SDK or upstream call', async () => {
   const ui = await runConsoleWithOperator({ onOperator: async (action) => (action === 'issue' ? issuedJson() : { status: 200, json: { state: 'pending' } }) });
   assert.equal(ui.stepState(2), 'locked');
+  // 初期はApple方式: Appleの案内・ログインだけ、コード操作は非表示
+  assert.equal(ui.el('sttd-apple-panel').hidden, false);
+  assert.equal(ui.el('sttd-code-panel').hidden, true);
+  assert.equal(ui.el('sttd-method-apple').getAttribute('aria-pressed'), 'true');
   await ui.click('sttd-method-code');
   assert.equal(ui.el('sttd-code-panel').hidden, false);
+  assert.equal(ui.el('sttd-apple-panel').hidden, true, 'Apple sign-in is not shown in code mode');
+  assert.equal(ui.el('sttd-method-code').getAttribute('aria-pressed'), 'true');
+  assert.equal(ui.el('sttd-method-apple').getAttribute('aria-pressed'), 'false');
   await ui.click('sttd-code-issue');
   assert.equal(ui.el('sttd-code-value').textContent, '012345');
   assert.equal(ui.stepState(2), 'ready');
@@ -383,7 +411,7 @@ test('B1 issue unlocks only step 2 from the controller state; sending stays lock
   for (const n of [3, 4, 5]) assert.equal(ui.stepState(n), 'locked', `step ${n}`);
   assert.equal(ui.base.calls.loads, 0, 'no SDK before an explicit sign-in');
   assert.equal(ui.fetches.filter((f) => !f.url.startsWith('/v1/operator/')).length, 0, 'no upstream call');
-  assert.equal(ui.el('sttd-login').hidden, false, 'not shown as signed in');
+  assert.equal(ui.el('sttd-apple-panel').hidden, true, 'code mode shows only code operations');
 });
 
 test('B2 confirm success signs in with the custom token and advances the console without reload or Apple', async () => {
@@ -415,6 +443,9 @@ test('B3 switching method resets to step 1, locks later steps and closes the cod
   assert.ok(ui.base.calls.signOuts > signOuts);
   assert.equal(ui.el('sttd-switch-notice').hidden, false, 'reinstall guidance shown');
   assert.equal(ui.el('sttd-code-panel').hidden, true);
+  assert.equal(ui.el('sttd-apple-panel').hidden, false, 'Apple guidance and sign-in shown again');
+  assert.equal(ui.el('sttd-method-apple').getAttribute('aria-pressed'), 'true');
+  assert.equal(ui.el('sttd-method-code').getAttribute('aria-pressed'), 'false');
 });
 
 test('B4 late issue/confirm results after a method switch are discarded', async () => {

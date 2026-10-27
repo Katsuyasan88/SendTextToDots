@@ -1,7 +1,8 @@
 // ローカル送信画面の明示operator mode（開発者向け6桁コードの発行）の設定・画面部品・ブラウザscript。I/O・管理SDK 0。
 //   - 通常の配信mode（public client設定だけ）は変えない。operator modeは`node dist/console/operator-server.js`で明示的に起動した時だけ。
 //   - 設定は固定の配置値（project/database/namespace、identifierKeyのSecret Manager版名、custom tokenの署名SA）だけで、秘密の値・管理鍵JSONを持たない。
-//   - 画面: ステップ1で「Appleでログイン」「コードで接続」を選ぶ。選択だけでは発行しない。発行・接続確認・再発行・取消は本人の明示操作だけで、
+//   - 画面: ステップ1の先頭で方式「Apple」「コード」を選ぶ（認証の実行ボタンと区別した選択肢。選択中はaria-pressed）。Apple選択時はAppleの案内・
+//     ログインだけ、コード選択時はコード操作だけを表示する。選択だけでは発行しない。発行・接続確認・再発行・取消は本人の明示操作だけで、
 //     自動pollしない（残り時間の表示更新は端末内だけ）。送信はFirebaseのログイン・利用許可・同意・購読の確認まで封鎖のまま。
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -85,8 +86,8 @@ export interface OperatorRoutes {
 export const OPERATOR_TEXT = Object.freeze({
   en: Object.freeze({
     methodTitle: 'Choose how to connect',
-    methodApple: 'Sign in with Apple',
-    methodCode: 'Connect with a code',
+    methodApple: 'Apple',
+    methodCode: 'Code',
     notConfigured: 'Code issuance is not configured for this deployment.',
     codeGuide:
       'Enter the code in the plugin connection screen within 10 minutes. A code works once. After connecting, the number of texts you send is not limited.',
@@ -108,8 +109,8 @@ export const OPERATOR_TEXT = Object.freeze({
   }),
   ja: Object.freeze({
     methodTitle: '接続方法を選ぶ',
-    methodApple: 'Appleでログイン',
-    methodCode: 'コードで接続',
+    methodApple: 'Apple',
+    methodCode: 'コード',
     notConfigured: 'この配置ではコード発行が設定されていません。',
     codeGuide: '10分以内にプラグインの接続画面へ入力してください。使用は1回です。接続後の送信回数は制限しません。',
     issue: 'コードを発行',
@@ -154,8 +155,8 @@ export function renderOperatorSection(input: {
   }
   const data = ` data-sttd-operator-nonce="${escapeHtml(input.nonce)}" data-sttd-operator-language="${lang}" data-sttd-operator-firebase="${escapeHtml(JSON.stringify(input.web))}"`;
   return `<section id="sttd-method" aria-labelledby="sttd-method-title"${data}><h3 id="sttd-method-title">${t('methodTitle')}</h3>
-<div class="sttd-actions"><button type="button" id="sttd-method-apple">${t('methodApple')}</button>
-<button type="button" id="sttd-method-code">${t('methodCode')}</button></div>
+<div class="sttd-actions sttd-method-choice" role="group" aria-labelledby="sttd-method-title"><button type="button" id="sttd-method-apple" aria-pressed="true">${t('methodApple')}</button>
+<button type="button" id="sttd-method-code" aria-pressed="false">${t('methodCode')}</button></div>
 <p id="sttd-switch-notice" hidden>${t('switchNotice')}</p>
 <div id="sttd-code-panel" hidden>
 <p>${t('codeGuide')}</p>
@@ -192,6 +193,14 @@ let pending = false;
 
 function say(text) { el('sttd-code-message').textContent = text; }
 function show(id, visible) { const node = el(id); if (node) node.hidden = !visible; }
+// 選んだ方式だけを表示する（未選択は既存のApple方式）。Appleの案内・ログインと、コード操作は同時に出さない。
+function reflect(m) {
+  const mode = m === 'code' ? 'code' : 'apple';
+  el('sttd-method-apple').setAttribute('aria-pressed', String(mode === 'apple'));
+  el('sttd-method-code').setAttribute('aria-pressed', String(mode === 'code'));
+  show('sttd-apple-panel', mode === 'apple');
+  show('sttd-code-panel', mode === 'code');
+}
 function current(at) { return chosen === 'code' && at === epoch; }
 
 async function call(action) {
@@ -312,7 +321,7 @@ async function choose(next) {
   if (before !== null && before !== next) show('sttd-switch-notice', true);
   hideCode();
   say('');
-  show('sttd-code-panel', next === 'code');
+  reflect(next);
   if (next === 'code') controls();
 }
 
@@ -321,8 +330,9 @@ if (root && bridge) {
     if (state.epoch !== epoch && chosen === 'code') hideCode();
     epoch = state.epoch;
     chosen = state.method;
-    show('sttd-code-panel', chosen === 'code');
+    reflect(chosen);
   });
+  reflect(chosen);
   el('sttd-method-apple').onclick = () => choose('apple');
   el('sttd-method-code').onclick = () => choose('code');
   el('sttd-code-issue').onclick = () => issue('issue');
