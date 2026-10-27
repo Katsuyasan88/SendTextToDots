@@ -10,6 +10,7 @@ import { isDevelopmentPublicOrigin } from '../http/origin.js';
 import { KMS_REGION_PATTERN } from '../protection/kms-sealing.js';
 import { arrayItems, dataFields } from '../protection/google-sdk-call.js';
 import { createKmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
+import { isEncryptionNamespace, PAYLOAD_ENCRYPTION_MODE } from '../encryption/contract.js';
 import { DEPLOYMENT_CONFIG } from './deployment.js';
 
 /** src/deployment/functions.tsのexport名（ESMの静的名）。設定のapi.functionName・api.serviceNameはこれと一致しなければならない。 */
@@ -110,6 +111,50 @@ export interface DeploymentConfig {
     readonly authDomain: string;
     readonly apiKeyEnv: string;
   };
+  /** 本文暗号化（欠落は'off'）。有効時だけ専用secretの固定数値版を持つ。 */
+  readonly payloadEncryption: 'off' | PayloadEncryptionConfig;
+}
+
+export interface PayloadEncryptionConfig {
+  readonly mode: typeof PAYLOAD_ENCRYPTION_MODE;
+  /** `t280_<lower-case UUID>`。 */
+  readonly namespace: string;
+  /** 専用secret `projects/<projectNumber>/secrets/<id>`（版を含まない。既存4用途と別のid）。 */
+  readonly secret: string;
+  readonly writeSecretVersion: number;
+  /** 開封に使える数値版（writeSecretVersionを含む重複なし1〜3件）。 */
+  readonly readSecretVersions: readonly number[];
+}
+
+const PAYLOAD_ENCRYPTION_KEYS = ['mode', 'namespace', 'secret', 'writeSecretVersion', 'readSecretVersions'] as const;
+const MAX_READ_SECRET_VERSIONS = 3;
+
+function isSecretVersionNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
+}
+
+/** 'off'または有効時のexact object。専用secretは同じprojectNumberで既存4用途のsecret idと別。 */
+function parsePayloadEncryption(value: unknown, projectNumber: string, existingSecretIds: ReadonlySet<string>): 'off' | PayloadEncryptionConfig {
+  if (value === 'off') return 'off';
+  const fields = dataFields(value, PAYLOAD_ENCRYPTION_KEYS);
+  requireThat(fields.get('mode') === PAYLOAD_ENCRYPTION_MODE && isEncryptionNamespace(fields.get('namespace')));
+  const secret = str(fields, 'secret');
+  const parts = secret.split('/');
+  requireThat(secret.length <= 512 && parts.length === 4);
+  const [p, project, s, secretId] = parts as [string, string, string, string];
+  requireThat(p === 'projects' && project === projectNumber && s === 'secrets' && SECRET_ID.test(secretId) && !existingSecretIds.has(secretId));
+  const writeSecretVersion = fields.get('writeSecretVersion');
+  const readSecretVersions = arrayItems(fields.get('readSecretVersions'));
+  requireThat(isSecretVersionNumber(writeSecretVersion) && readSecretVersions.length >= 1 && readSecretVersions.length <= MAX_READ_SECRET_VERSIONS);
+  requireThat(readSecretVersions.every(isSecretVersionNumber) && new Set(readSecretVersions).size === readSecretVersions.length);
+  requireThat(readSecretVersions.includes(writeSecretVersion));
+  return {
+    mode: PAYLOAD_ENCRYPTION_MODE,
+    namespace: fields.get('namespace') as string,
+    secret,
+    writeSecretVersion: writeSecretVersion as number,
+    readSecretVersions: [...(readSecretVersions as number[])],
+  };
 }
 
 const invalid = (): DeploymentConfigError => new DeploymentConfigError('deployment_config_invalid');
@@ -172,7 +217,7 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
   let top: Map<string, unknown>;
   try {
     // accessPolicyは配布placeholder（未設定）の判定を先に保つため存在だけ任意で読み、設定済みの時は下で必須にする。
-    top = dataFields(raw, TOP_KEYS, ['accessPolicy', 'developerLogin']);
+    top = dataFields(raw, TOP_KEYS, ['accessPolicy', 'developerLogin', 'payloadEncryption']);
   } catch {
     throw invalid();
   }
@@ -252,6 +297,8 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
     const web = { projectId: str(webFields, 'projectId'), authDomain: str(webFields, 'authDomain'), apiKeyEnv: str(webFields, 'apiKeyEnv') };
     requireThat(web.projectId === projectId && isDnsHost(web.authDomain) && isApiKeyEnvName(web.apiKeyEnv));
 
+    const payloadEncryption = parsePayloadEncryption(top.has('payloadEncryption') ? top.get('payloadEncryption') : 'off', projectNumber, ids);
+
     return deepFreeze({
       accessPolicy: ACCESS_POLICY,
       developerLogin: developerLogin as 'off' | typeof DEVELOPER_LOGIN_MODE,
@@ -274,6 +321,7 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
       },
       secretVersions: secretVersions as unknown as DeploymentConfig['secretVersions'],
       web,
+      payloadEncryption,
     });
   } catch {
     throw invalid();

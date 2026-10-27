@@ -70,6 +70,17 @@ Callback verification, delivery and CIMD retrieval share the same egress compone
 
 See the English [security policy and reporting channel status](../SECURITY.md). Report vulnerabilities through the GitHub private reporting channel described there. Do not put vulnerability details, secrets, real data or tokens in public issues. If the reporting button is unavailable, ask only for a private security contact without disclosing the issue.
 
+## Key storage for payload encryption (in development)
+
+The current version contains only the foundation for storing and protecting keys; there is no entry yet for fetching the public key, sending encrypted text or reissuing keys ([configuration](CONFIGURATION_EN.md#payload-encryption)).
+
+- Each authenticated Firebase user unit (UID) has its own RSA 3072 key: multiple devices of the same UID share it, and the UID of a new code connection gets a separate key. A key is created only for a user explicitly registered by the operator who already has a connection (owner). Fetching a key never creates an owner or an access permission.
+- Only the private key encrypted with AES-256-GCM under a dedicated protection key (a fixed numeric version of a dedicated Secret Manager secret) is stored in Firestore. The deployment, user, key ID, public key and protection key version are included as authenticated data, so a stored record copied to another user, environment or version cannot be opened. The raw private key, the protection key and the UID are never stored or returned.
+- The protection key is read only when encryption processing needs it, and working values are zero-filled at the end of the request (complete erasure from JavaScript strings or OS internals is not guaranteed). When the protection key cannot be read, key creation and opening are refused, and existing keys are not regenerated or overwritten.
+- A key is not used after access is disabled, the connection is revoked, 90 days of inactivity, or 90 days without key use. Re-registration does not automatically revive an old key.
+- Initialization attempts are limited per user to 3 per minute and 10 per UTC day.
+- Read permission for the protection key and collection of existing data are not yet part of the deployment procedure.
+
 ## Developer 6-digit code
 
 - Codes are cryptographically random 000000–999999 and authenticate once, within 10 minutes of issue. After use or cancellation the same number is not issued for at least 24 hours from issue (longer while deletion is delayed). Plain codes are never stored in the database or logs; reservations are identified by an HMAC under a key derived, per purpose, from the deployment secret (identifierKey).

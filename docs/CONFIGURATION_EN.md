@@ -44,6 +44,7 @@ The Functions entry validates at import (discovery) time; the MCP entry and each
 | `web.projectId` | The same as `projectId` |
 | `web.authDomain` | The authDomain of the Firebase Web configuration (a DNS host) |
 | `web.apiKeyEnv` | The name of the environment variable from which the MCP process reads the Firebase Web API key value (upper-case letters, digits and `_`). Existing namespaces such as `GOOGLE_`, `FIREBASE_`, `NODE_`, `K_` and `PORT` are not allowed |
+| `payloadEncryption` (optional) | Omitted or `'off'` (default). For the enabled form, see [Key storage for payload encryption](#payload-encryption) below |
 
 A UUID can be generated with, for example, `node -e "console.log(crypto.randomUUID())"` (randomUUID in Node 22 is version 4).
 
@@ -93,6 +94,23 @@ Only the metadata credentials of the runtime SA attached to the service are used
 `invoker: private` is the allowed value in the source. The Cloud-side public reachability that lets browsers and Dots reach the service is configured separately; changing invoker to public in the configuration file does not solve it. The application's Firebase ID token / OAuth authentication is always required.
 
 Do not commit real configuration values or secrets to public Git; keep them in an environment the installer controls. Passing tests does not verify the correctness of real deployment values, IAM, secret registration or URL reachability.
+
+<a id="payload-encryption"></a>
+## Key storage for payload encryption (off by default, in development)
+
+The current version implements only the foundation that stores and protects a key per user. There is no HTTP entry yet for fetching the public key, sending encrypted text or reissuing the key, so enabling it changes nothing visible to users. When omitted or `'off'`, no new secret is needed and no secret is read and no key is created.
+
+The enabled form (all items required, no extra keys):
+
+| Item | Content |
+| --- | --- |
+| `mode` | Only `jwe-rsa-oaep-256-a256gcm-v1` |
+| `namespace` | `t280_<lower-case UUID>`. Stored under `sttdEncryption/<namespace>` in the same Firestore database |
+| `secret` | `projects/<projectNumber>/secrets/<id>` (without a version). A dedicated secret, different from the four existing purposes in `secretVersions` |
+| `writeSecretVersion` | The positive integer version used when protecting a key |
+| `readSecretVersions` | Versions allowed for opening. 1 to 3 without duplicates, including `writeSecretVersion` |
+
+The value of the dedicated secret is 32 random bytes encoded as unpadded base64url (43 characters). Never write the value in the configuration file. Versions are fixed numbers; `latest` and aliases are not used. To rotate the protection key, create a new version, list the old and new versions in `readSecretVersions`, and set `writeSecretVersion` to the new one. A key protected with the old version is protected again with the new version, keeping the same key, the next time that user uses it. While an unused key still depends on the old version, do not remove the old version from read or destroy it (if the old version cannot be read, that user's key is temporarily unavailable).
 
 ## Developer 6-digit code (off by default)
 

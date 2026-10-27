@@ -44,6 +44,7 @@ Functions entryはimport時（discovery時）に、MCP entryと各起動口はen
 | `web.projectId` | `projectId` と同じ |
 | `web.authDomain` | Firebase Web設定のauthDomain（DNS host） |
 | `web.apiKeyEnv` | MCP processでFirebase Web API keyの値を読む環境変数名（英大文字・数字・`_`）。`GOOGLE_`・`FIREBASE_`・`NODE_`・`K_` 等の既存の名前空間と `PORT` は不可 |
+| `payloadEncryption`（任意） | 省略または`'off'`（既定）。有効化の形は下の[本文暗号化の鍵保存](#payload-encryption)を参照 |
 
 UUIDは例えば `node -e "console.log(crypto.randomUUID())"` で作れます（Node 22のrandomUUIDはversion 4）。
 
@@ -93,6 +94,23 @@ serviceへattachしたruntime SAのmetadata資格だけを使います。ロー�
 `invoker: private`はsourceの許可値です。browser/Dotsがserviceへ到達するためのCloud側の公開到達設定は別に必要で、設定fileのinvokerをpublicへ変更して解決しません。アプリのFirebase ID token/OAuth認証は常に必須です。
 
 実際の設定値や秘密を公開Gitへcommitせず、導入者が管理する環境で保管してください。試験が合格しても実配置値の正しさ・IAM・秘密の登録・URL到達を検証したことにはなりません。
+
+<a id="payload-encryption"></a>
+## 本文暗号化の鍵保存（既定off、開発中）
+
+現在の版で実装済みなのは、利用者ごとの鍵を保存・保護する基盤だけです。公開鍵の取得・暗号文の送信・鍵の再発行のHTTP入口はまだなく、有効にしても利用者から見える動作は変わりません。省略・`'off'`では新しい秘密は不要で、Secret読取り・鍵作成は行いません。
+
+有効にする場合の形（全項目必須・余分なkeyは不可）:
+
+| 項目 | 内容 |
+| --- | --- |
+| `mode` | `jwe-rsa-oaep-256-a256gcm-v1` だけ |
+| `namespace` | `t280_<小文字UUID>`。同じFirestore database内の `sttdEncryption/<namespace>` に保存します |
+| `secret` | `projects/<projectNumber>/secrets/<id>`（版を含まない）。`secretVersions`の既存4用途とは別の専用secret |
+| `writeSecretVersion` | 新しく保護するときに使う正の整数の版 |
+| `readSecretVersions` | 開封に使える版。重複なし1〜3件で、`writeSecretVersion`を含む |
+
+専用secretの値は32byteのランダム値をpaddingなしのbase64url（43文字）にしたものです。値を設定ファイルへ書かないでください。版は数値で固定し、`latest`・aliasは使いません。保護鍵の更新は、新しい版を作り`readSecretVersions`に旧版と新版を並べて`writeSecretVersion`を新版にします。旧版で保護された鍵は、その利用者の次の利用時に同じ鍵のまま新版で保護し直されます。利用されていない鍵が旧版に依存している間は、旧版をreadから外したり破棄したりしないでください（旧版が読めないと、その利用者の鍵は一時的に利用できません）。
 
 ## 開発者向け6桁コード（既定off）
 
