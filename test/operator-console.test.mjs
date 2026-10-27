@@ -11,7 +11,7 @@ import { randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import { test } from 'node:test';
 
-import { OPERATOR_TEXT, operatorScript, parseOperatorConfig, renderOperatorSection } from '../dist/console/operator-config.js';
+import { OPERATOR_TEXT, operatorScript, parseOperatorConfig, renderOperatorCodePanel, renderOperatorSection } from '../dist/console/operator-config.js';
 import { createOperatorRoutes, parseOperatorArgs, startOperatorConsole } from '../dist/console/operator-server.js';
 import { CODE_TEXT, INTERACTION_SCRIPT, renderInteractionLogin } from '../dist/connect/pages.js';
 import { renderConsolePage } from '../dist/connect/console.js';
@@ -268,10 +268,15 @@ test('U1 step 1 method choice: off shows not-configured; on has explicit buttons
   assert.ok(off.includes(OPERATOR_TEXT.ja.notConfigured));
   assert.ok(!off.includes('sttd-method-continue'));
   const on = renderOperatorSection({ language: 'en', enabled: true, nonce: NONCE, web: WEB });
-  for (const id of ['sttd-method-apple', 'sttd-method-code', 'sttd-method-continue', 'sttd-code-confirm', 'sttd-code-reissue']) assert.ok(on.includes(`id="${id}"`), id);
+  for (const id of ['sttd-method-apple', 'sttd-method-code', 'sttd-method-continue']) assert.ok(on.includes(`id="${id}"`), id);
+  // コード操作は手順2の部品（operator modeでないときは空）
+  const codePanel = renderOperatorCodePanel({ language: 'en', enabled: true });
+  assert.equal(renderOperatorCodePanel({ language: 'en', enabled: false }), '');
+  for (const id of ['sttd-code-confirm', 'sttd-code-reissue', 'sttd-code-cancel', 'sttd-code-display', 'sttd-code-guide']) assert.ok(codePanel.includes(`id="${id}"`), id);
+  assert.ok(!on.includes('id="sttd-code-panel"'), 'code operations are not in step 1');
   assert.ok(!on.includes('id="sttd-code-issue"'), 'issuing starts from the single Continue button');
-  assert.ok(on.includes(OPERATOR_TEXT.en.codeGuide));
-  assert.ok(on.includes('id="sttd-code-panel" hidden'));
+  assert.ok(codePanel.includes(OPERATOR_TEXT.en.codeGuide));
+  assert.ok(codePanel.includes('id="sttd-code-panel" hidden'));
   // native radio（fieldset/legend/label、初期値は既存のApple方式）と共通の「続ける」1つ。別のApple実行ボタンは置かない
   assert.ok(/<fieldset class="sttd-method-choice"><legend>/.test(on));
   assert.ok(/<label class="sttd-radio"><input type="radio" name="sttd-method" id="sttd-method-apple" value="apple" checked>/.test(on));
@@ -346,6 +351,7 @@ async function runConsoleWithOperator({ onOperator, restoredCode = false } = {})
     secure: false,
     operatorSection: renderOperatorSection({ language: 'en', enabled: true, nonce: NONCE, web: WEB }),
     operatorFirst: true,
+    operatorCodePanel: renderOperatorCodePanel({ language: 'en', enabled: true }),
   }).body;
   const dom = domFromHtml(html);
   const base = syntheticSdk();
@@ -419,9 +425,13 @@ test('B1 issue unlocks only step 2 from the controller state; sending stays lock
   await ui.click('sttd-method-continue');
   assert.equal(ui.el('sttd-code-value').textContent, '012345');
   assert.equal(ui.el('sttd-code-guide').hidden, false, 'input guide shown after a successful issue');
-  assert.equal(ui.stepState(2), 'ready');
-  await ui.click('sttd-panel-2');
+  // 発行成功だけで、controllerの正規状態から手順2へ進み、追加方法を開く。コード未認証の間は通常の接続確認を出さない
   assert.equal(ui.stepState(2), 'current');
+  assert.equal(ui.el('sttd-plugin-guide').open, true, 'plugin guide expanded');
+  assert.equal(ui.el('sttd-refresh').hidden, true, 'normal connection check hidden before the code sign-in');
+  assert.equal(ui.el('sttd-code-confirm').hidden, false);
+  assert.ok(ui.el('sttd-plugin-step-3').textContent.includes('Connect with a code'), 'plugin guide matches the code method');
+  assert.ok(!ui.el('sttd-plugin-step-3').textContent.includes('same Apple account'));
   for (const n of [3, 4, 5]) assert.equal(ui.stepState(n), 'locked', `step ${n}`);
   assert.equal(ui.base.calls.loads, 0, 'no SDK before an explicit sign-in');
   assert.equal(ui.fetches.filter((f) => !f.url.startsWith('/v1/operator/')).length, 0, 'no upstream call');
@@ -474,10 +484,29 @@ test('B7 the code input guide appears only after a successful issue; hidden on f
   assert.equal(ui.el('sttd-code-guide').hidden, false);
   await ui.click('sttd-code-cancel');
   assert.equal(ui.el('sttd-code-guide').hidden, true, 'hidden after cancel');
+  await ui.click('sttd-panel-1');
   await ui.click('sttd-method-continue');
   assert.equal(ui.el('sttd-code-guide').hidden, false);
+  await ui.click('sttd-panel-1');
   await ui.click('sttd-method-apple');
   assert.equal(ui.el('sttd-code-guide').hidden, true, 'hidden after a method switch');
+});
+
+test('B8 after the code sign-in step 2 uses the normal connection check only; switching after an Apple sign-in shows the reinstall notice', async () => {
+  const ui = await runConsoleWithOperator({ onOperator: async (action) => (action === 'issue' ? issuedJson() : activeJson()) });
+  await ui.click('sttd-method-code');
+  await ui.click('sttd-method-continue');
+  await ui.click('sttd-code-confirm');
+  assert.equal(ui.el('sttd-refresh').hidden, false, 'normal connection check after the code sign-in');
+  assert.equal(ui.el('sttd-code-confirm').hidden, true, 'no second (code) check');
+  assert.equal(ui.el('sttd-code-reissue').hidden, true);
+  const apple = await runConsoleWithOperator({ onOperator: async () => issuedJson() });
+  await apple.click('sttd-method-continue');
+  assert.equal(apple.base.calls.popups, 1);
+  assert.ok(apple.el('sttd-plugin-step-3').textContent.includes('same Apple account'), 'Apple method keeps the Apple guide');
+  await apple.click('sttd-panel-1');
+  await apple.click('sttd-method-code');
+  assert.equal(apple.el('sttd-switch-notice').hidden, false, 'reinstall notice after an Apple sign-in');
 });
 
 test('B6 Apple with Continue starts the existing Apple sign-in; selecting alone loads nothing', async () => {
@@ -521,6 +550,7 @@ test('B4 late issue/confirm results after a method switch are discarded', async 
   statusHold = gate();
   ui.el('sttd-code-confirm').click();
   await settle();
+  await ui.click('sttd-panel-1');
   await ui.click('sttd-method-apple');
   statusHold.release();
   await settle();
@@ -538,6 +568,7 @@ test('B5 a slow custom-token SDK result after switching is signed out; a restore
   ui.el('sttd-code-confirm').click();
   await settle();
   await settle();
+  await ui.click('sttd-panel-1');
   await ui.click('sttd-method-apple');
   ui.custom.hold.release();
   await settle();

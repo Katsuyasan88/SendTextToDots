@@ -168,17 +168,28 @@ export function renderOperatorSection(input: {
 <p id="sttd-method-desc-apple" class="sttd-note">${t('descApple')}</p>
 <p id="sttd-method-desc-code" class="sttd-note" hidden>${t('descCode')}</p>
 <div class="sttd-actions"><button type="button" id="sttd-method-continue">${t('continue')}</button></div>
+<p id="sttd-method-message" role="status"></p>
 <p id="sttd-switch-notice" hidden>${t('switchNotice')}</p>
-<div id="sttd-code-panel" hidden>
-<p id="sttd-code-guide" hidden>${t('codeGuide')}</p>
-<div class="sttd-actions"><button type="button" id="sttd-code-reissue" hidden>${t('reissue')}</button>
-<button type="button" id="sttd-code-confirm" hidden>${t('confirm')}</button>
-<button type="button" id="sttd-code-cancel" hidden>${t('cancel')}</button></div>
-<p id="sttd-code-display" hidden>${t('codeLabel')}: <code id="sttd-code-value"></code> <span>${t('remaining')}: <span id="sttd-code-remaining"></span></span></p>
-<p id="sttd-code-message" role="status"></p>
-</div>
 </section>
 <script type="module" src="${OPERATOR_SCRIPT_PATH}"></script>`;
+}
+
+/**
+ * 手順2に置くコード操作（発行に成功したコード・残り時間・入力案内・再発行・コードの接続確認・取消・結果）。operator modeでないときは空。
+ * 発行は手順1の方式「コード」＋「続ける」だけで始まり、成功した時だけ本体controllerが手順2へ進める。
+ */
+export function renderOperatorCodePanel(input: { readonly language?: Language | undefined; readonly enabled: boolean }): string {
+  if (!input.enabled) return '';
+  const lang = isLanguage(input.language) ? input.language : DEFAULT_LANGUAGE;
+  const t = (key: OperatorTextKey) => escapeHtml(OPERATOR_TEXT[lang][key]);
+  return `<div id="sttd-code-panel" hidden>
+<p id="sttd-code-display" hidden>${t('codeLabel')}: <code id="sttd-code-value"></code> <span>${t('remaining')}: <span id="sttd-code-remaining"></span></span></p>
+<p id="sttd-code-guide" hidden>${t('codeGuide')}</p>
+<div class="sttd-actions"><button type="button" id="sttd-code-confirm" hidden>${t('confirm')}</button>
+<button type="button" id="sttd-code-reissue" hidden>${t('reissue')}</button>
+<button type="button" id="sttd-code-cancel" hidden>${t('cancel')}</button></div>
+<p id="sttd-code-message" role="status"></p>
+</div>`;
 }
 
 /**
@@ -216,7 +227,9 @@ function reflect(m) {
   show('sttd-code-panel', selected === 'code');
 }
 // 認証済み・発行済み等の進捗がある時だけ、方式切替で旧pluginの削除/再追加を案内する（初期・空の切替では出さない）。
-function hasProgress() { return issuedOnce || (last !== null && (last.signedIn || last.codeIssued)); }
+function hasProgress() { return (typeof bridge.progressed === 'function' && bridge.progressed() === true) || issuedOnce || (last !== null && (last.signedIn || last.codeIssued)); }
+// 発行の失敗は手順1（続ける の近く）にも出す。コードの結果・接続確認は手順2のコード操作に出す
+function sayIssue(text) { el('sttd-method-message').textContent = text; say(text); }
 function current(at) { return chosen === 'code' && at === epoch; }
 
 async function call(action) {
@@ -244,9 +257,11 @@ function hideCode() {
 }
 
 function controls() {
-  show('sttd-code-reissue', issuedOnce);
-  show('sttd-code-confirm', issuedOnce);
-  show('sttd-code-cancel', issuedOnce);
+  // コードで認証済みになった後は、手順2の通常の接続確認だけを使う（コードの確認/再発行/取消は出さない）
+  const signed = chosen === 'code' && last !== null && last.signedIn === true;
+  show('sttd-code-reissue', issuedOnce && !signed);
+  show('sttd-code-confirm', issuedOnce && !signed);
+  show('sttd-code-cancel', issuedOnce && !signed);
 }
 
 function tick() {
@@ -263,6 +278,7 @@ function showCode(code, authExpiresAt, at) {
   controls();
   show('sttd-code-display', true);
   show('sttd-code-guide', true);
+  el('sttd-method-message').textContent = '';
   stopTimer();
   timer = setInterval(tick, 1000);
   tick();
@@ -284,9 +300,9 @@ async function issue(action) {
       issuedOnce = true;
       controls();
     }
-    say(T('issueFailed') + ' ' + T('unchanged'));
+    sayIssue(T('issueFailed') + ' ' + T('unchanged'));
   } catch {
-    if (current(at)) say(T('issueFailed') + ' ' + T('unchanged'));
+    if (current(at)) sayIssue(T('issueFailed') + ' ' + T('unchanged'));
   } finally {
     pending = false;
   }
@@ -342,6 +358,7 @@ async function choose(next) {
     hideCode();
     issuedOnce = false;
     say('');
+    el('sttd-method-message').textContent = '';
   }
   reflect(next);
   if (next === 'code') controls();
@@ -363,6 +380,7 @@ if (root && bridge) {
     chosen = state.method;
     last = state;
     if (chosen !== null) reflect(chosen);
+    if (chosen === 'code') controls();
   });
   reflect(chosen);
   // radioの選択（click/keyboard）は表示と方式の切替だけで、認証・発行・通信はしない

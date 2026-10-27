@@ -13,7 +13,7 @@
 //   - 有限: 上流の期限（route別）、応答本文の上限、browser切断/中止の上流への伝播。正常終了のcloseを中止と誤認しない。token・本文・秘密を保存/記録しない。
 //   - CLI: node dist/console/local-server.js --config <public-client-config.json> [--port 8765]。設定の読取りはconfig.ts。本番配置設定は読まない。
 
-import { OPERATOR_PATH_PREFIX, OPERATOR_SCRIPT_PATH, renderOperatorSection, type OperatorRoutes } from './operator-config.js';
+import { OPERATOR_PATH_PREFIX, OPERATOR_SCRIPT_PATH, renderOperatorCodePanel, renderOperatorSection, type OperatorRoutes } from './operator-config.js';
 import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { realpathSync } from 'node:fs';
@@ -286,7 +286,8 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
       const language = selectLanguage({ query, cookie: req.headers.cookie, acceptLanguage: req.headers['accept-language'] });
       const extra: Record<string, string> = path === CONSOLE_PATH && isLanguage(query) ? { 'Set-Cookie': languageCookie(language, false) } : {};
       const operatorSection = renderOperatorSection({ language, enabled: options.operator !== undefined, nonce, web });
-      const asset = consoleAsset(path, web, { language, nonce, secure: false, mcpOrigin: config.mcpOrigin, operatorSection, operatorFirst: options.operator !== undefined })!;
+      const operatorCodePanel = renderOperatorCodePanel({ language, enabled: options.operator !== undefined });
+  const asset = consoleAsset(path, web, { language, nonce, secure: false, mcpOrigin: config.mcpOrigin, operatorSection, operatorFirst: options.operator !== undefined, operatorCodePanel })!;
       log({ event: 'local.asset', route: path });
       return send(res, 200, asset.type, asset.body, { ...asset.headers, ...extra });
     }

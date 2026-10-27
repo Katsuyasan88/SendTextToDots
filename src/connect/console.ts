@@ -93,6 +93,8 @@ export interface ConsolePageOptions {
    * 部品のscriptが表示を切り替える。通常の配信modeでは従来どおりApple操作の後に「設定されていません」だけを置く。
    */
   readonly operatorFirst?: boolean | undefined;
+  /** operator modeのコード操作（6桁・残り時間・案内・再発行・接続確認・取消・結果）。手順2の追加方法の後に置く（escape済みの値）。 */
+  readonly operatorCodePanel?: string | undefined;
 }
 
 /**
@@ -202,6 +204,7 @@ ${
 <li><a id="sttd-plugin-doc-custom" href="${PLUGIN_GUIDE_LINKS.customMcp}" target="_blank" rel="noopener noreferrer"${i18n('plugin.docCustom')}>${t('plugin.docCustom')}</a></li>
 </ul>
 </details>
+${options.operatorCodePanel ?? ''}
 <p id="sttd-state-text" role="status"></p>
 <p id="sttd-state-guide"></p>
 <div class="sttd-actions">
@@ -481,6 +484,9 @@ function render() {
   el('sttd-state-text').textContent = checking ? T('wizard.checking') : connection === null ? T(connectionKey) : T(connection === 'subscribed' ? 'console.state.subscribed' : 'common.state.' + connection);
   el('sttd-state-guide').textContent = checking ? '' : T(guideKey);
   el('sttd-refresh').disabled = inactive(2) || !available(2) || busy() || inFlight() || confirming;
+  // コード方式で未認証の間は、コードの接続確認だけ（通常の接続確認は認証後に出す）。追加方法の認証説明も選んだ方式に合わせる
+  el('sttd-refresh').hidden = method === 'code' && !signedIn;
+  el('sttd-plugin-step-3').textContent = T(method === 'code' ? 'plugin.step3Code' : 'plugin.step3');
   el('sttd-disconnect').hidden = !signedIn || confirming || connection === null || connection === 'unlinked';
   el('sttd-disconnect').disabled = inactive(2) || busy() || inFlight();
   el('sttd-disconnect-confirm').hidden = !confirming;
@@ -1098,7 +1104,8 @@ async function chooseMethod(next) {
   }
   // 送信中だけは切り替えない（ログイン・確認の途中は世代を進めて古い結果を捨てる）。
   if (inFlight()) return false;
-  const hadProgress = method !== null && (done[1] || codeIssued);
+  // 未選択（null）は既存のApple方式。Apple認証後の切替でも進捗ありとして再追加の案内を出す
+  const hadProgress = done[1] || codeIssued || signedIn;
   method = next;
   codeEpoch += 1;
   codeIssued = false;
@@ -1129,8 +1136,15 @@ async function chooseMethod(next) {
 function codeIssuedFor(epoch) {
   if (method !== 'code' || epoch !== codeEpoch) return false;
   codeIssued = true;
+  // 発行に成功したこの世代だけ、手順2（プラグイン追加とコードの接続確認）へ進め、追加方法を開く
+  if (step === 1) step = 2;
+  const guide = el('sttd-plugin-guide');
+  if (guide) guide.open = true;
   render();
   codeState();
+  const panel = el('sttd-panel-2');
+  if (panel && typeof panel.scrollIntoView === 'function') panel.scrollIntoView({ block: 'start' });
+  if (panel && typeof panel.focus === 'function') panel.focus();
   return true;
 }
 
@@ -1194,6 +1208,8 @@ globalThis.sttdConsoleCode = Object.freeze({
   chooseMethod: (next) => chooseMethod(next),
   // 方式「Apple」で共通の「続ける」を押した時だけ、既存のAppleログインを始める（選択・初期表示では通信しない）。
   appleLogin: () => login(false),
+  // 認証済み・発行済み等の進捗の有無（方式切替時の旧plugin再追加の案内に使う）
+  progressed: () => done[1] || codeIssued || signedIn,
   issued: (epoch) => codeIssuedFor(epoch),
   signIn: (epoch, customToken) => codeSignIn(epoch, customToken),
   subscribe(listener) {
