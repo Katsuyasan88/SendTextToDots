@@ -4,7 +4,7 @@ English | [日本語](DOTS_GUIDE.md)
 
 This guide is for users of a self-hosted SendTextToDots installation. It provides test and operational instructions that also work for a first installation or a fork.
 
-First follow the [installation guide](INSTALL_EN.md) to sign in with Apple, connect from Dots/ChatGPT through OAuth, and subscribe to `text.submitted`. Confirm that step 2 of the [local send screen](LOCAL_CONSOLE_EN.md) shows "Receiving". Paste the following instructions directly into the conversation with the Dots that receives your text. You can copy them from steps 3 and 5 of the send screen or use the text below.
+First follow the [installation guide](INSTALL_EN.md) to sign in with Apple, connect from Dots/ChatGPT through OAuth, and subscribe to `text.submitted`. Confirm the connection in step 2 of the [local send screen](LOCAL_CONSOLE_EN.md) (receiving is started by the instructions in step 3 and checked in step 4). Paste the following instructions directly into the conversation with the Dots that receives your text. You can copy them from steps 3 and 6 of the send screen or use the text below.
 
 ## 1. Paste the test instructions into Dots before sending
 
@@ -24,7 +24,7 @@ After that, until we switch to the operational instructions, handle text receive
 
 ## 2. Send a message and check it in Dots
 
-Enter a short, non-sensitive message into the text field on the same send screen and send it once. Check that the reply from the same Dots matches the text you sent. The send screen's `delivered` (accepted) state means that the callback accepted the event with 2xx; it does not prove a Dots reply, an exact text match, or completion of work.
+In step 5 of the same send screen, send the fixed test message once. Check that the reply from the same Dots matches the fixed message. The send screen's `delivered` (accepted) state means that the callback accepted the event with 2xx; it does not prove a Dots reply, an exact text match, or completion of work.
 
 Copying the instructions does not send them to Dots. Dots is not guaranteed to follow the instructions or reproduce the original text exactly. If it does not match, check the destination, subscription state, and the instructions given to Dots.
 

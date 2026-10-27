@@ -3,13 +3,14 @@
 //     ログイン操作で初めてimport()し、復元済みsessionの確認・ID token取得・接続状態の確認もその後にだけ行う。popupは明示操作だけ。
 //   - 認証後の操作（接続確認・解除・送信・中止・同ID確認）は同origin（localhost helper）の限定pathへ、Authorization: Bearer と起動ごとのlocal nonce
 //     （X-Sttd-Local-Nonce）を付けて送る。helperが固定のMCP/API originへ中継する。本文はRAM/DOMだけ、保存0。
-//   - 6段階wizard: 1 ログイン → 2 プラグイン追加と接続許可の確認（手動1回。linked/subscribed＋access allowedで3へ。プラグイン追加・OAuth接続の
+//   - 7段階wizard: 1 ログイン → 2 プラグイン追加と接続許可の確認（手動1回。linked/subscribed＋access allowedで3へ。プラグイン追加・OAuth接続の
 //     展開ガイドと、helperの検証済みMCP originから作る登録先URLは表示だけで通信しない） → 3 テスト用Dotsプロンプト（受信開始。コピー＋本人の
-//     「貼り付けて次へ」） → 4 受信状態の確認（手動1回。subscribed＋allowedだけが5を開く。linkedは4に留めて受信開始を案内） → 5 送信（単回POST・
-//     同ID・取消。本人の「Dotsで本文一致を確認して次へ」） → 6 運用用Dotsプロンプト（コピー＋「貼り付けて完了」）。初期は1だけ有効。完了済みの前step
+//     「貼り付けて次へ」） → 4 受信状態の確認（手動1回。subscribed＋allowedだけが5を開く。linkedは4に留めて受信開始を案内） → 5 固定文の送信テスト
+//     （編集欄なし。本文は辞書の固定文。単回POST・同ID・取消。本人の「Dotsで本文一致を確認して次へ」） → 6 運用用Dotsプロンプト（コピー＋「貼り付けて
+//     完了」でセットアップ完了） → 7 自由送信（通常利用。5とは別の送信状態で、7の結果はセットアップ完了の条件にしない）。初期は1だけ有効。完了済みの前step
 //     は薄く表示して再選択でき、再表示だけでは証跡を消さない。再ログイン開始時は2以降、接続許可を確認できない時は3以降、受信中を確認できない時と
-//     テスト設定の再適用は4以降を戻す。未解放のstepはクリックしても進めず通信しない。古いasync結果（世代が違うログイン/確認）で後続を解放しない。
-//     完了後は5で通常送信を繰り返せる。
+//     テスト設定の再適用は4以降を戻す（7も封鎖）。未解放のstepはクリックしても進めず通信しない。古いasync結果（世代が違うログイン/確認）で後続を解放しない。
+//     完了後は7で通常送信を繰り返せる。
 //   - HTTP受領（delivered）だけでwizardを進めない。5の完了は利用者がDotsで一致を確認した明示操作。不明（delivery_unknown/結果不明）はAPI結果を
 //     成功へ書き換えず、利用者の確認だけで進める。進行中（in-flight・中止確認中・同ID確認中）は完了不可。
 //   - 本文欄は空で始まりplaceholderに非機密の例文、主buttonはja「送信」/en「Send」。空・空白だけ・対にならないsurrogate・4096 UTF-8 byte超は通信前に拒否。
@@ -122,7 +123,7 @@ export function consoleSecurityHeaders(web: FirebaseWebConfig): Record<string, s
   };
 }
 
-/** /consoleのHTML（6段階wizard、1画面）。値はdata属性へescapeして渡す。文言は選択言語の辞書から入れ、scriptが同じキーで差し替える。 */
+/** /consoleのHTML（7段階wizard、1画面）。値はdata属性へescapeして渡す。文言は選択言語の辞書から入れ、scriptが同じキーで差し替える。 */
 export function renderConsolePage(web: FirebaseWebConfig, options: ConsolePageOptions): string {
   checkWeb(web);
   const nonce = checkLocalNonce(options?.nonce);
@@ -238,6 +239,27 @@ ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wi
 <section id="sttd-panel-5" class="sttd-panel" aria-labelledby="sttd-panel-5-title" data-sttd-state="locked" tabindex="0">
 <h2 id="sttd-panel-5-title" class="sttd-panel-title"${i18n('wizard.step5')}>${t('wizard.step5')}</h2>
 <p id="sttd-send-intro"${i18n('wizard.sendIntro')}>${t('wizard.sendIntro')}</p>
+<p id="sttd-fixed-label"${i18n('wizard.fixedLabel')}>${t('wizard.fixedLabel')}</p>
+<p id="sttd-fixed-text" class="sttd-fixed"${i18n('wizard.fixedText')}>${t('wizard.fixedText')}</p>
+<div class="sttd-actions">
+<button type="button" id="sttd-test-send" disabled${i18n('wizard.sendFixed')}>${t('wizard.sendFixed')}</button>
+<button type="button" id="sttd-test-cancel" hidden${i18n('console.cancel')}>${t('console.cancel')}</button>
+<button type="button" id="sttd-test-check" hidden${i18n('console.check')}>${t('console.check')}</button>
+<button type="button" id="sttd-test-new" hidden${i18n('wizard.sendFixedAgain')}>${t('wizard.sendFixedAgain')}</button>
+</div>
+<p id="sttd-test-result" role="status"></p>
+<p id="sttd-note" class="sttd-note"${i18n('console.note')}>${t('console.note')}</p>
+<button type="button" id="sttd-verify-send" disabled${i18n('wizard.sendVerified')}>${t('wizard.sendVerified')}</button>
+<p id="sttd-verify-hint" class="sttd-note"${i18n('wizard.sendNotVerifiable')}>${t('wizard.sendNotVerifiable')}</p>
+</section>
+<section id="sttd-panel-6" class="sttd-panel" aria-labelledby="sttd-panel-6-title" data-sttd-state="locked" tabindex="0">
+<h2 id="sttd-panel-6-title" class="sttd-panel-title"${i18n('wizard.step6')}>${t('wizard.step6')}</h2>
+<p id="sttd-guide-step3"${i18n('guide.step3')}>${t('guide.step3')}</p>
+${instructions('operation', 'guide.showOperation', 'guide.operationText', 'guide.copyOperation', 'wizard.pastedOperationFinish')}
+</section>
+<section id="sttd-panel-7" class="sttd-panel" aria-labelledby="sttd-panel-7-title" data-sttd-state="locked" tabindex="0">
+<h2 id="sttd-panel-7-title" class="sttd-panel-title"${i18n('wizard.step7')}>${t('wizard.step7')}</h2>
+<p id="sttd-free-intro"${i18n('wizard.freeIntro')}>${t('wizard.freeIntro')}</p>
 <label id="sttd-text-label" for="sttd-text"${i18n('console.textLabel')}>${t('console.textLabel')}</label>
 <textarea id="sttd-text" rows="4" maxlength="4096" placeholder="${t('console.textPlaceholder')}" disabled></textarea>
 <div class="sttd-actions">
@@ -247,14 +269,6 @@ ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wi
 <button type="button" id="sttd-new" hidden${i18n('console.new')}>${t('console.new')}</button>
 </div>
 <p id="sttd-result" role="status"></p>
-<p id="sttd-note" class="sttd-note"${i18n('console.note')}>${t('console.note')}</p>
-<button type="button" id="sttd-verify-send" disabled${i18n('wizard.sendVerified')}>${t('wizard.sendVerified')}</button>
-<p id="sttd-verify-hint" class="sttd-note"${i18n('wizard.sendNotVerifiable')}>${t('wizard.sendNotVerifiable')}</p>
-</section>
-<section id="sttd-panel-6" class="sttd-panel" aria-labelledby="sttd-panel-6-title" data-sttd-state="locked" tabindex="0">
-<h2 id="sttd-panel-6-title" class="sttd-panel-title"${i18n('wizard.step6')}>${t('wizard.step6')}</h2>
-<p id="sttd-guide-step3"${i18n('guide.step3')}>${t('guide.step3')}</p>
-${instructions('operation', 'guide.showOperation', 'guide.operationText', 'guide.copyOperation', 'wizard.pastedOperationFinish')}
 </section>
 <p id="sttd-complete" class="sttd-complete" role="status" hidden${i18n('wizard.complete')}>${t('wizard.complete')}</p>
 </main>
@@ -297,11 +311,12 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-panel[data-sttd-state="current"] { border: 2px solid #1f5fbf; }
 .sttd-panel[aria-disabled="true"] button, .sttd-panel[aria-disabled="true"] textarea, .sttd-panel[aria-disabled="true"] details, .sttd-panel[aria-disabled="true"] summary, .sttd-panel[aria-disabled="true"] pre, .sttd-panel[aria-disabled="true"] a { pointer-events: none; }
 .sttd-complete { font-weight: 700; border: 2px solid #1f5fbf; border-radius: 8px; padding: 0.75rem; }
+.sttd-fixed { font-weight: 600; border: 1px solid #888; border-radius: 6px; padding: 0.5rem 0.75rem; white-space: pre-wrap; }
 [hidden] { display: none !important; }
 `;
 
 /**
- * 画面のscript（固定asset）。6段階wizardの状態・単回送信・中止・同ID確認・確認後の解除・固定プロンプトのコピー・言語切替。
+ * 画面のscript（固定asset）。7段階wizardの状態・単回送信・中止・同ID確認・確認後の解除・固定プロンプトのコピー・言語切替。
  * Firebase SDKは手順1の明示操作でだけimport()する。文言は埋め込んだ固定辞書（connect/i18n.ts）からキーで引く。
  */
 export const CONSOLE_SCRIPT = `const body = document.body;
@@ -326,7 +341,9 @@ const ACCESS_STATES = ['allowed', 'denied', 'unavailable'];
 const ERROR_STATUSES = [400, 401, 403, 409, 422, 429];
 const TERMINAL = ['delivered', 'failed', 'cancelled', 'expired', 'delivery_unknown'];
 const RANK = { in_flight: 1, delivery_unknown: 2, failed: 3, expired: 3, cancelled: 3, delivered: 4 };
-const STEPS = [1, 2, 3, 4, 5, 6];
+const STEPS = [1, 2, 3, 4, 5, 6, 7];
+// 送信の2系統: test=手順5の固定文（本文一致の証跡）、free=手順7の自由送信（通常利用。セットアップ完了の条件にしない）。
+const LANE_STEP = { test: 5, free: 7 };
 /** Firebase SDKの読込み（明示ログイン時だけ。固定CDNの2 module）。 */
 const loadSdkModules = () => Promise.all([import(SDK_BASE + 'firebase-app.js'), import(SDK_BASE + 'firebase-auth.js')]);
 
@@ -353,10 +370,13 @@ let checkFrom = 2;
 // 手順4の受信状態の確認結果（RAMだけ）。
 let receiveKey = '';
 let step = 1;
-const done = { 1: false, 2: false, 3: false, 4: false, 5: false, 6: false };
+const done = { 1: false, 2: false, 3: false, 4: false, 5: false, 6: false, 7: false };
 let noteKey = '';
 let test = null;
 let sendNote = '';
+// 手順7の自由送信（testとは別の状態。7の失敗で5の証跡を消さない）。
+let free = null;
+let freeNote = '';
 // 結果が確定していない送信をreset（再ログイン・認証喪失・状態の再確認・テスト指示の再適用）で画面から消した時の重複注意（RAMだけ）。
 // 次の送信を始めるまで表示し、resetの一般noteで上書きしない。
 let duplicateWarning = false;
@@ -405,12 +425,16 @@ function busy() {
 
 /** 送信中（1件の終端まで）か。 */
 function sending() {
-  return test !== null && phaseOf(test) === 'sending';
+  return [test, free].some((current) => current !== null && phaseOf(current) === 'sending');
 }
 
 /** 送信・中止・結果確認のいずれかが進行中か（この間はtestを壊す操作を拒否する）。 */
 function inFlight() {
-  return test !== null && (phaseOf(test) === 'sending' || test.cancel === 'pending' || test.checking);
+  return laneBusy(test) || laneBusy(free);
+}
+
+function laneBusy(current) {
+  return current !== null && (phaseOf(current) === 'sending' || current.cancel === 'pending' || current.checking);
 }
 
 /** stepの操作（ボタン）を受けるか: 解放済みで、かつ現在activeなpanelであること（非activeのgray panel内のcontrolは誤操作防止で動かさない）。 */
@@ -426,7 +450,8 @@ function available(n) {
   if (n === 3) return done[2];
   if (n === 4) return done[3];
   if (n === 5) return done[4];
-  return done[5];
+  if (n === 6) return done[5];
+  return done[6];
 }
 
 /** 手順nより後ろに戻すべき進捗があるか（reset時の注意に使う）。 */
@@ -434,12 +459,12 @@ function doneAfter(n) {
   return STEPS.some((k) => k > n && done[k]);
 }
 
-function sendableNow() {
-  return available(5) && signedIn && connection === 'subscribed' && access === 'allowed' && !busy();
+function sendableNow(n = 5) {
+  return available(n) && signedIn && connection === 'subscribed' && access === 'allowed' && !busy();
 }
 
 function languageLocked() {
-  return accountBusy || copying || (test !== null && (phaseOf(test) === 'sending' || test.cancel === 'pending' || test.checking));
+  return accountBusy || copying || inFlight();
 }
 
 /** 本人がDotsで一致を確認できる送信終端か（受領/不明。未送信・失敗・中止・期限切れ・進行中は不可）。 */
@@ -471,11 +496,16 @@ function resetFrom(n) {
     if (test !== null && uncertain(test)) duplicateWarning = true;
     test = null;
     sendNote = '';
-    el('sttd-text').value = '';
   }
   if (n <= 6) {
     copied.operation = false;
     manual.operation = false;
+  }
+  if (n <= 7) {
+    if (free !== null && uncertain(free)) duplicateWarning = true;
+    free = null;
+    freeNote = '';
+    el('sttd-text').value = '';
   }
   if (copyFor !== '' && ((n <= 3 && copyFor === 'test') || (n <= 6 && copyFor === 'operation'))) {
     copyKey = '';
@@ -485,7 +515,6 @@ function resetFrom(n) {
 }
 
 function render() {
-  const phase = test === null ? null : phaseOf(test);
   for (const n of STEPS) {
     const state = step === n ? 'current' : done[n] ? 'done' : available(n) ? 'ready' : 'locked';
     // 全panelを順に表示し、非active/未解放はgray。panel自身（done/ready）はクリック/keyboardで再活性化できる。
@@ -524,42 +553,52 @@ function render() {
     el('sttd-copy-result-' + kind).textContent = copyFor === kind ? T(copyKey) : '';
     el('sttd-done-' + kind).disabled = inactive(n) || copying || !available(n) || !(copied[kind] || manual[kind]) || (kind === 'test' && inFlight());
   }
-  // 完了banner（panel6の外、画面下）: done6の間は手順5へ戻っても表示する。
+  // 完了banner（panel7の外、画面下）: セットアップ（手順6まで）の完了で表示し、手順7の送信結果には依存しない。
   el('sttd-complete').hidden = !done[6];
   // 4 受信状態の確認（明示1回GET。自動の再確認はしない）
   el('sttd-receive-check').disabled = inactive(4) || !available(4) || !signedIn || busy() || inFlight() || confirming;
   el('sttd-receive-text').textContent = checking && checkFrom === 4 ? T('wizard.receiveChecking') : T(receiveKey);
-  // 5 送信
-  const sendable = sendableNow() && !inactive(5);
-  el('sttd-text').disabled = !sendable || test !== null;
-  el('sttd-send').disabled = !sendable || test !== null;
-  el('sttd-cancel').hidden = test === null || (phase !== 'sending' && phase !== 'unknown') || test.cancel === 'answered' || test.cancel === 'unconfirmed';
-  el('sttd-cancel').disabled = inactive(5) || (test !== null && test.cancel === 'pending');
-  el('sttd-check').hidden = test === null || !checkable(test);
-  el('sttd-check').disabled = inactive(5) || (test !== null && test.checking);
-  el('sttd-new').hidden = test === null || phase === 'sending' || test.cancel === 'pending' || test.checking;
-  el('sttd-new').disabled = inactive(5);
+  // 5 固定文の送信（編集欄なし）・7 自由送信。どちらも同じ単回POST・中止・同ID確認の部品
+  renderLane('test', { send: 'sttd-test-send', cancel: 'sttd-test-cancel', check: 'sttd-test-check', again: 'sttd-test-new', result: 'sttd-test-result' }, inactive);
+  renderLane('free', { send: 'sttd-send', cancel: 'sttd-cancel', check: 'sttd-check', again: 'sttd-new', result: 'sttd-result' }, inactive);
+  el('sttd-text').disabled = !sendableNow(7) || inactive(7) || free !== null;
   el('sttd-verify-send').disabled = inactive(5) || !available(5) || busy() || !verifiable();
   for (const code of ['en', 'ja']) {
     const link = el('sttd-lang-' + code);
     link.setAttribute('aria-current', code === lang ? 'true' : 'false');
     link.setAttribute('aria-disabled', languageLocked() ? 'true' : 'false');
   }
+}
+
+/** 送信系統（test=手順5、free=手順7）の表示。系統ごとに別の状態を持ち、操作は各系統の手順がactiveな時だけ。 */
+function renderLane(lane, ids, inactive) {
+  const n = LANE_STEP[lane];
+  const current = laneOf(lane);
+  const phase = current === null ? null : phaseOf(current);
+  const sendable = sendableNow(n) && !inactive(n);
+  el(ids.send).disabled = !sendable || current !== null;
+  el(ids.cancel).hidden = current === null || (phase !== 'sending' && phase !== 'unknown') || current.cancel === 'answered' || current.cancel === 'unconfirmed';
+  el(ids.cancel).disabled = inactive(n) || (current !== null && current.cancel === 'pending');
+  el(ids.check).hidden = current === null || !checkable(current);
+  el(ids.check).disabled = inactive(n) || (current !== null && current.checking);
+  el(ids.again).hidden = current === null || phase === 'sending' || current.cancel === 'pending' || current.checking;
+  el(ids.again).disabled = inactive(n);
   const lines = [];
-  if (test !== null) {
-    if (test.state !== null) lines.push(T('console.state.' + test.state));
+  if (current !== null) {
+    if (current.state !== null) lines.push(T('console.state.' + current.state));
     else if (phase === 'sending') lines.push(T('console.sending'));
-    else if (test.rejected !== null) lines.push(T(test.rejected));
+    else if (current.rejected !== null) lines.push(T(current.rejected));
     else lines.push(T('console.unknown'));
-    if (test.cancel === 'pending') lines.push(T('console.cancelPending'));
-    if (test.cancel === 'unconfirmed' && test.state !== 'cancelled') lines.push(T('console.cancelUnconfirmed'));
-    if (test.checkNote) lines.push(T(test.checkNote));
+    if (current.cancel === 'pending') lines.push(T('console.cancelPending'));
+    if (current.cancel === 'unconfirmed' && current.state !== 'cancelled') lines.push(T('console.cancelUnconfirmed'));
+    if (current.checkNote) lines.push(T(current.checkNote));
   } else {
-    if (sendNote) lines.push(T(sendNote));
+    const note = lane === 'test' ? sendNote : freeNote;
+    if (note) lines.push(T(note));
     else if (duplicateWarning) lines.push(T('console.duplicateWarning'));
     if (signedIn && connection === 'subscribed' && access !== null && access !== 'allowed') lines.push(T('wizard.access.' + access));
   }
-  el('sttd-result').textContent = lines.join(' ');
+  el(ids.result).textContent = lines.join(' ');
 }
 
 function applyLanguage() {
@@ -1046,10 +1085,31 @@ function completeOperation() {
   }
   done[6] = true;
   noteKey = '';
+  step = 7;
   render();
+  reveal(7);
 }
 
-// ---- 5 送信・中止・同ID確認 ----
+// ---- 5（固定文）/7（自由入力）の送信・中止・同ID確認 ----
+
+function laneOf(lane) {
+  return lane === 'test' ? test : free;
+}
+
+function setLane(lane, current) {
+  if (lane === 'test') test = current;
+  else free = current;
+}
+
+function setLaneNote(lane, key) {
+  if (lane === 'test') sendNote = key;
+  else freeNote = key;
+}
+
+/** 送る本文: 手順5は表示中の固定文の正本（辞書）から作り、DOMの入力値を読まない。手順7は本人の入力欄。 */
+function laneText(lane) {
+  return lane === 'test' ? T('wizard.fixedText') : el('sttd-text').value;
+}
 
 function stateOf(current, outcome) {
   const json = outcome.kind === 'response' ? outcome.json : null;
@@ -1062,17 +1122,18 @@ function apply(current, state) {
   current.state = state;
 }
 
-async function send() {
-  if (!sendableNow() || !canAct(5) || test !== null) return;
-  const text = el('sttd-text').value;
+async function send(lane) {
+  const n = LANE_STEP[lane];
+  if (!sendableNow(n) || !canAct(n) || laneOf(lane) !== null) return;
+  const text = laneText(lane);
   if (typeof text !== 'string' || text.trim() === '' || LONE_SURROGATE.test(text) || new TextEncoder().encode(text).length > MAX_TEXT_BYTES) {
-    sendNote = 'console.inputInvalid';
+    setLaneNote(lane, 'console.inputInvalid');
     return render();
   }
   const created = Date.now();
   const current = { commandId: crypto.randomUUID(), state: null, postDone: false, rejected: null, cancel: 'none', checking: false, checkNote: '' };
-  test = current;
-  sendNote = '';
+  setLane(lane, current);
+  setLaneNote(lane, '');
   duplicateWarning = false;
   render();
   const payload = JSON.stringify({
@@ -1083,7 +1144,7 @@ async function send() {
     expiresAt: new Date(created + LIFETIME_MS).toISOString(),
   });
   const outcome = await request('/v2/commands', 'POST', Math.min(POST_MS, created + LIFETIME_MS - Date.now()), { 'Content-Type': 'application/json', 'Idempotency-Key': current.commandId }, payload);
-  if (test !== current) return;
+  if (laneOf(lane) !== current) return;
   current.postDone = true;
   const state = stateOf(current, outcome);
   if (state !== null) apply(current, state);
@@ -1104,13 +1165,13 @@ function errorCode(json) {
   return json !== null && typeof json === 'object' && json.error !== null && typeof json.error === 'object' && typeof json.error.code === 'string' ? json.error.code : '';
 }
 
-async function cancel() {
-  const current = test;
-  if (!canAct(5) || current === null || current.cancel !== 'none' || phaseOf(current) === 'settled') return;
+async function cancel(lane) {
+  const current = laneOf(lane);
+  if (!canAct(LANE_STEP[lane]) || current === null || current.cancel !== 'none' || phaseOf(current) === 'settled') return;
   current.cancel = 'pending';
   render();
   const outcome = await request('/v2/commands/' + current.commandId + '/cancel', 'POST', CANCEL_MS, {}, undefined);
-  if (test !== current) return;
+  if (laneOf(lane) !== current) return;
   const state = stateOf(current, outcome);
   if (state !== null) {
     current.cancel = 'answered';
@@ -1122,14 +1183,14 @@ async function cancel() {
   render();
 }
 
-async function check() {
-  const current = test;
-  if (!canAct(5) || current === null || current.checking || !checkable(current)) return;
+async function check(lane) {
+  const current = laneOf(lane);
+  if (!canAct(LANE_STEP[lane]) || current === null || current.checking || !checkable(current)) return;
   current.checking = true;
   current.checkNote = '';
   render();
   const outcome = await request('/v2/commands/' + current.commandId, 'GET', CHECK_MS, {}, undefined);
-  if (test !== current) return;
+  if (laneOf(lane) !== current) return;
   current.checking = false;
   const state = stateOf(current, outcome);
   if (state !== null) apply(current, state);
@@ -1139,12 +1200,13 @@ async function check() {
   render();
 }
 
-function newTest() {
-  const current = test;
-  if (!canAct(5) || current === null || phaseOf(current) === 'sending' || current.cancel === 'pending' || current.checking) return;
+/** 系統の送信を画面から外して次の送信を可能にする（手順5は固定文の再送信、手順7は新しい本文）。未確定なら重複注意。 */
+function newTest(lane) {
+  const current = laneOf(lane);
+  if (!canAct(LANE_STEP[lane]) || current === null || phaseOf(current) === 'sending' || current.cancel === 'pending' || current.checking) return;
   const warn = uncertain(current);
-  test = null;
-  sendNote = warn ? 'console.duplicateWarning' : '';
+  setLane(lane, null);
+  setLaneNote(lane, warn ? 'console.duplicateWarning' : '');
   render();
 }
 
@@ -1342,10 +1404,14 @@ function start() {
   el('sttd-done-operation').onclick = () => completeOperation();
   el('sttd-verify-send').onclick = () => verifySend();
 el('sttd-receive-check').onclick = () => checkReceiving();
-  el('sttd-send').onclick = () => send();
-  el('sttd-cancel').onclick = () => cancel();
-  el('sttd-check').onclick = () => check();
-  el('sttd-new').onclick = () => newTest();
+  el('sttd-test-send').onclick = () => send('test');
+  el('sttd-test-cancel').onclick = () => cancel('test');
+  el('sttd-test-check').onclick = () => check('test');
+  el('sttd-test-new').onclick = () => newTest('test');
+  el('sttd-send').onclick = () => send('free');
+  el('sttd-cancel').onclick = () => cancel('free');
+  el('sttd-check').onclick = () => check('free');
+  el('sttd-new').onclick = () => newTest('free');
   for (const code of ['en', 'ja']) {
     el('sttd-lang-' + code).onclick = (event) => {
       if (event && typeof event.preventDefault === 'function') event.preventDefault();
