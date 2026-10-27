@@ -169,7 +169,7 @@ export function renderConsolePage(web: FirebaseWebConfig, options: ConsolePageOp
 <p id="sttd-intro"${i18n('wizard.intro')}>${t('wizard.intro')}</p>
 <p id="sttd-wizard-note" role="status"></p>
 <section id="sttd-panel-1" class="sttd-panel" aria-labelledby="sttd-panel-1-title" data-sttd-state="current" tabindex="0">
-<h2 id="sttd-panel-1-title" class="sttd-panel-title"${i18n('wizard.step1')}>${t('wizard.step1')}</h2>
+<div class="sttd-panel-head"><h2 id="sttd-panel-1-title" class="sttd-panel-title"${i18n('wizard.step1')}>${t('wizard.step1')}</h2><button type="button" id="sttd-skip-1" class="sttd-skip" disabled${i18n('wizard.skipResume')}>${t('wizard.skipResume')}</button></div>
 ${options.operatorFirst === true ? (options.operatorSection ?? '') : ''}
 <div id="sttd-apple-panel"${options.operatorFirst === true ? ' hidden' : ''}>
 <p id="sttd-login-intro"${i18n('wizard.loginIntro')}>${t('wizard.loginIntro')}</p>
@@ -182,7 +182,7 @@ ${options.operatorFirst === true ? (options.operatorSection ?? '') : ''}
 ${options.operatorFirst === true ? '' : (options.operatorSection ?? '')}
 </section>
 <section id="sttd-panel-2" class="sttd-panel" aria-labelledby="sttd-panel-2-title" data-sttd-state="locked" tabindex="0">
-<h2 id="sttd-panel-2-title" class="sttd-panel-title"${i18n('wizard.step2')}>${t('wizard.step2')}</h2>
+<div class="sttd-panel-head"><h2 id="sttd-panel-2-title" class="sttd-panel-title"${i18n('wizard.step2')}>${t('wizard.step2')}</h2><button type="button" id="sttd-skip-2" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
 <p id="sttd-state-intro"${i18n('wizard.stateIntro')}>${t('wizard.stateIntro')}</p>
 <p id="sttd-plugin-intro"${i18n('plugin.intro')}>${t('plugin.intro')}</p>
 <details id="sttd-plugin-guide" class="sttd-instructions-details">
@@ -222,14 +222,14 @@ ${options.operatorCodePanel ?? ''}
 <p id="sttd-disconnect-result" role="status"></p>
 </section>
 <section id="sttd-panel-3" class="sttd-panel" aria-labelledby="sttd-panel-3-title" data-sttd-state="locked" tabindex="0">
-<h2 id="sttd-panel-3-title" class="sttd-panel-title"${i18n('wizard.step3')}>${t('wizard.step3')}</h2>
+<div class="sttd-panel-head"><h2 id="sttd-panel-3-title" class="sttd-panel-title"${i18n('wizard.step3')}>${t('wizard.step3')}</h2><button type="button" id="sttd-skip-3" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
 <p id="sttd-guide-intro"${i18n('guide.intro')}>${t('guide.intro')}</p>
 <p id="sttd-guide-step1"${i18n('guide.step1')}>${t('guide.step1')}</p>
 <p id="sttd-receive-start"${i18n('wizard.receiveStart')}>${t('wizard.receiveStart')}</p>
 ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wizard.pastedTestNext')}
 </section>
 <section id="sttd-panel-4" class="sttd-panel" aria-labelledby="sttd-panel-4-title" data-sttd-state="locked" tabindex="0">
-<h2 id="sttd-panel-4-title" class="sttd-panel-title"${i18n('wizard.step4')}>${t('wizard.step4')}</h2>
+<div class="sttd-panel-head"><h2 id="sttd-panel-4-title" class="sttd-panel-title"${i18n('wizard.step4')}>${t('wizard.step4')}</h2><span id="sttd-required-4" class="sttd-required"${i18n('wizard.required')}>${t('wizard.required')}</span></div>
 <p id="sttd-receive-intro"${i18n('wizard.receiveIntro')}>${t('wizard.receiveIntro')}</p>
 <div class="sttd-actions">
 <button type="button" id="sttd-receive-check" disabled${i18n('wizard.receiveCheck')}>${t('wizard.receiveCheck')}</button>
@@ -237,7 +237,7 @@ ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wi
 <p id="sttd-receive-text" role="status"></p>
 </section>
 <section id="sttd-panel-5" class="sttd-panel" aria-labelledby="sttd-panel-5-title" data-sttd-state="locked" tabindex="0">
-<h2 id="sttd-panel-5-title" class="sttd-panel-title"${i18n('wizard.step5')}>${t('wizard.step5')}</h2>
+<div class="sttd-panel-head"><h2 id="sttd-panel-5-title" class="sttd-panel-title"${i18n('wizard.step5')}>${t('wizard.step5')}</h2><button type="button" id="sttd-skip-5" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
 <p id="sttd-send-intro"${i18n('wizard.sendIntro')}>${t('wizard.sendIntro')}</p>
 <p id="sttd-fixed-label"${i18n('wizard.fixedLabel')}>${t('wizard.fixedLabel')}</p>
 <p id="sttd-fixed-text" class="sttd-fixed"${i18n('wizard.fixedText')}>${t('wizard.fixedText')}</p>
@@ -253,12 +253,12 @@ ${instructions('test', 'guide.showTest', 'guide.testText', 'guide.copyTest', 'wi
 <p id="sttd-verify-hint" class="sttd-note"${i18n('wizard.sendNotVerifiable')}>${t('wizard.sendNotVerifiable')}</p>
 </section>
 <section id="sttd-panel-6" class="sttd-panel" aria-labelledby="sttd-panel-6-title" data-sttd-state="locked" tabindex="0">
-<h2 id="sttd-panel-6-title" class="sttd-panel-title"${i18n('wizard.step6')}>${t('wizard.step6')}</h2>
+<div class="sttd-panel-head"><h2 id="sttd-panel-6-title" class="sttd-panel-title"${i18n('wizard.step6')}>${t('wizard.step6')}</h2><button type="button" id="sttd-skip-6" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
 <p id="sttd-guide-step3"${i18n('guide.step3')}>${t('guide.step3')}</p>
 ${instructions('operation', 'guide.showOperation', 'guide.operationText', 'guide.copyOperation', 'wizard.pastedOperationFinish')}
 </section>
 <section id="sttd-panel-7" class="sttd-panel" aria-labelledby="sttd-panel-7-title" data-sttd-state="locked" tabindex="0">
-<h2 id="sttd-panel-7-title" class="sttd-panel-title"${i18n('wizard.step7')}>${t('wizard.step7')}</h2>
+<div class="sttd-panel-head"><h2 id="sttd-panel-7-title" class="sttd-panel-title"${i18n('wizard.step7')}>${t('wizard.step7')}</h2><button type="button" id="sttd-skip-7" class="sttd-skip" disabled${i18n('wizard.skip')}>${t('wizard.skip')}</button></div>
 <p id="sttd-free-intro"${i18n('wizard.freeIntro')}>${t('wizard.freeIntro')}</p>
 <label id="sttd-text-label" for="sttd-text"${i18n('console.textLabel')}>${t('console.textLabel')}</label>
 <textarea id="sttd-text" rows="4" maxlength="4096" placeholder="${t('console.textPlaceholder')}" disabled></textarea>
@@ -295,6 +295,9 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-language a[aria-disabled="true"] { color: #5b616b; pointer-events: none; }
 .sttd-badge { font-size: 0.8rem; color: #4a5059; min-width: 3.5rem; }
 .sttd-panel-title { font-size: 1.05rem; margin: 0 0 0.5rem; }
+.sttd-panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
+.sttd-skip { font-size: 0.85rem; color: #4a4a4a; background: #f0f0f0; border: 1px solid #8a8a8a; border-radius: 4px; padding: 0.15rem 0.5rem; }
+.sttd-required { font-size: 0.85rem; color: #4a4a4a; }
 .sttd-instruction-block { margin-top: 0.75rem; }
 .sttd-instructions-details summary { cursor: pointer; font-weight: 600; min-height: 44px; display: flex; align-items: center; }
 .sttd-instructions { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; background: #f5f6f8; border: 1px solid #d9dce1; border-radius: 6px; padding: 0.75rem; margin: 0; }
@@ -307,7 +310,7 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 #sttd-result, #sttd-disconnect-result, #sttd-wizard-note { font-weight: 600; min-height: 1.5em; overflow-wrap: anywhere; }
 .sttd-note { font-size: 0.85rem; color: #4a5059; }
 .sttd-panel[data-sttd-state="locked"] { opacity: 0.55; background: #eceef1; }
-.sttd-panel[data-sttd-state="done"], .sttd-panel[data-sttd-state="ready"] { opacity: 0.8; background: #f5f6f8; cursor: pointer; }
+.sttd-panel[data-sttd-state="done"], .sttd-panel[data-sttd-state="skipped"], .sttd-panel[data-sttd-state="ready"] { opacity: 0.8; background: #f5f6f8; cursor: pointer; }
 .sttd-panel[data-sttd-state="current"] { border: 2px solid #1f5fbf; }
 .sttd-panel[aria-disabled="true"] button, .sttd-panel[aria-disabled="true"] textarea, .sttd-panel[aria-disabled="true"] details, .sttd-panel[aria-disabled="true"] summary, .sttd-panel[aria-disabled="true"] pre, .sttd-panel[aria-disabled="true"] a { pointer-events: none; }
 .sttd-complete { font-weight: 700; border: 2px solid #1f5fbf; border-radius: 8px; padding: 0.75rem; }
@@ -344,6 +347,11 @@ const RANK = { in_flight: 1, delivery_unknown: 2, failed: 3, expired: 3, cancell
 const STEPS = [1, 2, 3, 4, 5, 6, 7];
 // 送信の2系統: test=手順5の固定文（本文一致の証跡）、free=手順7の自由送信（通常利用。セットアップ完了の条件にしない）。
 const LANE_STEP = { test: 5, free: 7 };
+// 右上の補助操作で省略できる手順（4は必須の受信確認なので省略できない）。1の省略は保存済みログインの明示復元。
+const SKIPPABLE = [1, 2, 3, 5, 6, 7];
+// 保存済みコードログインの判定（サーバーの識別検証と同じ形: 専用UID・marker・family）。UIDの接頭辞だけでは信用しない。
+const CODE_UID = /^sttdc_[A-Za-z0-9_-]{32}$/;
+const CODE_FAMILY = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 /** Firebase SDKの読込み（明示ログイン時だけ。固定CDNの2 module）。 */
 const loadSdkModules = () => Promise.all([import(SDK_BASE + 'firebase-app.js'), import(SDK_BASE + 'firebase-auth.js')]);
 
@@ -371,6 +379,8 @@ let checkFrom = 2;
 let receiveKey = '';
 let step = 1;
 const done = { 1: false, 2: false, 3: false, 4: false, 5: false, 6: false, 7: false };
+// 省略した手順（doneとは別。未確認を完了・本文一致・貼付済みに見せない）。
+const skipped = { 1: false, 2: false, 3: false, 4: false, 5: false, 6: false, 7: false };
 let noteKey = '';
 let test = null;
 let sendNote = '';
@@ -445,18 +455,21 @@ function canAct(n) {
 /** stepが使えるか（DOMの見た目に頼らず、各handlerもこれで検査する）。確認中は3以降を一時封鎖。 */
 function available(n) {
   if (n === 1) return true;
-  if (n === 2) return done[1] || (method === 'code' && codeIssued);
+  if (n === 2) return passed(1) || (method === 'code' && codeIssued);
   if (checking) return false;
-  if (n === 3) return done[2];
-  if (n === 4) return done[3];
-  if (n === 5) return done[4];
-  if (n === 6) return done[5];
-  return done[6];
+  // 手順5以降は、必須の手順4（同じownerでsubscribed＋allowedの明示確認）が済んでいる時だけ。2/3の省略では迂回できない
+  if (n >= 5 && !done[4]) return false;
+  return passed(n - 1);
+}
+
+/** 手順nを完了または省略したか（手順4は省略できない）。 */
+function passed(n) {
+  return done[n] || (n !== 4 && skipped[n]);
 }
 
 /** 手順nより後ろに戻すべき進捗があるか（reset時の注意に使う）。 */
 function doneAfter(n) {
-  return STEPS.some((k) => k > n && done[k]);
+  return STEPS.some((k) => k > n && (done[k] || skipped[k]));
 }
 
 function sendableNow(n = 5) {
@@ -477,7 +490,11 @@ function verifiable() {
 /** 手順nから後ろの進捗を戻す（nより前の証跡は消さない）。進行中のコピーの結果はこのresetより前の世代として捨てる。 */
 function resetFrom(n) {
   copyEpoch += 1;
-  for (const k of STEPS) if (k >= n) done[k] = false;
+  for (const k of STEPS) {
+    if (k < n) continue;
+    done[k] = false;
+    skipped[k] = false;
+  }
   if (n <= 2) {
     connection = null;
     access = null;
@@ -516,7 +533,7 @@ function resetFrom(n) {
 
 function render() {
   for (const n of STEPS) {
-    const state = step === n ? 'current' : done[n] ? 'done' : available(n) ? 'ready' : 'locked';
+    const state = step === n ? 'current' : done[n] ? 'done' : skipped[n] ? 'skipped' : available(n) ? 'ready' : 'locked';
     // 全panelを順に表示し、非active/未解放はgray。panel自身（done/ready）はクリック/keyboardで再活性化できる。
     const panel = el('sttd-panel-' + n);
     panel.setAttribute('data-sttd-state', state);
@@ -553,8 +570,11 @@ function render() {
     el('sttd-copy-result-' + kind).textContent = copyFor === kind ? T(copyKey) : '';
     el('sttd-done-' + kind).disabled = inactive(n) || copying || !available(n) || !(copied[kind] || manual[kind]) || (kind === 'test' && inFlight());
   }
-  // 完了banner（panel7の外、画面下）: セットアップ（手順6まで）の完了で表示し、手順7の送信結果には依存しない。
-  el('sttd-complete').hidden = !done[6];
+  // 完了banner（panel7の外、画面下）: 手順6までを完了または省略（必須の4は確認済み）で表示し、手順7の送信結果には依存しない。
+  // 省略した手順があれば「未確認の手順があります」の文面にして、全確認済みと区別する。
+  el('sttd-complete').hidden = !(done[4] && passed(6));
+  el('sttd-complete').textContent = T(unconfirmed() ? 'wizard.completeSkipped' : 'wizard.complete');
+  for (const n of SKIPPABLE) el('sttd-skip-' + n).disabled = !skippable(n);
   // 4 受信状態の確認（明示1回GET。自動の再確認はしない）
   el('sttd-receive-check').disabled = inactive(4) || !available(4) || !signedIn || busy() || inFlight() || confirming;
   el('sttd-receive-text').textContent = checking && checkFrom === 4 ? T('wizard.receiveChecking') : T(receiveKey);
@@ -619,6 +639,118 @@ function chooseLanguage(next) {
   document.cookie = LANGUAGE_COOKIE + '=' + next + '; ' + COOKIE_ATTRIBUTES;
 }
 
+// ---- 手順の省略（右上の補助操作）。skippedはdoneと別に持ち、正規controllerのgateだけで次へ進める ----
+
+/** 省略した（未確認の）手順があるか。手順1の省略は保存済みログインの検証済み復元なので数えない。 */
+function unconfirmed() {
+  return [2, 3, 5, 6].some((k) => skipped[k] && !done[k]);
+}
+
+/** 手順nの省略を受けるか: activeで、処理中・送信中・解除確認中でないこと。7は結果が確定していない送信がある間は受けない。 */
+function skippable(n) {
+  if (!SKIPPABLE.includes(n) || !canAct(n) || busy() || inFlight() || confirming) return false;
+  if (n === 7) return !skipped[7] && !(test !== null && uncertain(test)) && !(free !== null && uncertain(free));
+  return true;
+}
+
+function skipStep(n) {
+  if (!skippable(n)) return;
+  if (n === 1) return resumeLogin();
+  skipped[n] = true;
+  if (n === 7) {
+    // 何も送らず今回の案内を終える（同じ画面で7を選び直せば送れる）。
+    noteKey = 'wizard.skip7Done';
+    return render();
+  }
+  step = n + 1;
+  render();
+  reveal(n + 1);
+}
+
+/**
+ * 手順1の省略＝保存済みログインの明示復元（通常のloginとは別経路。保存済みのコードログインをAppleへ切り替えない）。選んだ方式の
+ * Firebase既存persistenceだけを使い、popup・signOut・コード発行はしない。ID tokenのclaims（project・tenant・provider・
+ * コードのmarker/family/UID）がこの配置と方式に合う時だけ手順2へ進め、以降の確認は通常の手順2/4で行う。
+ */
+async function resumeLogin() {
+  if (!canAct(1) || busy() || inFlight()) return;
+  const want = method === 'code' ? 'code' : 'apple';
+  const gen = ++loginGeneration;
+  const chosen = method;
+  const epoch = codeEpoch;
+  const stale = () => gen !== loginGeneration || method !== chosen || epoch !== codeEpoch;
+  const hadProgress = done[1] || skipped[1];
+  resetFrom(2);
+  signedIn = false;
+  done[1] = false;
+  skipped[1] = false;
+  ownerUid = null;
+  step = 1;
+  noteKey = hadProgress ? 'wizard.loginReset' : '';
+  accountBusy = true;
+  accountKey = sdk === null ? 'wizard.loginLoading' : 'console.accountChecking';
+  render();
+  let resumed = false;
+  try {
+    let s;
+    try {
+      s = await ensureSdk();
+    } catch {
+      if (!stale()) accountKey = 'wizard.loginLoadFailed';
+      return;
+    }
+    if (stale()) return;
+    await s.auth.authStateReady();
+    if (stale()) return;
+    const user = s.auth.currentUser;
+    if (!user || typeof user.getIdTokenResult !== 'function') {
+      accountKey = 'wizard.resumeNone';
+      return;
+    }
+    let result;
+    try {
+      result = await user.getIdTokenResult(true);
+    } catch {
+      if (!stale()) accountKey = 'wizard.resumeFailed';
+      return;
+    }
+    if (stale() || s.auth.currentUser !== user) return;
+    if (!resumable(result, user.uid, want)) {
+      accountKey = 'wizard.resumeMismatch';
+      return;
+    }
+    ownerUid = user.uid;
+    signedIn = true;
+    skipped[1] = true;
+    accountKey = 'wizard.resumeDone';
+    step = 2;
+    resumed = true;
+    observeAuth(s);
+  } catch {
+    if (!stale()) accountKey = 'common.loginFailed';
+  } finally {
+    if (gen === loginGeneration) {
+      accountBusy = false;
+      render();
+      codeState();
+    }
+  }
+  if (resumed && gen === loginGeneration) reveal(2);
+}
+
+/** 復元したID tokenのclaimsが、この配置（project・tenantなし）と選んだ方式に合うか。サーバーの識別検証と同じ条件を見る。 */
+function resumable(result, uid, want) {
+  const c = result !== null && typeof result === 'object' ? result.claims : null;
+  if (c === null || typeof c !== 'object') return false;
+  const projectId = FIREBASE.projectId;
+  if (typeof projectId !== 'string' || c.aud !== projectId || c.iss !== 'https://securetoken.google.com/' + projectId) return false;
+  const fb = c.firebase;
+  if (fb === null || typeof fb !== 'object' || fb.tenant !== undefined) return false;
+  if (typeof uid !== 'string' || c.sub !== uid) return false;
+  if (want === 'code') return fb.sign_in_provider === 'custom' && c.sttd_dlc === 1 && typeof c.sttd_fam === 'string' && CODE_FAMILY.test(c.sttd_fam) && CODE_UID.test(uid);
+  return fb.sign_in_provider === 'apple.com' && !CODE_UID.test(uid);
+}
+
 /** 正の遷移先panelを表示する（scroll＋focus）。失敗・古い結果・再選択では呼ばない。 */
 function reveal(n) {
   const panel = el('sttd-panel-' + n);
@@ -664,6 +796,7 @@ function authLost(key, note) {
   resetFrom(2);
   signedIn = false;
   done[1] = false;
+  skipped[1] = false;
   ownerUid = null;
   step = 1;
   accountKey = key || 'common.loginRefresh';
@@ -710,10 +843,11 @@ async function login(switching) {
   if (!canAct(1) || busy() || inFlight()) return;
   if (method === 'code') await chooseMethod('apple');
   const gen = ++loginGeneration;
-  const hadProgress = done[1];
+  const hadProgress = done[1] || skipped[1];
   resetFrom(2);
   signedIn = false;
   done[1] = false;
+  skipped[1] = false;
   ownerUid = null;
   step = 1;
   noteKey = hadProgress ? 'wizard.loginReset' : '';
@@ -951,6 +1085,7 @@ function connectionLost() {
   if (doneAfter(2)) noteKey = 'wizard.stateReset';
   resetFrom(3);
   done[2] = false;
+  skipped[2] = false;
   step = 2;
 }
 
@@ -1222,7 +1357,7 @@ function isCodeUser(user) {
 }
 
 function codeState() {
-  const state = Object.freeze({ method, epoch: codeEpoch, signedIn, step, codeIssued });
+  const state = Object.freeze({ method, epoch: codeEpoch, signedIn, step, codeIssued, resumed: skipped[1] });
   for (const listener of codeListeners) {
     try {
       listener(state);
@@ -1256,6 +1391,7 @@ async function chooseMethod(next) {
   resetFrom(2);
   signedIn = false;
   done[1] = false;
+  skipped[1] = false;
   ownerUid = null;
   step = 1;
   accountKey = 'console.accountSignedOut';
@@ -1302,6 +1438,7 @@ function codeEndedFor(epoch) {
   resetFrom(2);
   signedIn = false;
   done[1] = false;
+  skipped[1] = false;
   ownerUid = null;
   step = 1;
   accountKey = 'console.accountSignedOut';
@@ -1373,14 +1510,14 @@ globalThis.sttdConsoleCode = Object.freeze({
   // 方式「Apple」で共通の「続ける」を押した時だけ、既存のAppleログインを始める（選択・初期表示では通信しない）。
   appleLogin: () => login(false),
   // 認証済み・発行済み等の進捗の有無（方式切替時の旧plugin再追加の案内に使う）
-  progressed: () => done[1] || codeIssued || signedIn,
+  progressed: () => done[1] || skipped[1] || codeIssued || signedIn,
   issued: (epoch) => codeIssuedFor(epoch),
   ended: (epoch) => codeEndedFor(epoch),
   signIn: (epoch, customToken) => codeSignIn(epoch, customToken),
   subscribe(listener) {
     if (typeof listener !== 'function') return;
     codeListeners.push(listener);
-    listener(Object.freeze({ method, epoch: codeEpoch, signedIn, step, codeIssued }));
+    listener(Object.freeze({ method, epoch: codeEpoch, signedIn, step, codeIssued, resumed: skipped[1] }));
   },
 });
 
@@ -1404,6 +1541,7 @@ function start() {
   el('sttd-done-operation').onclick = () => completeOperation();
   el('sttd-verify-send').onclick = () => verifySend();
 el('sttd-receive-check').onclick = () => checkReceiving();
+  for (const n of SKIPPABLE) el('sttd-skip-' + n).onclick = () => skipStep(n);
   el('sttd-test-send').onclick = () => send('test');
   el('sttd-test-cancel').onclick = () => cancel('test');
   el('sttd-test-check').onclick = () => check('test');

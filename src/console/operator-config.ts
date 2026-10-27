@@ -258,7 +258,8 @@ function hideCode() {
 
 function controls() {
   // コードで認証済みになった後は、二重になるコードの接続確認だけを隠す（通常の接続確認を使う）。再発行/取消は手順2に残す
-  const signed = chosen === 'code' && last !== null && last.signedIn === true;
+  // 保存済みログインの復元（手順1の省略）はhelperがコードsessionを所有しないので、再発行/取消を出さない（このページで発行した時だけ出す）
+  const signed = chosen === 'code' && last !== null && last.signedIn === true && last.resumed !== true;
   show('sttd-code-reissue', issuedOnce || signed);
   show('sttd-code-confirm', issuedOnce && !signed);
   show('sttd-code-cancel', issuedOnce || signed);

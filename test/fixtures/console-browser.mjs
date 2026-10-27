@@ -181,8 +181,9 @@ export function domFromHtml(html) {
  * 合成Firebase SDK。load()がscriptの動的importの代わりに呼ばれる（回数を数える。modeで失敗を合成）。
  * auth.currentUserはsignIn後に合成userになる。popupはmodeに従う（ok / blocked / fail）。
  */
-export function syntheticSdk({ restoredUser = false, token = 'synthetic-id-token', uid = 'uid-a' } = {}) {
-  const calls = { loads: 0, loadMode: 'ok', popups: 0, popupMode: 'ok', signOuts: 0, tokens: 0, tokenMode: 'ok', providers: [], initialized: [], listeners: [], tokenGate: null };
+export function syntheticSdk({ restoredUser = false, token = 'synthetic-id-token', uid = 'uid-a', claims = null } = {}) {
+  // claims: getIdTokenResultが返すID tokenのclaims（uidを受ける関数か固定object。未指定は空＝復元の検証に通らない）。
+  const calls = { loads: 0, loadMode: 'ok', popups: 0, popupMode: 'ok', signOuts: 0, tokens: 0, tokenResults: 0, tokenMode: 'ok', providers: [], initialized: [], listeners: [], tokenGate: null };
   const makeUser = (id, value) => ({
     uid: id,
     async getIdToken() {
@@ -190,6 +191,12 @@ export function syntheticSdk({ restoredUser = false, token = 'synthetic-id-token
       if (calls.tokenMode === 'fail') throw new Error('synthetic token failure');
       if (calls.tokenGate) await calls.tokenGate.promise;
       return value;
+    },
+    async getIdTokenResult() {
+      calls.tokenResults += 1;
+      if (calls.tokenMode === 'fail') throw new Error('synthetic token failure');
+      if (calls.tokenGate) await calls.tokenGate.promise;
+      return { claims: typeof claims === 'function' ? claims(id) : (claims ?? {}) };
     },
   });
   const user = makeUser(uid, token);

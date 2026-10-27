@@ -5,6 +5,7 @@
 //   - W4 テスト用プロンプト: コピー（または手動確認）＋「貼り付けて次へ」で4（受信状態の確認）を解放。再適用は4〜6を戻す。前stepの再表示は証跡を消さない。
 //   - W5 固定文の送信: 編集欄なし、固定文の正本から5項目のPOST（nonce/Bearer）、二重クリック1件、deliveredだけでは進まず本人の一致確認で6へ。失敗/中止/未送信は確認不可、不明は確認可。
 //   - W6 運用用プロンプト: コピー＋「貼り付けて完了」で完了文面と手順7。7の自由送信は5の証跡やセットアップ完了を変えない。
+//   - W18/W19 右上の省略: 手順1は保存済みログインの明示復元（claimsの検証、失敗は手順1）、2/3/5/6/7の省略はdoneと別、4は必須。
 //   - W17 自由送信（手順7）: 通信前の入力検証、入力どおりの本文、二重クリック1件、固定4本文のような制限なし、後続resetで7も封鎖。
 //   - W16 受信状態の確認: 明示1回GET、subscribed＋allowedだけが5を開く。linked・不明・権限なし・古い結果は通さない。受信の喪失は4以降を戻す。
 //   - W7 解除: 確認→1回POST→2以降を戻して再確認。
@@ -1211,4 +1212,107 @@ test('W17 free send in step 7: pre-flight input checks send nothing; the typed t
   await settle();
   assert.equal(ui.api().length, posts, 'the handler refuses while step 7 is locked');
   results.W17 = { posts: ui.api().length };
+});
+
+const PROJECT_ID = WEB.projectId;
+const appleClaims = (uid) => ({ aud: PROJECT_ID, iss: `https://securetoken.google.com/${PROJECT_ID}`, sub: uid, firebase: { sign_in_provider: 'apple.com' } });
+
+test('W18 skips: the top-right skip of step 1 resumes a saved Apple sign-in only on an explicit click; steps 2/3/5/6 can be skipped but step 4 has no skip and still needs the explicit subscribed+allowed check before any send; skipped steps stay distinct from done and the banner says some steps are unconfirmed; step 7 skip is refused while a send is unsettled; a sign-in change resets everything', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk({ restoredUser: true, claims: appleClaims });
+  const { state, onFetch } = helper('linked');
+  const ui = await runConsole({ html: html('en'), onFetch, sdk });
+  const { el } = ui;
+  assert.deepEqual([sdk.calls.loads, sdk.calls.tokenResults, ui.fetches.length], [0, 0, 0], 'no SDK and no automatic resume on load');
+  for (const n of [1, 2, 3, 5, 6, 7]) assert.equal(el('sttd-skip-' + n).parent.id, 'sttd-panel-' + n, `skip ${n} sits in its panel`);
+  assert.deepEqual([el('sttd-skip-4'), el('sttd-required-4').textContent, el('sttd-required-4').parent.id], [undefined, EN('wizard.required'), 'sttd-panel-4'], 'step 4 is required: no skip control');
+  assert.deepEqual([1, 2, 3, 5, 6, 7].map((n) => el('sttd-skip-' + n).disabled), [false, true, true, true, true, true]);
+  el('sttd-skip-2').onclick();
+  el('sttd-skip-5').onclick();
+  assert.deepEqual([ui.stepState(2), ui.stepState(5)], ['locked', 'locked'], 'locked skips do nothing even through the handler');
+  // 手順1: 明示操作で保存済みのAppleログインを復元（popup・signOut・通信なし）。
+  assert.equal(el('sttd-skip-1').click(), true);
+  await settle();
+  assert.deepEqual([ui.stepState(1), ui.stepState(2), sdk.calls.popups, sdk.calls.signOuts, sdk.calls.tokenResults, ui.fetches.length], ['skipped', 'current', 0, 0, 1, 0]);
+  assert.equal(el('sttd-account-text').textContent, EN('wizard.resumeDone'));
+  // 2/3を省略しても、4の明示確認（subscribed＋allowed）までは送信できない。
+  el('sttd-skip-2').click();
+  await settle();
+  el('sttd-skip-3').click();
+  await settle();
+  assert.deepEqual([2, 3, 4, 5].map(ui.stepState), ['skipped', 'skipped', 'current', 'locked']);
+  assert.equal(el('sttd-copy-result-test').textContent, '', 'skipping step 3 does not claim a copy');
+  el('sttd-test-send').onclick();
+  el('sttd-send').onclick();
+  await settle();
+  assert.equal(ui.api().length, 0, 'no send before step 4');
+  el('sttd-receive-check').click();
+  await settle();
+  assert.deepEqual([ui.stepState(4), ui.stepState(5)], ['current', 'locked'], 'linked does not pass step 4');
+  state.connection = 'subscribed';
+  el('sttd-receive-check').click();
+  await settle();
+  assert.deepEqual([ui.stepState(4), ui.stepState(5)], ['done', 'current']);
+  // 5/6の省略は確認済みと区別し、bannerは未確認ありの文面。
+  el('sttd-skip-5').click();
+  await settle();
+  el('sttd-skip-6').click();
+  await settle();
+  assert.deepEqual([5, 6, 7].map(ui.stepState), ['skipped', 'skipped', 'current']);
+  assert.deepEqual([el('sttd-complete').hidden, el('sttd-complete').textContent], [false, EN('wizard.completeSkipped')]);
+  assert.equal(el('sttd-verify-send').disabled, true, 'no match was confirmed');
+  // 7: 結果不明の送信がある間は省略できず、証跡（結果・同ID確認）は残る。
+  state.mode = 'fail';
+  el('sttd-text').value = 'free after skips';
+  el('sttd-send').click();
+  await settle();
+  state.mode = 'deliver';
+  assert.deepEqual([el('sttd-result').textContent, el('sttd-check').hidden, el('sttd-skip-7').disabled], [EN('console.unknown'), false, true]);
+  el('sttd-skip-7').onclick();
+  assert.equal(el('sttd-result').textContent, EN('console.unknown'), 'the unsettled send stays visible');
+  el('sttd-check').click();
+  await settle();
+  assert.equal(el('sttd-skip-7').disabled, false, 'once settled, step 7 can be skipped');
+  const posts = ui.api().filter((entry) => entry.url === '/v2/commands').length;
+  el('sttd-skip-7').click();
+  await settle();
+  assert.deepEqual([el('sttd-wizard-note').textContent, ui.api().filter((entry) => entry.url === '/v2/commands').length], [EN('wizard.skip7Done'), posts], 'skipping step 7 sends nothing');
+  // 省略した5は戻って実施できる（6が省略のままなのでbannerは未確認ありのまま）。
+  assert.equal(ui.clickPanel(5), true);
+  el('sttd-test-send').click();
+  await settle();
+  el('sttd-verify-send').click();
+  await settle();
+  assert.deepEqual([ui.stepState(5), el('sttd-complete').textContent], ['done', EN('wizard.completeSkipped')]);
+  // 別accountへの切替で、省略と完了をすべて戻す。
+  sdk.changeUser('uid-b');
+  await settle();
+  assert.deepEqual([1, 2, 3, 4, 5, 6, 7].map(ui.stepState), ['current', 'locked', 'locked', 'locked', 'locked', 'locked', 'locked']);
+  assert.equal(el('sttd-complete').hidden, true);
+  results.W18 = { posts: ui.api().length };
+});
+
+test('W19 the step 1 skip stays in step 1 with guidance when there is no saved sign-in, the token cannot be refreshed, or the claims do not match this deployment or the Apple method; nothing is signed out, no popup and no request', { timeout: 20_000 }, async () => {
+  const cases = [
+    ['none', { restoredUser: false, claims: appleClaims }, 'wizard.resumeNone'],
+    ['expired', { restoredUser: true, claims: appleClaims, fail: true }, 'wizard.resumeFailed'],
+    ['project', { restoredUser: true, claims: (uid) => ({ ...appleClaims(uid), aud: 'other-project' }) }, 'wizard.resumeMismatch'],
+    ['issuer', { restoredUser: true, claims: (uid) => ({ ...appleClaims(uid), iss: 'https://securetoken.google.com/other-project' }) }, 'wizard.resumeMismatch'],
+    ['tenant', { restoredUser: true, claims: (uid) => ({ ...appleClaims(uid), firebase: { sign_in_provider: 'apple.com', tenant: 't1' } }) }, 'wizard.resumeMismatch'],
+    ['provider', { restoredUser: true, claims: (uid) => ({ ...appleClaims(uid), firebase: { sign_in_provider: 'custom' }, sttd_dlc: 1 }) }, 'wizard.resumeMismatch'],
+    ['subject', { restoredUser: true, claims: (uid) => ({ ...appleClaims(uid), sub: 'someone-else' }) }, 'wizard.resumeMismatch'],
+    ['code uid', { restoredUser: true, uid: 'sttdc_' + 'A'.repeat(32), claims: appleClaims }, 'wizard.resumeMismatch'],
+  ];
+  for (const [name, options, key] of cases) {
+    const sdk = syntheticSdk(options);
+    if (options.fail) sdk.calls.tokenMode = 'fail';
+    const { onFetch } = helper();
+    const ui = await runConsole({ html: html('en'), onFetch, sdk });
+    const before = ui.el('sttd-skip-1');
+    before.click();
+    await settle();
+    assert.deepEqual([ui.stepState(1), ui.stepState(2), ui.el('sttd-account-text').textContent], ['current', 'locked', EN(key)], name);
+    assert.deepEqual([sdk.calls.popups, sdk.calls.signOuts, ui.fetches.length], [0, 0, 0], `${name}: nothing else happens`);
+    if (options.restoredUser) assert.notEqual(sdk.auth.currentUser, null, `${name}: the saved sign-in is kept`);
+  }
+  results.W19 = { cases: cases.length };
 });

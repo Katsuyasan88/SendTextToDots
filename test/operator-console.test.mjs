@@ -345,7 +345,7 @@ const gate = () => {
 
 const CODE_UID = `sttdc_${'A'.repeat(32)}`;
 
-async function runConsoleWithOperator({ onOperator, restoredCode = false } = {}) {
+async function runConsoleWithOperator({ onOperator, restoredCode = false, restoredClaims = null, restoredHold = null } = {}) {
   const html = consoleAsset('/console', WEB, {
     nonce: NONCE,
     secure: false,
@@ -355,7 +355,17 @@ async function runConsoleWithOperator({ onOperator, restoredCode = false } = {})
   }).body;
   const dom = domFromHtml(html);
   const base = syntheticSdk();
-  const codeUser = { uid: CODE_UID, async getIdToken() { return 'synthetic-code-id-token'; } };
+  const codeUser = {
+    uid: CODE_UID,
+    async getIdToken() {
+      return 'synthetic-code-id-token';
+    },
+    // 保存済みのコードログイン（Firebase persistence）のID token claims。restoredHoldで応答を遅らせる。
+    async getIdTokenResult() {
+      if (restoredHold) await restoredHold.promise;
+      return { claims: restoredClaims ?? {} };
+    },
+  };
   if (restoredCode) base.auth.currentUser = codeUser;
   const custom = { calls: 0, hold: null, tokens: [] };
   const sdk = {
@@ -612,4 +622,54 @@ test('B9 after the code sign-in a failed reissue keeps the connection; a success
   assert.deepEqual([1, 2, 3, 4, 5, 6].map(ui.stepState), ['current', 'locked', 'locked', 'locked', 'locked', 'locked'], 'cancel locks step 2 and later');
   assert.equal(ui.el('sttd-code-reissue').hidden, true);
   assert.equal(ui.fetches.filter((f) => !f.url.startsWith('/v1/operator/')).length, 0, 'no upstream call');
+});
+
+const FAMILY = '12345678-1234-4123-8123-123456789abc';
+const codeClaims = (over = {}) => ({ aud: WEB.projectId, iss: `https://securetoken.google.com/${WEB.projectId}`, sub: CODE_UID, firebase: { sign_in_provider: 'custom' }, sttd_dlc: 1, sttd_fam: FAMILY, ...over });
+
+test('B10 skip in step 1 resumes a saved code sign-in only when the token claims match this deployment and the code method; no popup, sign-out, issue or code request; reissue/cancel/confirm stay hidden because the helper does not own that session', async () => {
+  const ui = await runConsoleWithOperator({ restoredCode: true, restoredClaims: codeClaims(), onOperator: async () => issuedJson() });
+  await ui.click('sttd-method-code');
+  assert.equal(ui.fetches.length, 0, 'selecting does not issue');
+  await ui.click('sttd-skip-1');
+  assert.deepEqual([ui.stepState(1), ui.stepState(2)], ['skipped', 'current']);
+  assert.deepEqual([ui.base.calls.popups, ui.base.calls.signOuts, ui.custom.calls, ui.fetches.length], [0, 0, 0, 0], 'no popup, sign-out, custom token or code request');
+  assert.equal(ui.base.auth.currentUser.uid, CODE_UID);
+  for (const id of ['sttd-code-reissue', 'sttd-code-cancel', 'sttd-code-confirm']) assert.equal(ui.el(id).hidden, true, `${id} hidden`);
+  assert.equal(ui.el('sttd-refresh').hidden, false, 'the normal connection check is used');
+  for (const n of [3, 4, 5, 6, 7]) assert.equal(ui.stepState(n), 'locked', `step ${n}`);
+  // UIDの接頭辞だけでは信用しない: marker・family・project・tenant・providerのどれかが違えば手順1に留まり、保存済みログインも消さない。
+  for (const [name, claims] of [['marker', codeClaims({ sttd_dlc: undefined })], ['family', codeClaims({ sttd_fam: 'not-a-family' })], ['project', codeClaims({ aud: 'other-project' })], ['tenant', codeClaims({ firebase: { sign_in_provider: 'custom', tenant: 't1' } })], ['provider', codeClaims({ firebase: { sign_in_provider: 'apple.com' } })], ['subject', codeClaims({ sub: 'sttdc_' + 'B'.repeat(32) })]]) {
+    const bad = await runConsoleWithOperator({ restoredCode: true, restoredClaims: claims, onOperator: async () => issuedJson() });
+    await bad.click('sttd-method-code');
+    await bad.click('sttd-skip-1');
+    assert.deepEqual([bad.stepState(1), bad.stepState(2), bad.base.calls.signOuts, bad.base.calls.popups, bad.custom.calls, bad.fetches.length], ['current', 'locked', 0, 0, 0, 0], name);
+    assert.equal(bad.base.auth.currentUser.uid, CODE_UID, `${name}: the saved sign-in is not signed out`);
+  }
+  // Apple方式で保存済みのコードログインを復元しようとしても通さない（Appleへの変換・popup・発行なし）。
+  const apple = await runConsoleWithOperator({ restoredCode: true, restoredClaims: codeClaims(), onOperator: async () => issuedJson() });
+  await apple.click('sttd-skip-1');
+  assert.deepEqual([apple.stepState(2), apple.base.calls.popups, apple.base.calls.signOuts, apple.fetches.length], ['locked', 0, 0, 0]);
+  // 復元の途中で方式を変えた古い結果は採らない。
+  const hold = gate();
+  const late = await runConsoleWithOperator({ restoredCode: true, restoredClaims: codeClaims(), restoredHold: hold, onOperator: async () => issuedJson() });
+  await late.click('sttd-method-code');
+  late.el('sttd-skip-1').click();
+  await settle();
+  await late.click('sttd-method-apple');
+  hold.release();
+  for (let i = 0; i < 4; i += 1) await settle();
+  assert.deepEqual([late.stepState(1), late.stepState(2), late.fetches.length], ['current', 'locked', 0], 'the stale result unlocks nothing');
+});
+
+test('B11 a code issued on this page after a resume keeps its own controls and is not cancelled by the resume path', async () => {
+  const ui = await runConsoleWithOperator({ restoredCode: true, restoredClaims: codeClaims(), onOperator: async (action) => (action === 'issue' ? issuedJson() : { status: 200, json: { state: 'pending' } }) });
+  await ui.click('sttd-method-code');
+  await ui.click('sttd-method-continue');
+  assert.equal(ui.stepState(2), 'current');
+  const cancels = () => ui.fetches.filter((entry) => entry.url.endsWith('/cancel')).length;
+  await ui.click('sttd-panel-1');
+  await ui.click('sttd-skip-1');
+  assert.deepEqual([ui.stepState(1), ui.stepState(2), cancels()], ['skipped', 'current', 0], 'resuming does not cancel the issued code');
+  assert.deepEqual([ui.el('sttd-code-reissue').hidden, ui.el('sttd-code-cancel').hidden], [false, false], 'the code issued on this page keeps its controls');
 });
