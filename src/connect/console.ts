@@ -631,6 +631,12 @@ function applyLanguage() {
   if (document.documentElement) document.documentElement.lang = lang;
   document.title = T('console.title');
   for (const node of document.querySelectorAll('[data-sttd-i18n]')) node.textContent = T(node.dataset.sttdI18n);
+  // operator modeでない時の方式欄（scriptなし）は、両言語の文言をdata属性で持つ
+  for (const id of ['sttd-method-title', 'sttd-code-not-configured']) {
+    const node = el(id);
+    const text = node ? node.getAttribute('data-sttd-text-' + lang) : null;
+    if (typeof text === 'string' && text !== '') node.textContent = text;
+  }
   el('sttd-text').placeholder = T('console.textPlaceholder');
   render();
 }

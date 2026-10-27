@@ -156,8 +156,10 @@ export function renderOperatorSection(input: {
   const lang = isLanguage(input.language) ? input.language : DEFAULT_LANGUAGE;
   const t = (key: OperatorTextKey) => escapeHtml(OPERATOR_TEXT[lang][key]);
   if (!input.enabled) {
-    return `<section id="sttd-method" aria-labelledby="sttd-method-title"><h3 id="sttd-method-title">${t('methodTitle')}</h3>
-<p id="sttd-code-not-configured">${t('notConfigured')}</p></section>`;
+    // scriptの無い表示だけの分岐: 両言語の文言をdata属性で持ち、本体の言語切替がそれを使って差し替える
+    const both = (key: OperatorTextKey) => ` data-sttd-text-en="${escapeHtml(OPERATOR_TEXT.en[key])}" data-sttd-text-ja="${escapeHtml(OPERATOR_TEXT.ja[key])}"`;
+    return `<section id="sttd-method" aria-labelledby="sttd-method-title"><h3 id="sttd-method-title"${both('methodTitle')}>${t('methodTitle')}</h3>
+<p id="sttd-code-not-configured"${both('notConfigured')}>${t('notConfigured')}</p></section>`;
   }
   const data = ` data-sttd-operator-nonce="${escapeHtml(input.nonce)}" data-sttd-operator-language="${lang}" data-sttd-operator-firebase="${escapeHtml(JSON.stringify(input.web))}"`;
   return `<section id="sttd-method"${data}>

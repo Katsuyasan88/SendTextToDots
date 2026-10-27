@@ -334,7 +334,7 @@ test('U4 operator mode puts the method choice first in step 1; Apple guidance an
 import vm from 'node:vm';
 import { randomUUID } from 'node:crypto';
 import { consoleAsset, CONSOLE_SCRIPT } from '../dist/connect/console.js';
-import { domFromHtml, SDK_LOADER_LINE, settle, syntheticSdk } from './fixtures/console-browser.mjs';
+import { domFromHtml, runConsole, SDK_LOADER_LINE, settle, syntheticSdk } from './fixtures/console-browser.mjs';
 
 /** 保留して後から解放する合成の待ち。 */
 const gate = () => {
@@ -728,4 +728,19 @@ test('B13 the operator controls follow the page language: initial ja, then a liv
   assert.deepEqual(shown(), labels(JA), 'live en→ja');
   assert.equal(ui.el('sttd-code-message').textContent, JA.pending);
   assert.deepEqual(snapshot(), before);
+});
+
+test('B14 without operator mode, the not-configured method section follows a live ja→en→ja language switch; nothing is fetched and the SDK is not loaded', async () => {
+  const html = consoleAsset('/console', WEB, { nonce: NONCE, secure: false, language: 'ja', operatorSection: renderOperatorSection({ language: 'ja', enabled: false, nonce: NONCE, web: WEB }) }).body;
+  const sdk = syntheticSdk();
+  const ui = await runConsole({ html, onFetch: async () => ({ status: 500, json: {} }), sdk });
+  const shown = () => [ui.el('sttd-method-title').textContent, ui.el('sttd-code-not-configured').textContent];
+  assert.deepEqual(shown(), [OPERATOR_TEXT.ja.methodTitle, OPERATOR_TEXT.ja.notConfigured], 'initial ja');
+  ui.el('sttd-lang-en').click();
+  await settle();
+  assert.deepEqual(shown(), [OPERATOR_TEXT.en.methodTitle, OPERATOR_TEXT.en.notConfigured], 'live ja→en');
+  ui.el('sttd-lang-ja').click();
+  await settle();
+  assert.deepEqual(shown(), [OPERATOR_TEXT.ja.methodTitle, OPERATOR_TEXT.ja.notConfigured], 'live en→ja');
+  assert.deepEqual([ui.fetches.length, sdk.calls.loads], [0, 0]);
 });
