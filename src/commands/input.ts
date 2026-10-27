@@ -96,7 +96,7 @@ function readPrimitive(text: string, start: number): { value: Primitive; end: nu
  * 最上位のobjectを自前で読む。key名はescapeを解いた後の名前で比べ、5項目以外と、同じ名前の2回目（値が同じでも）を拒否する。
  * JSON.parseの後勝ちには頼らない。文字列の中のquote・波括弧・keyらしい並びは、文字列tokenとして読み飛ばす。
  */
-function readMembers(text: string): Map<string, Primitive> {
+function readMembers(text: string, names: ReadonlySet<string> = FIELD_NAMES): Map<string, Primitive> {
   const members = new Map<string, Primitive>();
   let at = skipWhitespace(text, 0);
   if (text[at] !== '{') throw invalid();
@@ -106,7 +106,7 @@ function readMembers(text: string): Map<string, Primitive> {
   } else {
     for (;;) {
       const name = readString(text, at);
-      if (!FIELD_NAMES.has(name.value) || members.has(name.value)) throw invalid();
+      if (!names.has(name.value) || members.has(name.value)) throw invalid();
       at = skipWhitespace(text, name.end);
       if (text[at] !== ':') throw invalid();
       const member = readPrimitive(text, skipWhitespace(text, at + 1));
@@ -158,13 +158,22 @@ function timestampMs(value: Primitive | undefined): number {
   return Date.UTC(year, month - 1, day, hour, minute, second, Number((match[7] ?? '').padEnd(3, '0')));
 }
 
+/** 平文の送信の「wire検査」: 1〜8192バイト・BOMなし・fatal UTF-8・5項目だけの重複なしJSON object。論理検査はvalidateMembers。 */
 function validate(idempotencyKey: string, rawBody: Buffer): ValidatedCommandInput {
   if (!Buffer.isBuffer(rawBody) || rawBody.length < 1 || rawBody.length > MAX_COMMAND_BODY_BYTES) throw invalid();
   if (typeof idempotencyKey !== 'string' || !UUID_PATTERN.test(idempotencyKey)) throw invalid();
   if (rawBody.length >= 3 && rawBody[0] === 0xef && rawBody[1] === 0xbb && rawBody[2] === 0xbf) throw invalid();
-  const members = readMembers(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(rawBody));
+  return validateMembers(idempotencyKey, readMembers(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(rawBody)));
+}
+
+/**
+ * 「論理5項目の検査」（平文・暗号文の共用）: 型・版・commandIdとIdempotency-Key・本文（4096バイト・空/空白のみ・孤立surrogate）・
+ * 日時の表記と60秒。JSON escapeの後の8192バイトの上限はwire検査の側だけで、ここでは見ない。
+ */
+function validateMembers(idempotencyKey: string, members: ReadonlyMap<string, Primitive>): ValidatedCommandInput {
+  if (typeof idempotencyKey !== 'string' || !UUID_PATTERN.test(idempotencyKey)) throw invalid();
   // 5項目以外と重複は読取りで拒否済みなので、個数が合えば5項目がちょうど1つずつある。
-  if (members.size !== FIELD_NAMES.size) throw invalid();
+  if (members.size !== FIELD_NAMES.size || ![...members.keys()].every((name) => FIELD_NAMES.has(name))) throw invalid();
 
   if (members.get('schemaVersion') !== 2) throw invalid();
   const commandId = uuid(members.get('commandId'));
@@ -197,6 +206,39 @@ function validate(idempotencyKey: string, rawBody: Buffer): ValidatedCommandInpu
 export function validateCommandInput(idempotencyKey: string, rawBody: Buffer): ValidatedCommandInput {
   try {
     return validate(idempotencyKey, rawBody);
+  } catch {
+    throw invalid();
+  }
+}
+
+/**
+ * 暗号文の経路の論理5項目（復号したtextと、認証済みprotected headerの元表記のcommandId/createdAt/expiresAt）を、平文と同じ論理検査・
+ * 同じcanonicalへ通す。値は正規化しない。失敗は固定のCommandApiError('invalid_request')だけ。
+ */
+export function validateCommandFields(
+  idempotencyKey: string,
+  fields: { readonly schemaVersion: unknown; readonly commandId: unknown; readonly text: unknown; readonly createdAt: unknown; readonly expiresAt: unknown },
+): ValidatedCommandInput {
+  try {
+    const members = new Map<string, Primitive>();
+    for (const name of FIELD_NAMES) {
+      const value = (fields as Record<string, unknown>)[name];
+      if (typeof value !== 'string' && typeof value !== 'number') throw invalid();
+      members.set(name, value);
+    }
+    return validateMembers(idempotencyKey, members);
+  } catch {
+    throw invalid();
+  }
+}
+
+/**
+ * 重複key（escapeを解いた後の名前で比べる）・許可外のkey・object/配列の値を拒否する、平らなJSON objectの読取り（平文の本文と同じ部品）。
+ * 暗号文のprotected header用。失敗は固定のCommandApiError('invalid_request')。
+ */
+export function readFlatJsonObject(text: string, names: ReadonlySet<string>): ReadonlyMap<string, string | number | boolean | null> {
+  try {
+    return readMembers(text, names);
   } catch {
     throw invalid();
   }

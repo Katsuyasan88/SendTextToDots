@@ -98,7 +98,7 @@ Do not commit real configuration values or secrets to public Git; keep them in a
 <a id="payload-encryption"></a>
 ## Key storage for payload encryption (off by default, in development)
 
-In the current version, enabling it adds [fetching your own public key](API_EN.md#encryption-key) (`GET /v2/encryption-key`) to the send API. Sending encrypted text and reissuing keys are not provided yet. The dedicated secret is read only by the send API (Functions) runtime, and only for requests that need to create a key or protect it again. It is not read at startup, and the MCP service and operator screens never read it. If it cannot be read, only the fetch returns `503` and plaintext sending continues. When omitted or `'off'`, no new secret is needed, no secret is read, no key is created, and the fetch entry returns `404`.
+In the current version, enabling it adds [fetching your own public key](API_EN.md#encryption-key) (`GET /v2/encryption-key`) and [sending encrypted text](API_EN.md#encrypted-commands) (`POST /v2/encrypted-commands`) to the send API. Reissuing keys is not provided yet. The dedicated secret is read only by the send API (Functions) runtime, and only for requests that need to create a key, protect it again or decrypt encrypted text. It is not read at startup, and the MCP service and operator screens never read it. If it cannot be read, only the fetch returns `503` and plaintext sending continues. When omitted or `'off'`, no new secret is needed, no secret is read, no key is created, and the fetch entry returns `404`.
 
 The enabled form (all items required, no extra keys):
 

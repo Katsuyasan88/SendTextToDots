@@ -636,7 +636,7 @@ async function startWith(config: Captured): Promise<OwnedDevelopmentDeliveryFunc
         clock,
         namespace: config.deliveryNamespace,
         ...(config.log !== undefined ? { log: config.log } : {}),
-        ...(encryption !== undefined ? { encryptionKeys: encryption.endpoint } : {}),
+        ...(encryption !== undefined ? { encryptionKeys: encryption.endpoint, encryptedCommands: encryption.commands } : {}),
       };
       owned.app = createIngressKmsRequestDeliveryFunction({ ...appOptions, ingress: config.ingress });
     } finally {

@@ -15,6 +15,7 @@ import {
   type EgressResponse,
   type PinnedAddress,
 } from './transport.js';
+import { MAX_SIGNED_EVENT_BYTES } from '../policy.js';
 import { parseIp } from './ip-policy.js';
 
 /** DNS・接続・TLS・本文読取りを通した絶対期限の上限。 */
@@ -22,8 +23,8 @@ export const EGRESS_MAX_DEADLINE_MS = 10_000;
 /** 応答本文の上限（バイト）。 */
 export const EGRESS_MAX_RESPONSE_BYTES = 8192;
 const MAX_URL_LENGTH = 2048;
-/** 指示の配送の本文（eventのUTF-8）の上限（バイト）。 */
-const MAX_COMMAND_BODY_BYTES = 8704;
+/** 指示の配送の本文（eventのUTF-8）の上限（バイト）。送出部品と共通の値（policy.ts）。 */
+const MAX_COMMAND_BODY_BYTES = MAX_SIGNED_EVENT_BYTES;
 
 /** callbackのPOSTで外へ出してよい見出し。これ以外は送らず、要求を拒否する。 */
 const CALLBACK_HEADERS: ReadonlySet<string> = new Set([
@@ -73,7 +74,7 @@ export interface CommandEgressOptions extends EgressOptions {
 
 export interface CommandCallbackPost {
   readonly headers: Readonly<Record<string, string>>;
-  /** 送る本文のbytes（1〜8704）。借りるだけで、書き換えない。 */
+  /** 送る本文のbytes（1〜MAX_SIGNED_EVENT_BYTES=25088）。借りるだけで、書き換えない。 */
   readonly body: Buffer;
 }
 

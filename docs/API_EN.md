@@ -62,7 +62,7 @@ The local send screen `/console` sends the text the user typed into its empty in
 <a id="encryption-key"></a>
 ### Fetching your own public key (payload encryption, off by default)
 
-Available only on deployments that enable payload encryption in the [deployment configuration](CONFIGURATION_EN.md#payload-encryption). On deployments where it is off, the response is `404 not_found`. The current version provides only this fetch; sending encrypted text and reissuing keys are not provided yet.
+Available only on deployments that enable payload encryption in the [deployment configuration](CONFIGURATION_EN.md#payload-encryption). On deployments where it is off, the response is `404 not_found`. The current version provides this fetch and [sending encrypted text](#encrypted-commands) below; reissuing keys is not provided yet.
 
 `GET /v2/encryption-key` (`Authorization: Bearer <Firebase ID token>`, no body or query)
 
@@ -91,6 +91,26 @@ Available only on deployments that enable payload encryption in the [deployment 
 | 409 | `encryption_key_unavailable` | The key has not been used for 90 days and is unavailable. It is not recreated automatically |
 | 429 | `rate_limited` | Too many fetch attempts (60 per minute and 1000 per UTC day; first creation 3 per minute and 10 per day). Wait for the `Retry-After` seconds |
 | 503 | `temporarily_unavailable` | Temporary failure of storage, the protection key or the processing deadline. A failure of the dedicated protection key does not stop plaintext sending. Failures of components shared with existing sending, such as the shared database, can affect plaintext sending as before |
+
+<a id="encrypted-commands"></a>
+### Sending encrypted text (payload encryption, off by default)
+
+`POST /v2/encrypted-commands` (`Authorization: Bearer <Firebase ID token>`, `Content-Type: application/jose`, `Idempotency-Key: <commandId>`). On deployments where it is off, the response is `404`.
+
+- The body is only the ASCII of a five-segment JWE Compact Serialization (RFC 7516), 12288 bytes or less in total. Only `alg` `RSA-OAEP-256` and `enc` `A256GCM` are accepted. The CEK is 32 random bytes per request and the IV is 12 bytes. RSA-OAEP uses SHA-256 for both the hash and MGF1 with an empty label. base64url is unpadded.
+- The protected header has exactly these nine items: `{"alg":"RSA-OAEP-256","enc":"A256GCM","typ":"sttd-command+jwe","kid":"<fetched kid>","sttdVersion":1,"scope":"<fetched scope>","commandId":"<UUID>","createdAt":"<time>","expiresAt":"<time>"}`. Duplicate or unknown items, compression (`zip`) and other algorithms are rejected. The AAD is the ASCII bytes of the protected header segment, so all nine items are authenticated.
+- The encrypted plaintext is only the UTF-8 of the `text` to send (4096 bytes or less; empty or whitespace-only is not allowed). The conditions on `commandId`, `createdAt` and `expiresAt` and the match with `Idempotency-Key` are the same as plaintext sending. Line breaks, whitespace and Unicode representation arrive unchanged.
+- The body of the signed event sent to Dots is at most 25088 bytes, separate from the receive limits (including the case where every character of a 4096-byte text expands to a JSON `\u00XX` escape). This API does not guarantee that the receiver (Dots) accepts this size.
+- The response is the same status response as plaintext sending (`commandId`/`state` etc.). With the same `commandId` and the same content, sending as plaintext, encrypted, re-encrypted or with another key converges to the same state and is not delivered twice. Different content returns `409 idempotency_conflict`. Use `/v2/commands/{commandId}` for status and cancellation.
+
+| status | `error.code` | Meaning |
+| --- | --- | --- |
+| 400 | `invalid_encrypted_request` | Shape, limits, cryptographic authentication or the content checks failed, or the key belongs to someone else or is unknown. The reason is not distinguished |
+| 409 | `encryption_key_unavailable` | Your key was revoked or is unavailable. It is refused without opening. For a request you already sent, first query its status with `GET /v2/commands/{commandId}`. When the result is unknown, do not automatically resend with a new ID or an extended expiry. Fetch the public key again separately when needed |
+| 429 | `rate_limited` | Too many decryption attempts (30 per minute and 1000 per UTC day; malformed requests, key mismatches and failures also count). Separate from the delivery count limit |
+| 503 | `temporarily_unavailable` | Temporary failure of storage, the protection key or the processing deadline. A failure of the dedicated protection key does not stop plaintext sending |
+
+401, 403 and `409 connection_required` are the same as fetching the public key. A body larger than 12288 bytes returns `400 invalid_encrypted_request` before identity verification or attempt counting. Other existing responses (`422` for time and expiry, `429` for the delivery count) are the same as plaintext sending.
 
 ## 3. Send screen and connection state
 

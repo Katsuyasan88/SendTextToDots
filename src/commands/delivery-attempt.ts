@@ -13,9 +13,10 @@ import { types } from 'node:util';
 import { parseEgressUrl, type CommandCallbackPost, type CommandEgressOptions } from '../egress/safe-egress.js';
 import { EgressError, type CommandEgressResponse } from '../egress/transport.js';
 import { signCommandBody } from '../events/signing.js';
-import type { Clock } from '../policy.js';
+import { MAX_SIGNED_EVENT_BYTES, type Clock } from '../policy.js';
 
-const MAX_EVENT_BYTES = 8704;
+/** 署名eventの上限（安全送出と共通の値。policy.ts）。 */
+const MAX_EVENT_BYTES = MAX_SIGNED_EVENT_BYTES;
 const MAX_URL_LENGTH = 2048;
 const SECRET_MIN_BYTES = 24;
 const SECRET_MAX_BYTES = 64;
@@ -71,7 +72,7 @@ export interface CommandDeliveryAttemptOptions {
 }
 
 export interface CommandDeliveryRequest {
-  /** 送るeventのUTF-8（1〜8704バイト）。借りるだけで、書き換えない。 */
+  /** 送るeventのUTF-8（1〜MAX_SIGNED_EVENT_BYTES=25088バイト）。借りるだけで、書き換えない。 */
   readonly eventBytes: Buffer;
   readonly eventId: string;
   readonly subscriptionId: string;

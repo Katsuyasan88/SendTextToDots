@@ -111,6 +111,8 @@ gcloud secrets versions add "$DIGEST_SECRET" --project="$PROJECT_ID" --data-file
 
 Record the returned numbered versions in the deployment configuration as `projects/<PROJECT_NUMBER>/secrets/<SECRET_ID>/versions/<N>`. Do not copy the payloads into logs, issues or the source, and confirm that each version is enabled and that the runtime SA has the required read permission.
 
+Only if you use payload encryption (off by default), create one more dedicated secret, separate from the four above. Its value is 32 random bytes as unpadded base64url (43 characters). Grant read permission on that secret only to the send API runtime SA (not to the MCP runtime SA). For the configuration, see [Key storage for payload encryption](CONFIGURATION_EN.md#payload-encryption). If you keep it off, this step is not needed.
+
 ### Create the KMS subscription marker
 
 At startup both services require that `sttdAuth/<kms.namespace>/config/kms-subscription` matches the configuration exactly. It is not created or repaired automatically. In the Console of the chosen Firestore database, go to collection `sttdAuth` → document `<kms.namespace>` → subcollection `config` → document `kms-subscription`, and create only the following fields.

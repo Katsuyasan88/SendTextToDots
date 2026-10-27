@@ -17,6 +17,7 @@ import type { HttpsFunction } from 'firebase-functions/https';
 import { createCommandDeliveryAttempt, type CommandDeliveryAttempt, type CommandDeliveryEgress } from '../commands/delivery-attempt.js';
 import type { ConnectStorage } from '../connect/firestore.js';
 import type { EncryptionKeyEndpoint } from '../encryption/api.js';
+import type { EncryptedCommandEndpoint, ValidatedCommandDelivery } from '../encryption/commands.js';
 import type { IdentityVerifier, VerifiedIdentity } from '../identity/firebase.js';
 import type { Clock } from '../policy.js';
 import type { SecretHasher } from '../secrets.js';
@@ -25,7 +26,7 @@ import { createRequestDeliveryFunction } from './functions.js';
 import { createKmsRequestDeliveryRuntime, type KmsRequestDeliveryRuntime, type KmsRequestDeliveryRuntimeOptions } from './kms-runtime.js';
 
 const REQUIRED = ['db', 'connect', 'hasher', 'digestKey', 'kms', 'identity', 'egress', 'clock', 'namespace', 'ingress'] as const;
-const OPTIONAL = ['log', 'encryptionKeys'] as const;
+const OPTIONAL = ['log', 'encryptionKeys', 'encryptedCommands'] as const;
 
 export type KmsDeliveryFunctionErrorCode = 'delivery_function_invalid' | 'delivery_function_close_failed';
 
@@ -59,6 +60,8 @@ export interface KmsRequestDeliveryFunctionOptions {
   readonly log?: ((entry: Record<string, unknown>) => void) | undefined;
   /** 本文暗号化が有効な配置だけ: 公開鍵取得のport（借用。HTTP入口が形を検査する）。無ければ/v2/encryption-keyは404。 */
   readonly encryptionKeys?: EncryptionKeyEndpoint | undefined;
+  /** 本文暗号化が有効な配置だけ: 共通配送service（postValidated）から暗号文送信のportを作る関数（組立て時に1回だけ呼ぶ）。 */
+  readonly encryptedCommands?: ((delivery: ValidatedCommandDelivery) => EncryptedCommandEndpoint) | undefined;
 }
 
 export interface KmsRequestDeliveryFunction {
@@ -104,6 +107,16 @@ function methodOf(target: unknown, name: string): (...args: unknown[]) => unknow
     holder = Object.getPrototypeOf(holder);
   }
   throw invalid();
+}
+
+/** 暗号文送信のportを、このruntimeの共通配送service（postValidated、thisを保つ）から1回だけ作る。関数でなければ不正。 */
+function encryptedCommandsOf(factory: unknown, runtime: KmsRequestDeliveryRuntime): EncryptedCommandEndpoint {
+  if (typeof factory !== 'function' || types.isProxy(factory)) throw invalid();
+  const service = runtime.service;
+  const delivery: ValidatedCommandDelivery = Object.freeze({
+    postValidated: (...args: Parameters<ValidatedCommandDelivery['postValidated']>) => service.postValidated(...args),
+  });
+  return Reflect.apply(factory as Function, undefined, [delivery]) as EncryptedCommandEndpoint;
 }
 
 /**
@@ -180,6 +193,7 @@ export function createIngressKmsRequestDeliveryFunction(options: KmsRequestDeliv
       log,
       lifetime: lifetime.signal,
       ...(fields.has('encryptionKeys') ? { encryptionKeys: fields.get('encryptionKeys') as EncryptionKeyEndpoint } : {}),
+      ...(fields.has('encryptedCommands') ? { encryptedCommands: encryptedCommandsOf(fields.get('encryptedCommands'), runtime) } : {}),
     };
     handler = createRequestDeliveryFunction(createIngressOperationDeliveryRequestHandler({ ...apiDeps, ingress }));
   } catch {

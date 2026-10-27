@@ -27,6 +27,11 @@ export const PRODUCT_POLICY: AuthPolicy = Object.freeze({
 export const MAX_BODY_BYTES = 4096;
 /** POST /v2/commandsだけの本文上限（バイト）。値の正本は docs/API.md §2。 */
 export const MAX_COMMAND_BODY_BYTES = 8192;
+/**
+ * 内部で組み立てて送る署名event（指示の配送の本文）の上限（バイト）。受信の上限（平文8192・暗号文12288）とは別。
+ * 本文4096バイトの全文字がJSONの`\u00XX`（6バイト）へ展開されても収まるよう、4096×6＋固定envelope 512 = 25088。
+ */
+export const MAX_SIGNED_EVENT_BYTES = 4096 * 6 + 512;
 /** /mcpの本文上限（バイト）。callback URLとsecretを含む購読要求が収まる値。 */
 export const MAX_MCP_BODY_BYTES = 16 * 1024;
 

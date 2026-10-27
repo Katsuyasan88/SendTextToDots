@@ -62,7 +62,7 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 <a id="encryption-key"></a>
 ### 本人の公開鍵の取得（本文暗号化、既定off）
 
-[配置設定](CONFIGURATION.md#payload-encryption)で本文暗号化を有効にした配置だけで使えます。offの配置では`404 not_found`です。現在の版で提供するのはこの取得だけで、暗号文の送信と鍵の再発行はまだ提供していません。
+[配置設定](CONFIGURATION.md#payload-encryption)で本文暗号化を有効にした配置だけで使えます。offの配置では`404 not_found`です。現在の版で提供するのはこの取得と下の[暗号文の送信](#encrypted-commands)で、鍵の再発行はまだ提供していません。
 
 `GET /v2/encryption-key`（`Authorization: Bearer <Firebase ID token>`、本文・queryなし）
 
@@ -91,6 +91,26 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 | 409 | `encryption_key_unavailable` | 鍵が90日間使われず利用できない。自動では作り直しません |
 | 429 | `rate_limited` | 取得の試行が多すぎる（1分60回・UTCの1日1000回、初回の作成は1分3回・1日10回）。`Retry-After`の秒数だけ待ってください |
 | 503 | `temporarily_unavailable` | 保存・保護鍵・処理期限の一時的な障害。専用の保護鍵の障害で平文の送信を止めることはありません。共有のデータベースなど、既存の送信と共通の部品の障害は、従来どおり平文の送信にも影響することがあります |
+
+<a id="encrypted-commands"></a>
+### 暗号文の送信（本文暗号化、既定off）
+
+`POST /v2/encrypted-commands`（`Authorization: Bearer <Firebase ID token>`、`Content-Type: application/jose`、`Idempotency-Key: <commandId>`）。offの配置では`404`です。
+
+- 本文はJWE Compact Serialization（RFC 7516）の5セグメントのASCIIだけで、全体12288byte以下です。`alg`は`RSA-OAEP-256`、`enc`は`A256GCM`だけを受け付けます。CEKは要求ごとに32byteの乱数、IVは12byteで、RSA-OAEPのhashとMGF1はSHA-256、labelは空です。base64urlはpaddingなしです。
+- protected headerはちょうど次の9項目です。`{"alg":"RSA-OAEP-256","enc":"A256GCM","typ":"sttd-command+jwe","kid":"<取得したkid>","sttdVersion":1,"scope":"<取得したscope>","commandId":"<UUID>","createdAt":"<日時>","expiresAt":"<日時>"}`。重複・未知の項目、圧縮（`zip`）、他の方式は拒否します。AADはprotected headerセグメントのASCII bytesで、9項目は全て暗号の認証の対象です。
+- 暗号化する平文は送る`text`のUTF-8だけです（4096byte以下、空・空白のみは不可）。`commandId`・`createdAt`・`expiresAt`の条件と`Idempotency-Key`との一致は、平文の送信と同じです。改行・空白・Unicodeの表現は変えずに届きます。
+- Dotsへ送る署名付きeventの本文は、受信の上限とは別に最大25088byteです（本文4096byteの全文字がJSONの`\u00XX`へ展開される場合を含む）。受信側（Dots）がこの大きさを受け付けるかは、このAPIでは保証しません。
+- 応答は平文の送信と同じ状態応答（`commandId`/`state`等）です。同じ`commandId`で同じ内容なら、平文・暗号文・暗号化し直し・別の鍵のどれで送っても同じ状態に収束し、重複して送りません。内容が違えば`409 idempotency_conflict`です。状態の照会・取消は`/v2/commands/{commandId}`を使います。
+
+| status | `error.code` | 意味 |
+| --- | --- | --- |
+| 400 | `invalid_encrypted_request` | 形・上限・暗号の認証・本文の検査のどれかが不成立、または他人や未知の鍵。理由は区別しません |
+| 409 | `encryption_key_unavailable` | 自分の鍵が失効したか、利用できない。開けずに拒否します。既に送った要求は、まず`GET /v2/commands/{commandId}`で状態を照会してください。結果が分からない時に、新しいIDや延ばした期限で自動的に送り直さないでください。必要な公開鍵の取り直しは、それとは別に行ってください |
+| 429 | `rate_limited` | 復号の試行が多すぎる（1分30回・UTCの1日1000回。形の不正・鍵の不一致・失敗も数えます）。配送件数の上限とは別です |
+| 503 | `temporarily_unavailable` | 保存・保護鍵・処理期限の一時的な障害。専用の保護鍵の障害で平文の送信を止めることはありません |
+
+401・403・`409 connection_required`は公開鍵の取得と同じです。12288byteを超える本文は、本人確認や試行の計数の前に`400 invalid_encrypted_request`になります。それ以外の既存の応答（`422`の時刻・期限、配送件数の`429`）は平文の送信と同じです。
 
 ## 3. 送信画面と接続状態
 

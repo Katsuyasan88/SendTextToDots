@@ -70,6 +70,11 @@ export type CommitOutcome =
 /** commit応答不明の後の採用read。 */
 export type AdoptedOutcome = AdmissionDenied | { readonly kind: 'key_expired' } | { readonly kind: 'absent' } | { readonly kind: 'adopted'; readonly ring: RingRecord };
 
+export type DecryptBeginOutcome =
+  | AdmissionDenied
+  | { readonly kind: 'rate_limited'; readonly retryAfterSec: number }
+  | { readonly kind: 'admitted'; readonly binding: RingBinding; readonly ring: RingRecord | null; readonly now: number };
+
 /** dispatch（T073）が渡す暗号文経路だけの鍵の証拠。 */
 export interface KeyEvidence {
   readonly binding: RingBinding;
@@ -210,6 +215,31 @@ export class EncryptionKeyStore {
     });
   }
 
+  /**
+   * 暗号文の受付（T073）: 認可→ring/controlsを読み、復号試行rate（分30/UTC日1000）を復号・形式検査の前に予約する（429は非消費）。
+   * ringは作らない・補完しない（POSTで鍵を初期化しない）。無活動期限を延ばさない。返すringは開封の準備に使うsnapshotで、
+   * 送出の可否はdispatchのtransactionでcheckKeyEvidenceが最新状態で決める。
+   */
+  async beginDecrypt(identityHash: string, scopeOf: (ownerId: string) => string, live: Live): Promise<DecryptBeginOutcome> {
+    return this.#run(live, async (tx): Promise<DecryptBeginOutcome> => {
+      const admission = await this.#admit(tx, identityHash, live);
+      if (admission.kind !== 'admitted') return admission;
+      const binding: RingBinding = { identityHash, ownerId: admission.ownerId, scope: scopeOf(admission.ownerId) };
+      const ringSnapshot = await this.#get(tx, this.#ringRef(binding.scope), live);
+      const controlsRef = this.#controlsRef(binding.scope);
+      const controlsSnapshot = await this.#get(tx, controlsRef, live);
+      const now = this.#now();
+      const ring = this.#ringOf(ringSnapshot, binding);
+      const controls = this.#controlsOf(controlsSnapshot, binding);
+      const used = consumeRate(controls.windows.decrypt, 'decrypt', now);
+      if ('retryAfterSec' in used) return { kind: 'rate_limited', retryAfterSec: used.retryAfterSec };
+      if (ring !== null) this.#ringExpired(ring, now);
+      live();
+      tx.set(controlsRef, { ...controls, windows: { ...controls.windows, decrypt: used.next } });
+      return { kind: 'admitted', binding, ring, now };
+    });
+  }
+
   /** 最新の認可を再確認し、束縛（ownerId）が同じ時だけadmittedを返す。 */
   async #readmit(tx: Transaction, binding: RingBinding, live: Live): Promise<Admitted | AdmissionDenied> {
     const admission = await this.#admit(tx, binding.identityHash, live);
@@ -275,12 +305,34 @@ export class EncryptionKeyStore {
   }
 
   /**
+   * 暗号文の送信が今回の要求で配送として確定した時だけ（呼出し側が判定）、同じ元operation・最新の認可の範囲でringの最終利用を更新する。
+   * 鍵がその時点で使えない・ringが無い・期限切れ・認可の拒否なら書かない。generation・鍵は変えない。失敗は呼出し側が無視する
+   * （応答の状態を変えない。非同期の再試行はしない）。
+   */
+  async touchAfterDelivery(binding: RingBinding, kid: string, live: Live): Promise<boolean> {
+    return this.#run(live, async (tx): Promise<boolean> => {
+      const admission = await this.#readmit(tx, binding, live);
+      if (admission.kind !== 'admitted') return false;
+      const ringRef = this.#ringRef(binding.scope);
+      const ring = this.#ringOf(await this.#get(tx, ringRef, live), binding);
+      const now = this.#now();
+      if (ring === null || this.#ringExpired(ring, now)) return false;
+      const key = ring.keys.find((entry) => entry.kid === kid);
+      if (key === undefined || !keyUsable(ring, key, now) || now <= ring.lastUsedAt) return false;
+      live();
+      tx.set(ringRef, { ...ring, lastUsedAt: now });
+      return true;
+    });
+  }
+
+  /**
    * 呼出し元（暗号文のdispatch）のtransactionの中で、証拠のring/scope/owner/identityHash/kidと鍵状態・期限を最新snapshotで確かめる。
    * 別transactionで確認してからdispatchする使い方をしない。不正schemaはEncryptionRecordError。
    */
-  async checkKeyEvidence(tx: Transaction, evidence: KeyEvidence, now: number): Promise<KeyEvidenceVerdict> {
-    if (!isTime(now)) throw new EncryptionUnavailableError();
+  async checkKeyEvidence(tx: Transaction, evidence: KeyEvidence): Promise<KeyEvidenceVerdict> {
     const ring = this.#ringOf(await tx.get(this.#ringRef(evidence.binding.scope)), evidence.binding);
+    // 猶予・無活動の期限は、鍵の読取りを待った後の最新時刻で判断する（読取り前の時刻を使わない）。
+    const now = this.#now();
     if (ring === null) return 'unknown_key';
     const key = ring.keys.find((entry) => entry.kid === evidence.kid);
     if (key === undefined) return 'unknown_key';

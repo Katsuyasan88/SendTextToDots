@@ -31,7 +31,7 @@ import {
   type DispatchDecision,
   type PublicState,
 } from './contract.js';
-import { captureOperation, KmsDeliveryOperationError, liveNow, type FinalState, type KmsPrepareDecision, type KmsRequestDeliveryStore, type TransactionOp } from './kms-store.js';
+import { captureOperation, KmsDeliveryOperationError, liveNow, type DispatchKeyCheck, type FinalState, type KmsPrepareDecision, type KmsRequestDeliveryStore, type TransactionOp } from './kms-store.js';
 import { buildEventBytes, errorResponse, eventIdFor, type DeliveryResponse } from './event.js';
 
 const DIGEST_PURPOSE = 't257:command-digest';
@@ -216,6 +216,42 @@ export class KmsRequestDeliveryService {
     } catch {
       return errorResponse(400, 'invalid_request');
     }
+    return this.#accept(ownerId, input, receivedAt, parent, until, undefined);
+  }
+
+  /**
+   * 暗号文の経路: 復号と論理5項目の検査（validateCommandFields）を済ませた入力から、平文と同じdigest・期限・準備・送出・結果へ進む。
+   * parentOperation（HTTP要求の元期限・中断）は必須で、受信時刻・元期限を取り直さない。keyCheckは送出権のtransactionの中で鍵の最新状態を
+   * 照合する（暗号文/nonce/kidはdigestへ混ぜない）。inputのcanonicalBytesはここで0埋めする。
+   */
+  async postValidated(
+    ownerId: string,
+    input: ValidatedCommandInput,
+    receivedAt: number,
+    parentOperation: KmsDeliveryParentOperation,
+    keyCheck: DispatchKeyCheck,
+  ): Promise<DeliveryResponse> {
+    try {
+      if (this.#d.lifetime.aborted) return unavailable();
+      const parent = parentOf(parentOperation);
+      if (parent === 'invalid' || parent === null) return unavailable();
+      const until = this.#until(receivedAt, parent);
+      if (until === undefined || this.#parentStopped(parent, until)) return unavailable();
+      return await this.#accept(ownerId, input, receivedAt, parent, until, keyCheck);
+    } finally {
+      input.canonicalBytes.fill(0);
+    }
+  }
+
+  async #accept(
+    ownerId: string,
+    input: ValidatedCommandInput,
+    receivedAt: number,
+    parent: Parent | null,
+    until: number,
+    keyCheck: DispatchKeyCheck | undefined,
+  ): Promise<DeliveryResponse> {
+    const { store, clock } = this.#d;
     const digest = createHmac('sha256', this.#d.digestKey).update(DIGEST_PURPOSE).update('\0').update(input.canonicalBytes).digest('hex');
     input.canonicalBytes.fill(0);
     const { commandId, fields } = input;
@@ -268,7 +304,7 @@ export class KmsRequestDeliveryService {
         case 'prepared':
           break;
       }
-      return await this.#deliver(ownerId, commandId, commandKey, attemptId, fields, decision, until, controller);
+      return await this.#deliver(ownerId, commandId, commandKey, attemptId, fields, decision, until, controller, keyCheck);
     } finally {
       release();
     }
@@ -298,6 +334,7 @@ export class KmsRequestDeliveryService {
     prepared: Extract<KmsPrepareDecision, { readonly kind: 'prepared' }>,
     until: number,
     controller: AbortController,
+    keyCheck: DispatchKeyCheck | undefined,
   ): Promise<DeliveryResponse> {
     const { store, clock, hooks, lifetime } = this.#d;
     const doc = prepared.doc;
@@ -373,7 +410,10 @@ export class KmsRequestDeliveryService {
       let dispatch: DispatchDecision | undefined;
       try {
         const evidence = prepared.previous && { sealed: prepared.previous.sealed, secretHash: prepared.previous.secretHash };
-        dispatch = await store.dispatch(ownerId, commandKey, attemptId, evidence, { deadlineAt: limit, signal });
+        dispatch =
+          keyCheck === undefined
+            ? await store.dispatch(ownerId, commandKey, attemptId, evidence, { deadlineAt: limit, signal })
+            : await store.dispatch(ownerId, commandKey, attemptId, evidence, { deadlineAt: limit, signal }, keyCheck);
       } catch {
         dispatch = undefined;
       }

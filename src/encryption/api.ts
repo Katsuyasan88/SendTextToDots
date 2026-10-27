@@ -14,6 +14,7 @@ import type { DeliveryRequestOperation } from '../delivery/api.js';
 import { errorResponse, type DeliveryResponse } from '../delivery/event.js';
 import type { VerifiedIdentity } from '../identity/firebase.js';
 import type { SecretHasher } from '../secrets.js';
+import { createEncryptedCommandEndpoint, type EncryptedCommandEndpoint, type ValidatedCommandDelivery } from './commands.js';
 import { createEncryptionSecretProvider, createGoogleEncryptionSecretSource } from './secret-provider.js';
 import { EncryptionKeyService, type KeyServiceOutcome } from './service.js';
 import { EncryptionKeyStore } from './store.js';
@@ -84,6 +85,8 @@ export interface EncryptionKeyRuntimeOptions {
 
 export interface EncryptionKeyRuntime {
   readonly endpoint: EncryptionKeyEndpoint;
+  /** 暗号文送信のport（共通配送serviceへ接続する。同じdb・hasher・専用Secret）。 */
+  readonly commands: (delivery: ValidatedCommandDelivery) => EncryptedCommandEndpoint;
   /** 同期・冪等。専用Secretのadapterを閉じる（進行中はcancel、以後の読取り0）。 */
   dispose(): void;
 }
@@ -102,19 +105,19 @@ export function createEncryptionKeyRuntime(options: EncryptionKeyRuntimeOptions)
     writeSecretVersion: setting.writeSecretVersion,
     clock,
   });
-  const service = new EncryptionKeyService({
-    environment: {
-      projectId: deployment.projectId,
-      projectNumber: deployment.projectNumber,
-      databaseId: deployment.databaseId,
-      connectNamespace: deployment.connectNamespace,
-      deliveryNamespace: deployment.deliveryNamespace,
-      encryptionNamespace: setting.namespace,
-    },
-    store,
-    secrets: createEncryptionSecretProvider(source, policy),
-    hasher: options.hasher,
-    clock,
+  const environment = {
+    projectId: deployment.projectId,
+    projectNumber: deployment.projectNumber,
+    databaseId: deployment.databaseId,
+    connectNamespace: deployment.connectNamespace,
+    deliveryNamespace: deployment.deliveryNamespace,
+    encryptionNamespace: setting.namespace,
+  };
+  const secrets = createEncryptionSecretProvider(source, policy);
+  const service = new EncryptionKeyService({ environment, store, secrets, hasher: options.hasher, clock });
+  return Object.freeze({
+    endpoint: createEncryptionKeyEndpoint(service),
+    commands: (delivery: ValidatedCommandDelivery) => createEncryptedCommandEndpoint({ environment, store, secrets, hasher: options.hasher, clock, delivery }),
+    dispose: () => source.dispose(),
   });
-  return Object.freeze({ endpoint: createEncryptionKeyEndpoint(service), dispose: () => source.dispose() });
 }

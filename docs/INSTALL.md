@@ -111,6 +111,8 @@ gcloud secrets versions add "$DIGEST_SECRET" --project="$PROJECT_ID" --data-file
 
 返された数値版を`projects/<PROJECT_NUMBER>/secrets/<SECRET_ID>/versions/<N>`で配置設定へ記録します。payloadをログ/issue/ソースへ転記せず、各版が有効でruntime SAに必要な読取り権限があることを確認します。
 
+本文暗号化（既定off）を使う場合だけ、上の4つとは別の専用secretを1つ作ります。値は32byteの乱数のbase64url（paddingなし43文字）です。読取り権限は送信APIのruntime SAだけに、そのsecretを対象として与えます（MCPのruntime SAには与えません）。配置設定の書き方は[本文暗号化の鍵保存](CONFIGURATION.md#payload-encryption)を参照してください。offのままなら、この手順は不要です。
+
 ### KMS購読のmarkerを作る
 
 起動時、両serviceは`sttdAuth/<kms.namespace>/config/kms-subscription`が設定と完全一致することを要求します。作成・修復は自動で行いません。選択したFirestore databaseのConsoleでcollection `sttdAuth` → document `<kms.namespace>` → subcollection `config` → document `kms-subscription`の順に進み、次のfieldだけを作ります。

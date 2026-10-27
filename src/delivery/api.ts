@@ -3,6 +3,7 @@
 //   GET  /v2/commands/{commandId}     読取りだけ。不在と他ownerは同じ404
 //   POST /v2/commands/{commandId}/cancel
 //   GET  /v2/encryption-key           本人の公開鍵（本文暗号化が有効な配置だけ。offは404。body・queryは400）
+//   POST /v2/encrypted-commands       暗号文（application/jose、12288byte以下）。平文と同じ状態応答（offは404）
 // 旧v1の3 routeはroute外（404 not_found、serviceを呼ばない）。新旧の変換・redirectはしない。
 // 公開鍵の取得は検証済みidentityだけを鍵service（encryption/api.ts）へ渡す。ownerはserviceが作らずに読む（findOwnerは呼ばない）。
 // 本人確認はBearer Firebase ID token（verifyIdToken・失効確認・apple.com）だけで、UID→ownerは接続保存（ConnectStorage.findOwner）から引く
@@ -17,6 +18,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { types } from 'node:util';
 
 import type { EncryptionKeyEndpoint } from '../encryption/api.js';
+import { ENCRYPTED_CONTENT_TYPE, ENCRYPTED_WIRE_MAX_BYTES, type EncryptedCommandEndpoint } from '../encryption/commands.js';
 import { IdentityError, type IdentityVerifier, type VerifiedIdentity } from '../identity/firebase.js';
 import { MAX_COMMAND_BODY_BYTES, type Clock } from '../policy.js';
 import { isRealSignal } from '../protection/google-sdk-call.js';
@@ -26,6 +28,7 @@ const BEARER_ID_TOKEN = /^Bearer ([A-Za-z0-9._-]{1,4096})$/;
 const UUID = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
 const COMMAND_PATH = new RegExp(`^/v2/commands/(${UUID})(/cancel)?$`);
 const ENCRYPTION_KEY_PATH = '/v2/encryption-key';
+const ENCRYPTED_COMMANDS_PATH = '/v2/encrypted-commands';
 
 /** onRequestのreqが持つwireの本文。 */
 export type DeliveryRequest = IncomingMessage & { readonly rawBody?: Buffer | undefined };
@@ -98,6 +101,8 @@ export interface IngressOperationDeliveryApiDeps {
   readonly ingress: () => DeliveryHttpIngress;
   /** 本文暗号化が有効な配置だけ: 本人の公開鍵取得（frozenでown dataの`get`関数を持つobject）。無ければ/v2/encryption-keyは404。 */
   readonly encryptionKeys?: EncryptionKeyEndpoint | undefined;
+  /** 本文暗号化が有効な配置だけ: 暗号文の送信（frozenでown dataの`post`関数を持つobject）。無ければ/v2/encrypted-commandsは404。 */
+  readonly encryptedCommands?: EncryptedCommandEndpoint | undefined;
 }
 
 /** depsの不正（ingress sourceが関数でない・Proxy・accessor）。固定のmessageだけ。 */
@@ -245,21 +250,37 @@ export function createIngressOperationDeliveryRequestHandler(deps: IngressOperat
   }
   const source = descriptor.value as Function;
   const encryptionKeys = captureEncryptionKeys(deps);
-  return buildOperationHandler(deps, () => Reflect.apply(source, undefined, []) as unknown, encryptionKeys);
+  const encryptedCommands = captureEncryptedCommands(deps);
+  return buildOperationHandler(deps, () => Reflect.apply(source, undefined, []) as unknown, encryptionKeys, encryptedCommands);
 }
 
-/** 任意のencryptionKeys（欠落/undefinedは無効）。own dataのfrozen objectで、own dataの`get`関数だけを捕捉する（Proxy・accessorは拒否）。 */
-function captureEncryptionKeys(deps: object): EncryptionKeyEndpoint | undefined {
-  const descriptor = Object.getOwnPropertyDescriptor(deps, 'encryptionKeys');
+/** 任意のport（欠落/undefinedは無効）。own dataのfrozen objectで、own dataのmethod関数だけを捕捉する（Proxy・accessorは拒否）。 */
+function capturePort(deps: object, name: string, method: string): ((...args: unknown[]) => unknown) | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(deps, name);
   if (descriptor === undefined) return undefined;
   if (!('value' in descriptor)) throw new DeliveryIngressConfigError();
   const value: unknown = descriptor.value;
   if (value === undefined) return undefined;
   if (typeof value !== 'object' || value === null || types.isProxy(value) || !Object.isFrozen(value)) throw new DeliveryIngressConfigError();
-  const get = Object.getOwnPropertyDescriptor(value, 'get');
-  if (get === undefined || !('value' in get) || typeof get.value !== 'function' || types.isProxy(get.value)) throw new DeliveryIngressConfigError();
-  const fn = get.value as Function;
-  return Object.freeze({ get: (identity: VerifiedIdentity, operation: DeliveryRequestOperation) => Reflect.apply(fn, value, [identity, operation]) as Promise<DeliveryResponse> });
+  const own = Object.getOwnPropertyDescriptor(value, method);
+  if (own === undefined || !('value' in own) || typeof own.value !== 'function' || types.isProxy(own.value)) throw new DeliveryIngressConfigError();
+  const fn = own.value as Function;
+  return (...args: unknown[]) => Reflect.apply(fn, value, args);
+}
+
+function captureEncryptionKeys(deps: object): EncryptionKeyEndpoint | undefined {
+  const get = capturePort(deps, 'encryptionKeys', 'get');
+  return get === undefined ? undefined : Object.freeze({ get: (identity: VerifiedIdentity, operation: DeliveryRequestOperation) => get(identity, operation) as Promise<DeliveryResponse> });
+}
+
+function captureEncryptedCommands(deps: object): EncryptedCommandEndpoint | undefined {
+  const post = capturePort(deps, 'encryptedCommands', 'post');
+  return post === undefined
+    ? undefined
+    : Object.freeze({
+        post: (identity: VerifiedIdentity, key: string | undefined, wire: Buffer, receivedAt: number, operation: DeliveryRequestOperation) =>
+          post(identity, key, wire, receivedAt, operation) as Promise<DeliveryResponse>,
+      });
 }
 
 /** 1つの要求の開始（受信時刻・元期限・timerの残り・結ぶ親signal）。不成立はundefined（固定503）。 */
@@ -297,6 +318,7 @@ function buildOperationHandler(
   deps: IngressOperationDeliveryApiDeps,
   ingress: () => unknown,
   encryptionKeys: EncryptionKeyEndpoint | undefined,
+  encryptedCommands: EncryptedCommandEndpoint | undefined,
 ): (req: DeliveryRequest, res: ServerResponse) => Promise<void> {
   const { identity, findOwner, service, clock, lifetime } = deps;
   const log = (entry: Record<string, unknown>) => {
@@ -364,11 +386,13 @@ function buildOperationHandler(
       label = path === '/v2/commands' ? 'commands.post' : match ? (match[2] ? 'commands.cancel' : 'commands.get') : 'not_found';
       // 公開鍵の取得は暗号化が有効な配置だけ（offは他の未知pathと同じ404。鍵service・Secretを呼ばない）。
       if (path === ENCRYPTION_KEY_PATH && encryptionKeys !== undefined) label = 'encryption_key.get';
+      if (path === ENCRYPTED_COMMANDS_PATH && encryptedCommands !== undefined) label = 'encrypted_commands.post';
       if (label === 'not_found') {
         response = errorResponse(404, 'not_found');
         return;
       }
       const allowed = label === 'commands.get' || label === 'encryption_key.get' ? 'GET' : 'POST';
+      const encrypted = label === 'encrypted_commands.post';
       if (method !== allowed) {
         response = errorResponse(405, 'method_not_allowed');
         return;
@@ -384,14 +408,16 @@ function buildOperationHandler(
         return;
       }
       const now = readClock(clock);
-      const read = await operationBodyOf(req, MAX_COMMAND_BODY_BYTES, now === undefined ? 0 : operation.deadlineAt - now, signal);
+      // 暗号文のwireは平文の8192とは別の12288で、超過は本人確認・DB・復号試行の前に読み出しを打ち切って400（暗号処理・rate消費0）。
+      const max = encrypted ? ENCRYPTED_WIRE_MAX_BYTES : MAX_COMMAND_BODY_BYTES;
+      const read = await operationBodyOf(req, max, now === undefined ? 0 : operation.deadlineAt - now, signal);
       if (read === STOPPED || !live()) {
         if (read !== STOPPED && read !== undefined && read.owned) read.body.fill(0);
         response = unavailable();
         return;
       }
       if (read === undefined) {
-        response = errorResponse(400, 'invalid_request');
+        response = errorResponse(400, encrypted ? 'invalid_encrypted_request' : 'invalid_request');
         return;
       }
       try {
@@ -431,13 +457,21 @@ function buildOperationHandler(
   ): Promise<DeliveryResponse> {
     if (label === 'commands.post') {
       if (!isJson(req) || body.length < 1) return errorResponse(400, 'invalid_request');
-    } else if (body.length > 0) {
+    } else if (label !== 'encrypted_commands.post' && body.length > 0) {
       return errorResponse(400, 'invalid_request');
     }
     if (label === 'encryption_key.get') {
       const verified = await verifiedWith(req, operation, live);
       if (!('uid' in verified)) return verified;
       return adopted(() => encryptionKeys!.get(verified, operation), operation, live);
+    }
+    if (label === 'encrypted_commands.post') {
+      const type = header(req, 'content-type');
+      if (type === undefined || !ENCRYPTED_CONTENT_TYPE.test(type.trim()) || body.length < 1) return errorResponse(400, 'invalid_encrypted_request');
+      const verified = await verifiedWith(req, operation, live);
+      if (!('uid' in verified)) return verified;
+      const key = header(req, 'idempotency-key');
+      return adopted(() => encryptedCommands!.post(verified, key, body, receivedAt, operation), operation, live);
     }
     const resolved = await ownerWith(req, operation, live);
     if (typeof resolved !== 'string') return resolved;

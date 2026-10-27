@@ -110,6 +110,12 @@ export interface KmsDeliveryConnect {
   ): 'allowed' | 'denied' | 'unavailable';
 }
 
+/**
+ * 暗号文の経路だけが渡す送出権transaction内の鍵の照合（同じdbのtransactionで読むだけ。書込み0）。使えればtrue。
+ * 平文の経路は渡さない（鍵への依存を加えない）。
+ */
+export type DispatchKeyCheck = (tx: Transaction) => Promise<boolean>;
+
 export interface KmsRequestDeliveryStoreDeps {
   /** 借用したinstance（terminateしない）。全参照はここから作り、connectの参照もこのinstanceのものだけを受け付ける。 */
   readonly db: Firestore;
@@ -283,6 +289,8 @@ interface AuthorizationSnapshot {
   readonly state: KmsMutableState | undefined;
   readonly view: AuthorizationView;
   readonly now: number;
+  /** 同じtransactionで読んだowner/Grant/許可のsnapshotから、指定時刻のviewを作り直す（純粋。DBの再読取り0）。 */
+  readonly viewAt: (now: number) => AuthorizationView;
 }
 
 export class KmsRequestDeliveryStore {
@@ -383,19 +391,14 @@ export class KmsRequestDeliveryStore {
         : connect.grantUseDecision(accessInput, { exists: meta.exists, data: meta.exists ? meta.data() : undefined }, ownerId);
     // 読めない・不正な許可/同意記録は固定の一時障害（許可・拒否のどちらへも読み替えない。送出しない）。
     if (decision !== 'allowed' && decision !== 'denied') throw new DeliveryStateError();
-    return {
-      command,
-      control,
-      ownerRef,
-      state,
-      now,
-      view: {
-        ownerActive: connect.ownerDocActive(owner.data(), now),
-        subscription: state,
-        grantLive: grantId !== undefined && connect.grantDocLive(grantData, ownerId, grantId, now),
-        access: decision,
-      },
-    };
+    const ownerData = owner.data();
+    const viewAt = (at: number): AuthorizationView => ({
+      ownerActive: connect.ownerDocActive(ownerData, at),
+      subscription: state,
+      grantLive: grantId !== undefined && connect.grantDocLive(grantData, ownerId, grantId, at),
+      access: decision,
+    });
+    return { command, control, ownerRef, state, now, view: viewAt(now), viewAt };
   }
 
   /** ownerの処理中参照が、このcommandを指していれば外す。controlDataは同じtransactionで先に読んだ値（ここでは読まない）。 */
@@ -456,6 +459,7 @@ export class KmsRequestDeliveryStore {
     attemptId: string,
     previous: KmsPreviousEvidence | null,
     operation: KmsDeliveryOperation,
+    keyCheck?: DispatchKeyCheck,
   ): Promise<DispatchDecision> {
     let captured: Captured;
     let evidence: KmsPreviousEvidence | null;
@@ -473,8 +477,19 @@ export class KmsRequestDeliveryStore {
       const snapshot = await this.#authorization(tx, captured, ownerId, commandKey, ownerRef);
       const current = parseCommandDoc(snapshot.command.data(), ownerId);
       const controlData = snapshot.control.data();
-      const { now } = snapshot;
-      const decision = decideDispatch(current, snapshot.view, attemptId, evidence?.sealed ?? null, now);
+      let now = snapshot.now;
+      // 暗号文の経路だけ: 同じtransactionの中で鍵ring（同じdb）の最新の本人・scope・kid・状態・期限を読む（期限は鍵の読取り後の最新時刻）。
+      // 使えない鍵は利用不許可と同じく送出権を与えずに終端へ確定する（送出0）。読取りは書込みより前。鍵の読取りを待った後は、
+      // 同じtransactionで読んだowner/Grant/許可のsnapshotから最新時刻でview全体を作り直し（無活動・Grant期限を古い時刻で判定しない）、
+      // 以後の判定もその時刻で行う。
+      let view = snapshot.view;
+      if (keyCheck !== undefined) {
+        const usable = await keyCheck(tx);
+        now = liveNow(this.#d.clock, captured);
+        view = snapshot.viewAt(now);
+        if (!usable) view = { ...view, access: 'denied' };
+      }
+      const decision = decideDispatch(current, view, attemptId, evidence?.sealed ?? null, now);
       liveNow(this.#d.clock, captured);
       if (decision.kind !== 'unchanged') tx.set(this.#commandRef(commandKey), commandDocData(decision.doc));
       if (decision.kind === 'refused') this.#release(tx, ownerId, commandKey, controlData);

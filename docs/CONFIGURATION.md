@@ -98,7 +98,7 @@ serviceへattachしたruntime SAのmetadata資格だけを使います。ロー�
 <a id="payload-encryption"></a>
 ## 本文暗号化の鍵保存（既定off、開発中）
 
-現在の版で有効にすると、送信APIに本人の[公開鍵の取得](API.md#encryption-key)（`GET /v2/encryption-key`）が加わります。暗号文の送信と鍵の再発行はまだ提供していません。専用secretは送信API（Functions）の実行時だけが、鍵の作成や保護し直しが必要な要求のときに読みます。起動時には読まず、MCP・運営者用の画面は読みません。読めない時は取得だけが`503`になり、平文の送信は続きます。省略・`'off'`では新しい秘密は不要で、Secret読取り・鍵作成は行わず、取得の入口は`404`です。
+現在の版で有効にすると、送信APIに本人の[公開鍵の取得](API.md#encryption-key)（`GET /v2/encryption-key`）と[暗号文の送信](API.md#encrypted-commands)（`POST /v2/encrypted-commands`）が加わります。鍵の再発行はまだ提供していません。専用secretは送信API（Functions）の実行時だけが、鍵の作成・保護し直し・暗号文の復号が必要な要求のときに読みます。起動時には読まず、MCP・運営者用の画面は読みません。読めない時は取得だけが`503`になり、平文の送信は続きます。省略・`'off'`では新しい秘密は不要で、Secret読取り・鍵作成は行わず、取得の入口は`404`です。
 
 有効にする場合の形（全項目必須・余分なkeyは不可）:
 
