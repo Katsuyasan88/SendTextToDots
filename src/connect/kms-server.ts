@@ -35,6 +35,18 @@ import type { SubscribeInput, SubscriptionAuth, VerificationSender } from '../ev
 import { assertNoBody, readForm, readJson } from '../http/body.js';
 import type { LogSink } from '../http/log.js';
 import { IdentityError, type IdentityVerifier, type VerifiedIdentity } from '../identity/firebase.js';
+import {
+  createCodeIdentityLookup,
+  createDeveloperCodeExchange,
+  developerCodeEntry,
+  type CodeAuthAdmin,
+  type CodeIdentityLookup,
+  type DeveloperCodeExchange,
+  type DeveloperCodeExchangeDeps,
+} from '../identity/developer-code-identity.js';
+import { DEVELOPER_LOGIN_PURPOSE, defaultRandom, developerLoginKeys } from '../identity/developer-login.js';
+import { DeveloperLoginStore } from '../identity/developer-login-store.js';
+import { connectIdentityHash } from './firestore.js';
 import type { McpEntry, McpRequestOperation, RequestScopedSubscriptionPort } from '../mcp/request-operation.js';
 import { createRequestScopedMcpEntry } from '../mcp/request-scoped-entry.js';
 import { CHATGPT_CIMD_CANDIDATE } from '../oauth/cimd.js';
@@ -88,7 +100,19 @@ const CIMD_TARGETS: ReadonlySet<string> = new Set(['client_metadata', 'jwks', 'o
 const CIMD_OUTCOMES: ReadonlySet<string> = new Set(['fetched', 'reused', 'refused']);
 
 const REQUIRED = ['bindPort', 'db', 'namespace', 'kms', 'secrets', 'identity', 'web', 'clientEgress', 'verificationSender', 'clock', 'publicOrigin'] as const;
-const OPTIONAL = ['log', 'startupOperation'] as const;
+const OPTIONAL = ['log', 'startupOperation', 'developerCode'] as const;
+const DEVELOPER_CODE_KEYS = ['auth', 'databaseId'] as const;
+const DEVELOPER_CODE_OPTIONAL = ['store', 'bindLookup'] as const;
+
+/** 起動ごとに捕捉した開発者向けコードの部品。 */
+interface CapturedDeveloperCode {
+  readonly auth: CodeAuthAdmin;
+  readonly databaseId: string;
+  /** 低levelの注入（試験）。nullなら起動時に読んだidentifierKeyから導く鍵と借用Firestoreで保存層を作る。 */
+  readonly store: DeveloperCodeExchangeDeps['store'] | null;
+  /** 同じ配置の共通verifier（API/MCP）へcode identity照合を結ぶ口（起動口が渡す）。 */
+  readonly bindLookup: ((lookup: CodeIdentityLookup) => void) | null;
+}
 const STARTUP_OPERATION_KEYS = ['deadlineAt', 'signal'] as const;
 const KMS_KEYS = ['environment', 'projectId', 'databaseId', 'namespace', 'cryptoKey', 'writeVersion', 'readVersions', 'transport'] as const;
 const WEB_KEYS = ['apiKey', 'authDomain', 'projectId'] as const;
@@ -176,6 +200,49 @@ export interface KmsConnectServerOptions {
    * 省略時は開始+20秒。親の期限・中断は起動の間だけ見て、成功後の要求は要求固有のoperationを使う。callerのsignalはabortしない。
    */
   readonly startupOperation?: KmsConnectStartupOperation | undefined;
+  /**
+   * 任意（既定off）。開発者向け6桁コードの交換（プラグイン接続画面の入力）。storeは共有Firestoreの予約/identity保存、authは専用UIDの
+   * 作成とcustom token署名だけ。未指定ならコード入力は404で、customのID tokenも受けない（verifier側）。
+   */
+  readonly developerCode?: KmsConnectDeveloperCode | undefined;
+}
+
+export interface KmsConnectDeveloperCode {
+  /** 専用UIDの作成とcustom token署名だけ。 */
+  readonly auth: CodeAuthAdmin;
+  /** 配置設定のFirestore database ID（重複防止の範囲。operator helperと同じ値）。 */
+  readonly databaseId: string;
+  /** 任意の低level注入（試験用）。省略時は起動時のidentifierKeyから導く鍵で共有Firestoreの保存層を作る。 */
+  readonly store?: DeveloperCodeExchangeDeps['store'] | undefined;
+  /** 任意。作った保存層のcode identity照合を、同じ配置の共通verifierへ結ぶ。 */
+  bindLookup?(lookup: CodeIdentityLookup): void;
+}
+
+/**
+ * 開発者向けコードの保存層（機能offはnull）。注入があればそれを使い、無ければidentifierKeyから導いた鍵・借用Firestore・接続保存の
+ * namespaceで作り、code identity照合を共通verifierへ結ぶ（この起動のclosureだけが持つ）。
+ */
+function buildDeveloperCodeStore(
+  developerCode: CapturedDeveloperCode | null,
+  identifierKey: Buffer,
+  db: Firestore,
+  namespace: string,
+  projectId: string,
+  clock: Clock,
+): DeveloperCodeExchangeDeps['store'] | null {
+  if (developerCode === null) return null;
+  if (developerCode.store !== null) return developerCode.store;
+  const keys = developerLoginKeys(identifierKey);
+  const store = new DeveloperLoginStore({
+    db,
+    scope: { projectId, databaseId: developerCode.databaseId, namespace, purpose: DEVELOPER_LOGIN_PURPOSE },
+    hasher: keys.hasher,
+    sealer: keys.sealer,
+    clock,
+    random: defaultRandom,
+  });
+  developerCode.bindLookup?.(createCodeIdentityLookup(store));
+  return store;
 }
 
 /** 起動の親operation（正確なown dataの2key・epoch ms・genuine AbortSignal）。 */
@@ -283,6 +350,8 @@ interface Captured {
   readonly log: (entry: Parameters<LogSink>[0]) => void;
   /** 任意の起動親（捕捉した写し）。省略はnull。 */
   readonly startupParent: KmsConnectStartupOperation | null;
+  /** 開発者向けコード（機能offはnull）。 */
+  readonly developerCode: CapturedDeveloperCode | null;
 }
 
 /** 起動親の捕捉（正確なown dataの2key、安全整数・非負・ISO表現域のepoch ms、genuine AbortSignal）。不正は設定エラー。 */
@@ -340,6 +409,41 @@ function capture(options: unknown): Captured {
 
   const load = methodOf(fields.get('secrets'), 'load');
 
+  // 開発者向けコードの交換（任意。省略＝機能offで/interaction/:uid/codeは固定404）。methodだけを1回取り出して凍結し、この起動の
+  // capturedへ型付きで保存する（借用Firestoreを共有する別の起動・namespace・機能offとは混ざらない）。
+  const developerCodeInput = fields.has('developerCode') ? fields.get('developerCode') : undefined;
+  let developerCode: CapturedDeveloperCode | null = null;
+  if (developerCodeInput !== undefined) {
+    const parts = dataFields(developerCodeInput, DEVELOPER_CODE_KEYS, DEVELOPER_CODE_OPTIONAL, () => new KmsConnectServerConfigError());
+    const authTarget = parts.get('auth');
+    const databaseId = parts.get('databaseId');
+    if (typeof databaseId !== 'string' || !/^(?:\(default\)|[a-z][a-z0-9-]{0,61}[a-z0-9])$/.test(databaseId)) configFail();
+    const createUser = methodOf(authTarget, 'createUser');
+    const createCustomToken = methodOf(authTarget, 'createCustomToken');
+    let store: DeveloperCodeExchangeDeps['store'] | null = null;
+    if (parts.has('store')) {
+      const storeTarget = parts.get('store');
+      const consume = methodOf(storeTarget, 'consume');
+      const fail = methodOf(storeTarget, 'fail');
+      const activate = methodOf(storeTarget, 'activate');
+      store = Object.freeze({
+        consume: (input) => consume(input) as ReturnType<DeveloperCodeExchangeDeps['store']['consume']>,
+        fail: (input) => fail(input) as ReturnType<DeveloperCodeExchangeDeps['store']['fail']>,
+        activate: (input) => activate(input) as ReturnType<DeveloperCodeExchangeDeps['store']['activate']>,
+      } satisfies DeveloperCodeExchangeDeps['store']);
+    }
+    const bind = parts.has('bindLookup') ? methodOf(developerCodeInput, 'bindLookup') : null;
+    developerCode = Object.freeze({
+      databaseId,
+      store,
+      bindLookup: bind === null ? null : (lookup: CodeIdentityLookup) => void bind(lookup),
+      auth: Object.freeze({
+        createUser: (properties) => createUser(properties) as Promise<unknown>,
+        createCustomToken: (uid, claims) => createCustomToken(uid, claims) as Promise<string>,
+      } satisfies CodeAuthAdmin),
+    });
+  }
+
   const identityTarget = fields.get('identity');
   const verifyIdToken = methodOf(identityTarget, 'verifyIdToken');
   const accountStatus = methodOf(identityTarget, 'accountStatus');
@@ -390,6 +494,7 @@ function capture(options: unknown): Captured {
     now,
     log,
     startupParent,
+    developerCode,
   });
 }
 
@@ -516,6 +621,7 @@ const loginBody = z.strictObject({
   idToken: z.string().min(1).max(ID_TOKEN_MAX),
 });
 
+
 /** route処理の結果（context.runの固定unavailableで元の分類を失わないよう、work内で捕捉して運ぶ）。 */
 type RouteOutcome = { readonly ok: true; readonly label: string } | { readonly ok: false; readonly error: unknown };
 /** context.run自身が期限・中止・閉鎖で打ち切った印。 */
@@ -577,6 +683,8 @@ export async function startDevelopmentKmsConnectServer(options: KmsConnectServer
 
 async function startCaptured(config: Captured): Promise<KmsConnectServer> {
   const { db, namespace, policy, identity, web, log } = config;
+  /** この起動だけの開発者向けコード保存層（機能offはnull。秘密の読込み後に作る）。 */
+  let developerCodeStore: DeveloperCodeExchangeDeps['store'] | null = null;
   /** 設定のauthority（`<DNS-host>`）。 */
   const authority = new URL(config.publicOrigin).host;
 
@@ -663,6 +771,8 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       requireKmsMarker(marker.data(), policy);
 
       const hasher = createHmacHasher(keys.identifierKey);
+      // 開発者向けコード（この起動だけの部品）。保存層の鍵はidentifierKeyからHKDFで用途分離して導く（同じ配置のAPI・operator helperも同じ）。
+      developerCodeStore = buildDeveloperCodeStore(config.developerCode, keys.identifierKey, db, namespace, identity.projectId, clock);
       // AS payload・UIDの封緘は、所有contextのcurrentを要求ごとのoperationにするKMS port（namespaceだけ接続保存のt256）。
       const box = createConnectKmsSealingPort({ kms: { ...kmsConfig(), namespace, clock }, operation: context.current });
       const storage = new ConnectStorage({
@@ -945,7 +1055,7 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       const { language, headers } = pageLanguage(req, url);
       const html =
         opened.ownerId === null
-          ? renderInteractionLogin(web, uid, label, opened.csrf, language)
+          ? renderInteractionLogin(web, uid, label, opened.csrf, language, developerExchange() !== null)
           : renderInteractionConsent(web, uid, label, opened.csrf, language);
       send(res, 200, 'text/html; charset=utf-8', html, { ...pageSecurityHeaders(web), ...headers });
     }
@@ -970,6 +1080,64 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       alive();
       res.writeHead(204, BASE_HEADERS);
       res.end();
+    }
+
+    /** 開発者向けコードの交換（機能offはnull）。接続保存と同じidentity HMACで予定UID1件の利用許可の位置を決める。 */
+    /** この起動のcaptured部品と保存層だけで1回組む（別の起動・機能offとは共有しない）。 */
+    let developerCodeExchange: DeveloperCodeExchange | null | undefined;
+    function developerExchange(): DeveloperCodeExchange | null {
+      if (developerCodeExchange !== undefined) return developerCodeExchange;
+      const parts = config.developerCode;
+      const store = developerCodeStore;
+      // 機能onで保存層がまだ無い（起動完了前）間は組まずにoffとして扱い、固定しない。
+      if (parts !== null && store === null) return null;
+      developerCodeExchange =
+        parts === null || store === null
+          ? null
+          : createDeveloperCodeExchange({
+              store,
+              auth: parts.auth,
+              accessIdentityHash: (codeUid: string) => connectIdentityHash(hasher, namespace, { projectId: identity.projectId, uid: codeUid }),
+              clock,
+            });
+      return developerCodeExchange;
+    }
+
+    /**
+     * プラグイン接続画面のコード入力。Origin・interaction cookie・CSRFをコード消費の前に確かめ、成功時だけ同originの応答へcustom tokenを
+     * 返す（browserはFirebase SDKでログインし、既存の/loginへID tokenを送る＝通常の同意・購読を省略しない）。
+     * 不存在/期限切れ/使用済み/取消は同じcode_rejected、制限429、SDK/DB障害503。コード・UID・tokenを記録しない。
+     */
+    async function codeInteraction(req: IncomingMessage, res: ServerResponse, uid: string): Promise<void> {
+      const entry = await developerCodeEntry(req, uid, {
+        exchange: developerExchange(),
+        origin: issuerUrl.origin,
+        checkInteraction: async () => {
+          await browserInteraction(req, res, uid);
+        },
+        csrfAccepts: (csrf) => guarded(() => storage.interactionAccepts(uid, csrf)),
+        sourceKey: req.socket.remoteAddress ?? 'unknown',
+      });
+      alive();
+      if (entry.kind === 'not_found') throw apiErrors.notFound();
+      if (entry.kind === 'forbidden') throw apiErrors.forbidden();
+      if (entry.kind === 'invalid_request') throw apiErrors.invalidRequest();
+      if (entry.kind === 'link_unavailable') throw apiErrors.linkUnavailable();
+      const { outcome } = entry;
+      log({ event: 'interaction.code', category: outcome.kind === 'token' ? 'exchanged' : outcome.kind });
+      switch (outcome.kind) {
+        case 'token':
+          sendJson(res, 200, { customToken: outcome.customToken });
+          return;
+        case 'rate_limited':
+          throw new ApiError(429, 'rate_limited');
+        case 'rejected':
+          throw new ApiError(400, 'code_rejected');
+        case 'failed':
+          throw new ApiError(503, 'code_failed');
+        default:
+          throw apiErrors.temporarilyUnavailable();
+      }
     }
 
     /** 同意の利用許可の拒否: 固定の日英案内（403。owner・UID・Grant・世代を出さない）。 */
@@ -1058,7 +1226,7 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         }
       }
 
-      const interactionMatch = /^\/interaction\/([A-Za-z0-9_-]{1,128})(?:\/(login|consent|deny))?$/.exec(path);
+      const interactionMatch = /^\/interaction\/([A-Za-z0-9_-]{1,128})(?:\/(login|consent|deny|code))?$/.exec(path);
       if (interactionMatch) {
         const uid = interactionMatch[1]!;
         switch (interactionMatch[2]) {
@@ -1074,6 +1242,10 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
             only('POST');
             await consentInteraction(req, res, uid, url);
             return 'interaction.consent';
+          case 'code':
+            only('POST');
+            await codeInteraction(req, res, uid);
+            return 'interaction.code';
           default:
             only('POST');
             await denyInteraction(req, res, uid);

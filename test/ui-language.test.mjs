@@ -217,7 +217,7 @@ test('L3 rendering: every page carries html lang, title and body in the selected
 test('L7 OAuth access refusal: the login script shows the not-permitted message only for the fixed 403 access_denied (other 403 / malformed / other failures keep the existing message); the consent refusal page is a fixed bilingual notice without forms, CSRF or identifiers', async () => {
   const IMPORTS = [
     `import { initializeApp } from 'https://www.gstatic.com/firebasejs/13.0.0/firebase-app.js';`,
-    `import { getAuth, OAuthProvider, signInWithPopup, signOut } from 'https://www.gstatic.com/firebasejs/13.0.0/firebase-auth.js';`,
+    `import { getAuth, OAuthProvider, signInWithCustomToken, signInWithPopup, signOut } from 'https://www.gstatic.com/firebasejs/13.0.0/firebase-auth.js';`,
   ];
   for (const line of IMPORTS) assert.ok(INTERACTION_SCRIPT.includes(line), 'the fixed SDK imports are present');
   const source = IMPORTS.reduce((text, line) => text.replace(line, ''), INTERACTION_SCRIPT);
@@ -234,6 +234,9 @@ test('L7 OAuth access refusal: the login script shows the not-permitted message 
       OAuthProvider: class {},
       signInWithPopup: async () => {
         throw new Error('no popup in this test');
+      },
+      signInWithCustomToken: async () => {
+        throw new Error('no code sign-in in this test');
       },
       signOut: async () => {},
     });

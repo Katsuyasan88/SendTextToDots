@@ -145,6 +145,14 @@ export type AccessDisplay = 'allowed' | 'denied' | 'unavailable';
 
 export { AccessUnavailableError };
 
+/**
+ * 検証済みidentityの接続保存用HMAC（identities/{hash}・access/{hash}の位置）。開発者向けコードの確定（developer-code-identity.ts）が
+ * 予定UID1件の利用許可を同じ位置へ作るために使う。
+ */
+export function connectIdentityHash(hasher: SecretHasher, namespace: string, identity: Pick<VerifiedIdentity, 'projectId' | 'uid'>): string {
+  return hasher.hash(`t256:${namespace}:identity`, `${identity.projectId}\0${identity.uid}`);
+}
+
 export class ConnectStorage {
   readonly #d: ConnectStorageDeps;
   readonly #root: DocumentReference;
@@ -403,7 +411,7 @@ export class ConnectStorage {
   // ---- owner ----
 
   #identityRef(identity: Pick<VerifiedIdentity, 'projectId' | 'uid'>): DocumentReference {
-    return this.#root.collection('identities').doc(this.#hash('identity', `${identity.projectId}\0${identity.uid}`));
+    return this.#root.collection('identities').doc(connectIdentityHash(this.#d.hasher, this.#d.namespace, identity));
   }
 
   #ownerRef(ownerId: string): DocumentReference {

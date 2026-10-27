@@ -74,9 +74,7 @@ Firebase ID tokens last about an hour. A sender that uses a Firebase client sess
 Planned areas of development include:
 
 - **Google sign-in:** another sign-in option alongside Apple.
-- **One-time login codes for developers:** an alternative to Apple sign-in. The expiry, issuance process and link to an existing account are still to be decided.
-
-These features are not available yet. The design, order and release dates are not fixed, and plans may change. Authentication currently supports only the Firebase Apple provider; using the service also requires explicit registration by the operator. See the [current authentication and session limits](docs/API_EN.md#firebase-sessions).
+Google sign-in is not available yet. The design, order and release dates are not fixed, and plans may change. Authentication uses the Firebase Apple provider by default; a deployment can also enable the optional developer 6-digit code (see below; off by default). Using the service with Apple also requires explicit registration by the operator. See the [current authentication and session limits](docs/API_EN.md#firebase-sessions).
 
 ## Compatibility
 
@@ -88,7 +86,7 @@ Version 0.3.0 is for new installations only; there is no automatic migration. Th
 - A subsequent author-supplied report records setup from GitHub commit `ad276fccc504bc367df209edb694809570496c3e` on a Mac, with deployment configuration changes only, successful builds, and one matching real Dots delivery from `/console`. Mac tests passed 108/112; four failed when binding to `127.0.0.2` (`EADDRNOTAVAIL`). The same source passed 112/112 synthetic tests in Linux Cloud Build. These are author reports, not independent third-party verification or acceptance of long-term production operation. See [LIMITATIONS](docs/LIMITATIONS_EN.md) for environments and remaining limits.
 - Production reliability, load, cost, multiple entry points sharing one UID, and immediate processing of each message are not guaranteed. The receiver may batch messages. Draft Events changes may affect compatibility.
 - Only users the operator has explicitly registered with the admin CLI can use the service, including yourself. After a stop or re-registration, earlier Grants and subscriptions can no longer be used for new sends or subscriptions; consent through OAuth and subscribe again. Status lookups, cancellation and disconnecting keep working while stopped ([CONFIGURATION](docs/CONFIGURATION_EN.md#access-admin)).
-- Authentication supports only Firebase's Apple provider. There is no authentication bypass or arbitrary endpoint, credential, emulator, or HTTP configuration override.
+- Authentication supports Firebase's Apple provider and, only when the deployment explicitly enables it (`developerLogin: 'operator-code-v1'`), the developer 6-digit code accounts. There is no authentication bypass or arbitrary endpoint, credential, emulator, or HTTP configuration override.
 - Message text is not persisted by this service. Expired stored metadata is made unusable, but physical deletion and full account deletion are not implemented. Receiver retention and processing follow that service's terms. Physical erasure from RAM, SDKs, and the OS is not guaranteed.
 - MIT licenses this source; it does not sublicense external services or SDKs. See [SECURITY](docs/SECURITY_EN.md) and [LIMITATIONS](docs/LIMITATIONS_EN.md).
 
@@ -117,3 +115,7 @@ Read the [security policy and reporting channel status](SECURITY.md) and [techni
 ## License
 
 [MIT](LICENSE) © 2026 Katsuyasan88. See [THIRD_PARTY_NOTICES_EN.md](THIRD_PARTY_NOTICES_EN.md) ([Japanese](THIRD_PARTY_NOTICES.md)) for third-party packages, SDKs, and reference data.
+
+## Developer 6-digit code (optional, off by default)
+
+In the operator mode of a console you deploy yourself, you can connect with a 6-digit code instead of Apple. A code works once within 10 minutes of issue, and the same number is not issued again for at least 24 hours. Each code creates a new account, and the number of texts sent after connecting is not limited. See [Local console](docs/LOCAL_CONSOLE_EN.md), [Configuration](docs/CONFIGURATION_EN.md), and [Security](docs/SECURITY_EN.md).

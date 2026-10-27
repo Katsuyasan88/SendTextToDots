@@ -1,0 +1,369 @@
+// 開発者向けコード（T-065）の画面・operator helperの合成検証。
+//   - O: operator設定のexact schema、限定4操作（Origin必須/nonce/認証header拒否/小本文/JSON/未知route/method）、二重クリックの直列化、
+//        照会による発行結果の再表示（再発行しない）、再発行失敗で現在のコードを維持、active時だけcustom token、取消。
+//   - U: ステップ1の方式選択（operator off=未設定の案内）、日英、秘密/コードをHTMLへ入れない、自動poll無し、プラグイン接続画面のコード入力
+//        （feature offでは出さない）、固定の失敗案内、送信元consoleのpanel 1への統合。
+// 合成のstore/auth・127.0.0.1のlocal serverだけ。実SDK・Cloud・資格・外部network 0。
+
+import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { createServer } from 'node:http';
+import { test } from 'node:test';
+
+import { OPERATOR_TEXT, operatorScript, parseOperatorConfig, renderOperatorSection } from '../dist/console/operator-config.js';
+import { createOperatorRoutes, parseOperatorArgs } from '../dist/console/operator-server.js';
+import { CODE_TEXT, INTERACTION_SCRIPT, renderInteractionLogin } from '../dist/connect/pages.js';
+import { renderConsolePage } from '../dist/connect/console.js';
+import { DeveloperLoginError } from '../dist/identity/developer-login.js';
+
+const WEB = { apiKey: 'AIzaSyntheticPublicKey000000000000000', authDomain: 'sttd-synthetic.firebaseapp.com', projectId: 'sttd-synthetic' };
+const NONCE = randomBytes(32).toString('hex');
+
+function fakeStore() {
+  const calls = { issue: [], claim: 0, cancel: 0 };
+  let n = 0;
+  const store = {
+    calls,
+    state: 'pending',
+    issueDelay: 0,
+    failIssue: null,
+    async issue(input) {
+      calls.issue.push(input);
+      if (store.issueDelay > 0) await new Promise((resolve) => setTimeout(resolve, store.issueDelay));
+      if (store.failIssue) throw new DeveloperLoginError(store.failIssue);
+      n += 1;
+      return { kind: 'issued', code: String(n).padStart(6, '0'), operationId: randomBytes(32).toString('base64url'), issuedAt: Date.now(), authExpiresAt: Date.now() + 600_000, candidates: 1 };
+    },
+    async claim() {
+      calls.claim += 1;
+      return store.state === 'active' ? { kind: 'active', uid: `sttdc_${'a'.repeat(32)}`, familyId: globalThis.crypto.randomUUID() } : { kind: store.state };
+    },
+    async cancel() {
+      calls.cancel += 1;
+      return 'revoked';
+    },
+  };
+  return store;
+}
+
+async function withHelper(store, fn) {
+  const routes = createOperatorRoutes({ store, auth: { createCustomToken: async () => 'synthetic-custom-token' }, clock: { now: () => Date.now() } });
+  let origin = '';
+  const server = createServer((req, res) => {
+    const url = new URL(req.url, origin);
+    routes.handle(req, res, { path: url.pathname, method: req.method, nonce: NONCE, origin }).catch(() => res.destroy());
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  origin = `http://localhost:${server.address().port}`;
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const post = (action, init = {}) =>
+    fetch(`${base}/v1/operator/code/${action}`, {
+      method: init.method ?? 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: origin, 'X-Sttd-Local-Nonce': NONCE, ...(init.headers ?? {}) },
+      ...(init.method === 'GET' ? {} : { body: init.body ?? '{}' }),
+    });
+  try {
+    await fn({ post, base, origin });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+test('O1 operator config is exact and contains no secret value', () => {
+  const good = {
+    version: 1,
+    projectId: 'sttd-synthetic',
+    databaseId: '(default)',
+    namespace: 't256_0b2c9a1e-4d5f-4a6b-8c7d-9e0f1a2b3c4d',
+    identifierKeySecretVersion: 'projects/123456789012/secrets/sttd-identifier/versions/1',
+  };
+  assert.equal(parseOperatorConfig(good).identifierKeySecretVersion, good.identifierKeySecretVersion);
+  for (const bad of [
+    { ...good, extra: 1 },
+    { ...good, version: 2 },
+    { ...good, identifierKeySecretVersion: 'projects/123456789012/secrets/x/versions/latest' },
+    { ...good, identifierKeySecretVersion: 'projects/sttd-synthetic/secrets/x/versions/1' },
+    { ...good, purpose: 'plugin-connect' },
+    { ...good, namespace: 'replace-me' },
+    { ...good, dedupeKey: 'inline-secret' },
+  ]) assert.throws(() => parseOperatorConfig(bad));
+  assert.deepEqual(parseOperatorArgs(['--config', 'a.json', '--operator', 'b.json']), { configPath: 'a.json', operatorPath: 'b.json', port: undefined });
+  assert.throws(() => parseOperatorArgs(['--config', 'a.json']));
+  assert.throws(() => parseOperatorArgs(['--config', 'a.json', '--operator', 'b.json', '--url', 'https://x']));
+});
+
+test('O2 helper refuses missing Origin, wrong nonce, auth header, wrong method/type/body, unknown action', async () => {
+  const store = fakeStore();
+  await withHelper(store, async ({ post, base }) => {
+    assert.equal((await fetch(`${base}/v1/operator/code/issue`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Sttd-Local-Nonce': NONCE }, body: '{}' })).status, 403);
+    assert.equal((await post('issue', { headers: { 'X-Sttd-Local-Nonce': 'x'.repeat(43) } })).status, 403);
+    assert.equal((await post('issue', { headers: { Origin: 'http://localhost:1' } })).status, 403);
+    assert.equal((await post('issue', { headers: { Authorization: 'Bearer abc' } })).status, 403);
+    assert.equal((await post('issue', { method: 'GET' })).status, 405);
+    assert.equal((await post('issue', { headers: { 'Content-Type': 'text/plain' } })).status, 415);
+    assert.equal((await post('issue', { body: JSON.stringify({ code: '123456', pad: 'x'.repeat(80) }) })).status, 400);
+    assert.equal((await post('write')).status, 404);
+    assert.equal(store.calls.issue.length, 0);
+  });
+});
+
+test('O3 issue, double click serialized, status re-shows result, reissue failure keeps current code, active token, cancel', async () => {
+  const store = fakeStore();
+  await withHelper(store, async ({ post }) => {
+    store.issueDelay = 50;
+    const [first, second] = await Promise.all([post('issue'), post('issue')]);
+    assert.deepEqual([first.status, second.status].sort(), [200, 409]);
+    store.issueDelay = 0;
+    const issued = await (first.status === 200 ? first : second).json();
+    assert.match(issued.code, /^[0-9]{6}$/);
+    assert.equal(store.calls.issue.length, 1);
+    assert.equal((await post('issue')).status, 409);
+    const status = await (await post('status')).json();
+    assert.equal(status.state, 'pending');
+    assert.equal(status.code, issued.code);
+    assert.equal(store.calls.issue.length, 1);
+    store.failIssue = 'issue_exhausted';
+    const failed = await post('reissue');
+    assert.equal(failed.status, 503);
+    assert.equal((await failed.json()).error.code, 'issue_exhausted');
+    assert.equal((await (await post('status')).json()).code, issued.code);
+    store.failIssue = null;
+    const reissued = await (await post('reissue')).json();
+    assert.notEqual(reissued.code, issued.code);
+    assert.equal(typeof store.calls.issue.at(-1).previousOperationId, 'string');
+    assert.equal(store.calls.issue.at(-1).claimSecret, store.calls.issue[0].claimSecret);
+    store.state = 'active';
+    const active = await (await post('status')).json();
+    assert.deepEqual(active, { state: 'active', customToken: 'synthetic-custom-token' });
+    assert.equal((await (await post('cancel')).json()).state, 'ended');
+    assert.equal((await (await post('status')).json()).state, 'ended');
+  });
+});
+
+test('O4 operator script is served same-origin and has no automatic polling', async () => {
+  await withHelper(fakeStore(), async ({ base }) => {
+    const response = await fetch(`${base}/console/operator.js`);
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.ok(body.includes('X-Sttd-Local-Nonce'));
+    assert.ok(!/setInterval\((call|confirm|issue)/.test(body));
+    assert.ok(!body.includes('localStorage'));
+  });
+  const script = operatorScript('X-Sttd-Local-Nonce');
+  assert.equal((script.match(/fetch\(/g) ?? []).length, 1);
+});
+
+test('U1 step 1 method choice: off shows not-configured; on has explicit buttons; ja/en; no secret in HTML', () => {
+  const off = renderOperatorSection({ language: 'ja', enabled: false, nonce: NONCE, web: WEB });
+  assert.ok(off.includes(OPERATOR_TEXT.ja.notConfigured));
+  assert.ok(!off.includes('sttd-code-issue'));
+  const on = renderOperatorSection({ language: 'en', enabled: true, nonce: NONCE, web: WEB });
+  for (const id of ['sttd-method-apple', 'sttd-method-code', 'sttd-code-issue', 'sttd-code-confirm', 'sttd-code-reissue']) assert.ok(on.includes(`id="${id}"`), id);
+  assert.ok(on.includes(OPERATOR_TEXT.en.codeGuide));
+  assert.ok(on.includes('id="sttd-code-panel" hidden'));
+  assert.ok(!/[0-9]{6}<\/code>/.test(on));
+  assert.ok(OPERATOR_TEXT.ja.switchNotice.includes('ステップ2'));
+  assert.deepEqual(Object.keys(OPERATOR_TEXT.ja).sort(), Object.keys(OPERATOR_TEXT.en).sort());
+});
+
+test('U2 plugin connection screen: code input only when enabled, fixed failure guidance, custom-token login then existing /login', () => {
+  const on = renderInteractionLogin(WEB, 'interactionUid1', 'Client', 'c'.repeat(43), 'ja', true);
+  assert.ok(on.includes('id="sttd-code-input"'));
+  assert.ok(on.includes('data-sttd-code="on"'));
+  assert.ok(on.includes('<section id="sttd-code-section" aria-labelledby="sttd-code-heading">'));
+  const off = renderInteractionLogin(WEB, 'interactionUid1', 'Client', 'c'.repeat(43), 'en');
+  assert.ok(off.includes('<section id="sttd-code-section" aria-labelledby="sttd-code-heading" hidden>'));
+  assert.ok(/id="sttd-code-submit" disabled/.test(off));
+  assert.ok(off.includes('data-sttd-code="off"'));
+  assert.equal(CODE_TEXT.ja.rejected, 'このコードでは接続できません。コンソールで新しいコードを発行してください。');
+  assert.equal(CODE_TEXT.en.rejected, 'This code cannot be used to connect. Generate a new code in the console.');
+  assert.ok(INTERACTION_SCRIPT.includes('signInWithCustomToken'));
+  assert.ok(INTERACTION_SCRIPT.includes("'/code'"));
+  assert.ok(!/setInterval/.test(INTERACTION_SCRIPT));
+});
+
+test('U3 console page panel 1 includes the method section', () => {
+  const section = renderOperatorSection({ language: 'en', enabled: false, nonce: NONCE, web: WEB });
+  const html = renderConsolePage(WEB, { language: 'en', nonce: NONCE, secure: false, operatorSection: section });
+  const panel1 = html.slice(html.indexOf('id="sttd-panel-1"'), html.indexOf('id="sttd-panel-2"'));
+  assert.ok(panel1.includes('id="sttd-code-not-configured"'));
+});
+
+// ---------- B: 送信画面の本体controllerとoperator部品を同じ合成DOMで実行（既存fixture console-browser.mjs） ----------
+
+import vm from 'node:vm';
+import { randomUUID } from 'node:crypto';
+import { consoleAsset, CONSOLE_SCRIPT } from '../dist/connect/console.js';
+import { domFromHtml, SDK_LOADER_LINE, settle, syntheticSdk } from './fixtures/console-browser.mjs';
+
+/** 保留して後から解放する合成の待ち。 */
+const gate = () => {
+  let release;
+  const promise = new Promise((resolve) => (release = resolve));
+  return { promise, release };
+};
+
+const CODE_UID = `sttdc_${'A'.repeat(32)}`;
+
+async function runConsoleWithOperator({ onOperator, restoredCode = false } = {}) {
+  const html = consoleAsset('/console', WEB, {
+    nonce: NONCE,
+    secure: false,
+    operatorSection: renderOperatorSection({ language: 'en', enabled: true, nonce: NONCE, web: WEB }),
+  }).body;
+  const dom = domFromHtml(html);
+  const base = syntheticSdk();
+  const codeUser = { uid: CODE_UID, async getIdToken() { return 'synthetic-code-id-token'; } };
+  if (restoredCode) base.auth.currentUser = codeUser;
+  const custom = { calls: 0, hold: null, tokens: [] };
+  const sdk = {
+    ...base,
+    load: async () => {
+      const [app, mod] = await base.load();
+      return [
+        app,
+        {
+          ...mod,
+          signInWithCustomToken: async (auth, token) => {
+            custom.calls += 1;
+            custom.tokens.push(token);
+            if (custom.hold) await custom.hold.promise;
+            auth.currentUser = codeUser;
+            return { user: codeUser };
+          },
+        },
+      ];
+    },
+  };
+  const fetches = [];
+  const fetch = async (url, init = {}) => {
+    fetches.push({ url, init });
+    assert.ok(url.startsWith('/'), 'same-origin only');
+    const prefix = '/v1/operator/code/';
+    const { status, json } = url.startsWith(prefix) ? await onOperator(url.slice(prefix.length), init) : { status: 503, json: { error: { code: 'unavailable' } } };
+    return { ok: status >= 200 && status < 300, status, headers: { get: () => null }, json: async () => json };
+  };
+  const context = vm.createContext({ document: dom.document, fetch, crypto: { randomUUID }, TextEncoder, setTimeout, clearTimeout, setInterval: () => 0, clearInterval: () => {}, AbortController, __sdk: sdk });
+  vm.runInContext(CONSOLE_SCRIPT.replace(SDK_LOADER_LINE, 'const loadSdkModules = () => __sdk.load();'), context, { filename: 'console-app.js' });
+  // ブラウザではmodule scriptごとに独立したscope。vmでは同じglobalなので関数scopeで包んで同じ分離にする。
+  vm.runInContext(`(() => {\n${operatorScript('X-Sttd-Local-Nonce')}\n})();`, context, { filename: 'operator.js' });
+  await settle();
+  const el = (id) => dom.elements.get(id);
+  const click = async (id) => {
+    el(id).click();
+    for (let i = 0; i < 4; i += 1) await settle();
+  };
+  const stepState = (n) => el(`sttd-step-${n}`).getAttribute('data-sttd-state');
+  return { el, click, stepState, base, custom, fetches };
+}
+
+const issuedJson = () => ({ status: 200, json: { code: '012345', authExpiresAt: Date.now() + 600_000 } });
+const activeJson = () => ({ status: 200, json: { state: 'active', customToken: 'synthetic-custom-token' } });
+
+test('B1 issue unlocks only step 2 from the controller state; sending stays locked; no SDK or upstream call', async () => {
+  const ui = await runConsoleWithOperator({ onOperator: async (action) => (action === 'issue' ? issuedJson() : { status: 200, json: { state: 'pending' } }) });
+  assert.equal(ui.stepState(2), 'locked');
+  await ui.click('sttd-method-code');
+  assert.equal(ui.el('sttd-code-panel').hidden, false);
+  await ui.click('sttd-code-issue');
+  assert.equal(ui.el('sttd-code-value').textContent, '012345');
+  assert.equal(ui.stepState(2), 'ready');
+  await ui.click('sttd-step-2-head');
+  assert.equal(ui.stepState(2), 'current');
+  for (const n of [3, 4, 5]) assert.equal(ui.stepState(n), 'locked', `step ${n}`);
+  assert.equal(ui.base.calls.loads, 0, 'no SDK before an explicit sign-in');
+  assert.equal(ui.fetches.filter((f) => !f.url.startsWith('/v1/operator/')).length, 0, 'no upstream call');
+  assert.equal(ui.el('sttd-login').hidden, false, 'not shown as signed in');
+});
+
+test('B2 confirm success signs in with the custom token and advances the console without reload or Apple', async () => {
+  const ui = await runConsoleWithOperator({ onOperator: async (action) => (action === 'issue' ? issuedJson() : activeJson()) });
+  await ui.click('sttd-method-code');
+  await ui.click('sttd-code-issue');
+  await ui.click('sttd-code-confirm');
+  assert.equal(ui.custom.calls, 1);
+  assert.deepEqual(ui.custom.tokens, ['synthetic-custom-token']);
+  assert.equal(ui.base.calls.popups, 0, 'no Apple popup');
+  assert.equal(ui.stepState(1), 'done');
+  assert.equal(ui.stepState(2), 'current');
+  assert.equal(ui.el('sttd-login').hidden, true, 'signed in');
+  assert.equal(ui.el('sttd-code-message').textContent, OPERATOR_TEXT.en.connected);
+});
+
+test('B3 switching method resets to step 1, locks later steps and closes the code session', async () => {
+  const ui = await runConsoleWithOperator({ onOperator: async (action) => (action === 'issue' ? issuedJson() : activeJson()) });
+  await ui.click('sttd-method-code');
+  await ui.click('sttd-code-issue');
+  await ui.click('sttd-code-confirm');
+  assert.equal(ui.stepState(2), 'current');
+  const signOuts = ui.base.calls.signOuts;
+  await ui.click('sttd-step-1-head');
+  await ui.click('sttd-method-apple');
+  assert.equal(ui.stepState(1), 'current');
+  for (const n of [2, 3, 4, 5]) assert.equal(ui.stepState(n), 'locked', `step ${n}`);
+  assert.equal(ui.base.auth.currentUser, null, 'the code session is closed');
+  assert.ok(ui.base.calls.signOuts > signOuts);
+  assert.equal(ui.el('sttd-switch-notice').hidden, false, 'reinstall guidance shown');
+  assert.equal(ui.el('sttd-code-panel').hidden, true);
+});
+
+test('B4 late issue/confirm results after a method switch are discarded', async () => {
+  const issueHold = gate();
+  let statusHold = null;
+  let holdIssue = true;
+  const ui = await runConsoleWithOperator({
+    onOperator: async (action) => {
+      if (action === 'issue') {
+        if (holdIssue) await issueHold.promise;
+        return issuedJson();
+      }
+      if (statusHold) await statusHold.promise;
+      return activeJson();
+    },
+  });
+  await ui.click('sttd-method-code');
+  ui.el('sttd-code-issue').click();
+  await settle();
+  await ui.click('sttd-method-apple');
+  issueHold.release();
+  await settle();
+  await settle();
+  assert.equal(ui.stepState(2), 'locked', 'late issue does not unlock');
+  assert.equal(ui.el('sttd-code-display').hidden, true);
+  holdIssue = false;
+  await ui.click('sttd-method-code');
+  await ui.click('sttd-code-issue');
+  statusHold = gate();
+  ui.el('sttd-code-confirm').click();
+  await settle();
+  await ui.click('sttd-method-apple');
+  statusHold.release();
+  await settle();
+  await settle();
+  assert.equal(ui.custom.calls, 0, 'no code sign-in after the switch');
+  assert.equal(ui.stepState(1), 'current');
+  assert.equal(ui.el('sttd-login').hidden, false);
+});
+
+test('B5 a slow custom-token SDK result after switching is signed out; a restored code session is not accepted as Apple', async () => {
+  const ui = await runConsoleWithOperator({ onOperator: async (action) => (action === 'issue' ? issuedJson() : activeJson()) });
+  await ui.click('sttd-method-code');
+  await ui.click('sttd-code-issue');
+  ui.custom.hold = gate();
+  ui.el('sttd-code-confirm').click();
+  await settle();
+  await settle();
+  await ui.click('sttd-method-apple');
+  ui.custom.hold.release();
+  await settle();
+  await settle();
+  assert.equal(ui.custom.calls, 1);
+  assert.equal(ui.base.auth.currentUser, null, 'late code session closed');
+  assert.equal(ui.stepState(2), 'locked');
+
+  const restored = await runConsoleWithOperator({ restoredCode: true, onOperator: async () => issuedJson() });
+  await restored.click('sttd-login');
+  assert.equal(restored.base.calls.popups, 1, 'Apple sign-in is explicit');
+  assert.notEqual(restored.base.auth.currentUser?.uid, CODE_UID);
+  assert.equal(restored.stepState(2), 'current');
+});

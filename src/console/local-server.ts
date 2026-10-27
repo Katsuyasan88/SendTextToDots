@@ -13,6 +13,7 @@
 //   - 有限: 上流の期限（route別）、応答本文の上限、browser切断/中止の上流への伝播。正常終了のcloseを中止と誤認しない。token・本文・秘密を保存/記録しない。
 //   - CLI: node dist/console/local-server.js --config <public-client-config.json> [--port 8765]。設定の読取りはconfig.ts。本番配置設定は読まない。
 
+import { OPERATOR_PATH_PREFIX, OPERATOR_SCRIPT_PATH, renderOperatorSection, type OperatorRoutes } from './operator-config.js';
 import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { realpathSync } from 'node:fs';
@@ -141,6 +142,8 @@ export interface LocalConsoleOptions {
   readonly fetch?: UpstreamFetch | undefined;
   /** 固定のevent/route/statusだけを受け取る記録口（任意）。 */
   readonly log?: ((entry: { readonly event: string; readonly route?: string; readonly status?: number }) => void) | undefined;
+  /** 明示operator mode（開発者向けコードの発行。operator-server.tsのCLIだけが渡す）。省略時は通常の配信modeで、操作口は404。 */
+  readonly operator?: OperatorRoutes | undefined;
 }
 
 export interface LocalConsole {
@@ -282,9 +285,15 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
       const query = url.searchParams.get(LANGUAGE_QUERY);
       const language = selectLanguage({ query, cookie: req.headers.cookie, acceptLanguage: req.headers['accept-language'] });
       const extra: Record<string, string> = path === CONSOLE_PATH && isLanguage(query) ? { 'Set-Cookie': languageCookie(language, false) } : {};
-      const asset = consoleAsset(path, web, { language, nonce, secure: false, mcpOrigin: config.mcpOrigin })!;
+      const operatorSection = renderOperatorSection({ language, enabled: options.operator !== undefined, nonce, web });
+      const asset = consoleAsset(path, web, { language, nonce, secure: false, mcpOrigin: config.mcpOrigin, operatorSection })!;
       log({ event: 'local.asset', route: path });
       return send(res, 200, asset.type, asset.body, { ...asset.headers, ...extra });
+    }
+    if (path === OPERATOR_SCRIPT_PATH || path.startsWith(OPERATOR_PATH_PREFIX)) {
+      if (options.operator === undefined) return sendLocalRefusal(res, 404, 'not_found');
+      log({ event: 'local.operator', route: path });
+      return options.operator.handle(req, res, { path, method, nonce, origin });
     }
     const route = relayRouteFor(method, path);
     if (route === null) return sendLocalRefusal(res, 404, 'not_found');

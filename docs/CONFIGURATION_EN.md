@@ -93,3 +93,20 @@ Only the metadata credentials of the runtime SA attached to the service are used
 `invoker: private` is the allowed value in the source. The Cloud-side public reachability that lets browsers and Dots reach the service is configured separately; changing invoker to public in the configuration file does not solve it. The application's Firebase ID token / OAuth authentication is always required.
 
 Do not commit real configuration values or secrets to public Git; keep them in an environment the installer controls. Passing tests does not verify the correctness of real deployment values, IAM, secret registration or URL reachability.
+
+## Developer 6-digit code (off by default)
+
+Enable it with `developerLogin` in the deployment configuration (`src/config/deployment.ts`). Omitted or `'off'` is disabled (the default); `'operator-code-v1'` is the only enabling value, and any other value is a configuration error before startup. While off there is no code entry endpoint (fixed 404), and neither the send API nor MCP accepts ID tokens from the custom provider. When on, the connect server (MCP) accepts code entry on the plugin connection screen, and the identity check shared by the connect server and the send API verifies code-based accounts.
+
+The keys for the reservation HMAC and for sealing planned UIDs are derived with HKDF, per purpose, from the existing `secretVersions.identifierKey` (a 32-byte per-deployment secret). No new secret is added. Rotating the identifierKey would give the same number a different ID, so issuance is refused, regardless of time, while the key fingerprint differs. Rotate only after stopping issuance and confirming that all reservations were deleted, as an explicit administrator step.
+
+The operator mode file (for example `operator.local.json`, never committed) accepts only this exact schema:
+
+| key | meaning |
+| --- | --- |
+| version | `1` |
+| projectId / databaseId | The same Firebase project and Firestore database as the deployment configuration |
+| namespace | The same connect storage namespace as the deployment configuration (`t256_<UUID>`) |
+| identifierKeySecretVersion | The same Secret Manager version name as `secretVersions.identifierKey` (`projects/<projectNumber>/secrets/<id>/versions/<n>`). Never put the value in files, the browser, or distributed artifacts |
+
+Initial values (small self-hosted deployments): code 10 minutes, reservation kept at least 24 hours from issue, 20 candidates, at most 5 DB transaction attempts, 15 seconds overall. Active codes: 5 per namespace and 1 per console; issuance 3 per hour per console and 20 per hour per namespace; entry 5 per interaction, 5 per source and 5 namespace-wide failures per 10 minutes. On deployments that enable it, the connect server's service account needs permission to create Firebase users and sign custom tokens (the send API only reads for verification). Limit the operator helper's credentials to signing, read/write of the related collections, and reading the identifierKey. If you use TTL, configure it on fields such as `developerLoginCodeReservations.deleteAfter` yourself (TTL is never used to decide authentication expiry).

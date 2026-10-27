@@ -63,3 +63,20 @@ When the helper itself refuses a request before calling upstream (a nonce mismat
 
 - Behaviour in third-party environments and real browsers is unverified beyond the synthetic tests ([LIMITATIONS](LIMITATIONS_EN.md)).
 - The helper is a development aid on your own computer; it adds no authentication or secret handling and does not change Cloud settings or start or stop services.
+
+## Connecting with a developer 6-digit code (operator mode)
+
+The regular `npm run console` keeps the Sign in with Apple delivery mode and has no code issuance endpoints (step 1 shows "Code issuance is not configured for this deployment."). On a deployment configured with `developerLogin: 'operator-code-v1'`, start operator mode explicitly, only on a machine that holds management access to your own deployment.
+
+```
+node dist/console/operator-server.js --config console.local.json --operator operator.local.json
+```
+
+1. In step 1 choose "Connect with a code" (choosing does not issue a code). "Generate a code" shows a 6-digit code and the time left.
+2. Within 10 minutes, enter the code in the plugin connection screen after adding the plugin. A code works once. Then complete the normal consent and subscription.
+3. Press "Check connection" in the console to sign the console in to the same account. There is no automatic polling.
+4. "Generate a new code" ends the current code and its connection and creates a new one. If a new code cannot be secured, the current code and connection stay unchanged.
+
+Switching between Apple and a code happens in step 1. Switching does not stop the previous connection. Remove the previous plugin and add it again from step 2. The previous connection will not carry over.
+
+The operator claim secret lives only in the helper's memory. If the helper exits, issued codes can no longer be checked or reissued (an unused code expires in 10 minutes; issue a new one).

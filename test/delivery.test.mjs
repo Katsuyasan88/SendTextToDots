@@ -1396,3 +1396,163 @@ test('V08 explicit access with the production decisions: not permitted -> 403 ac
   assert.deepEqual([fx.docOf(late, lateId).state, fx.docOf(late, lateId).reason], ['failed', 'authorization_lost']);
   assert.equal(fx.calls.sent.length, 1, 'no send after the stop');
 });
+
+
+// ---------- 開発者向けコード（T-065）: コード登録→code identity→接続保存のowner→送信API→KMS配送serviceで本文2件 ----------
+// 実物: 予約/消費/確定（DeveloperLoginStore）、交換（createDeveloperCodeExchange）、共通verifier（createFirebaseAdminVerifier＋code照合）、
+// 接続保存の利用許可/owner解決（ConnectStorage.resolveOwner/findOwner）、送信HTTP入口とKMS配送service。合成: Firestore（in-memory）、
+// Firebase Auth（ID token検証の結果）、配送の保存・封緘・送出（この試験fileのkmsFixture）。OAuth同意画面/Grant metadata/購読登録の実処理は通さない。
+
+import { Timestamp } from '@google-cloud/firestore';
+import { ConnectStorage, connectIdentityHash } from '../dist/connect/firestore.js';
+import { createCodeIdentityLookup, createDeveloperCodeExchange } from '../dist/identity/developer-code-identity.js';
+import { DEVELOPER_LOGIN_PURPOSE, defaultRandom, developerLoginKeys } from '../dist/identity/developer-login.js';
+import { DeveloperLoginStore } from '../dist/identity/developer-login-store.js';
+
+function miniFirestore() {
+  const docs = new Map();
+  let version = 1;
+  let lock = Promise.resolve();
+  const snap = (ref) => {
+    const entry = docs.get(ref.path);
+    return { ref, id: ref.id, exists: entry !== undefined, data: () => (entry === undefined ? undefined : { ...entry.data }), updateTime: entry === undefined ? undefined : Timestamp.fromMillis(entry.version) };
+  };
+  const refOf = (path) => ({
+    path,
+    id: path.slice(path.lastIndexOf('/') + 1),
+    collection: (name) => ({ doc: (id) => refOf(`${path}/${name}/${id}`) }),
+    get: async () => snap(refOf(path)),
+  });
+  const db = {
+    collection: (name) => ({ doc: (id) => refOf(`${name}/${id}`) }),
+    async runTransaction(fn, options = {}) {
+      const previous = lock;
+      let release;
+      lock = new Promise((resolve) => (release = resolve));
+      await previous;
+      try {
+        for (let attempt = 0; attempt < (options.maxAttempts ?? 5); attempt += 1) {
+          const reads = new Map();
+          const writes = [];
+          const tx = {
+            async get(ref) {
+              if (writes.length > 0) throw new Error('read after write');
+              reads.set(ref.path, docs.get(ref.path)?.version ?? 0);
+              return snap(ref);
+            },
+            create: (ref, data) => writes.push(['create', ref.path, data]),
+            set: (ref, data) => writes.push(['set', ref.path, data]),
+            update: (ref, data) => writes.push(['update', ref.path, data]),
+          };
+          const result = await fn(tx);
+          if ([...reads].some(([path, v]) => (docs.get(path)?.version ?? 0) !== v)) continue;
+          for (const [kind, path, data] of writes) {
+            const existing = docs.get(path);
+            if (kind === 'create' && existing) throw new Error('exists');
+            if (kind === 'update' && !existing) throw new Error('missing');
+            version += 1;
+            docs.set(path, { data: kind === 'update' ? { ...existing.data, ...data } : { ...data }, version });
+          }
+          return result;
+        }
+        throw new Error('contention');
+      } finally {
+        release();
+      }
+    },
+  };
+  return db;
+}
+
+test('T065 code identity: issue -> exchange -> owner admitted -> two texts through the send API reach the sender; reissue stops the old code connection', async () => {
+  clockState.value = BASE;
+  const projectId = 'demo-sttd-delivery';
+  const namespace = 't256_2b3c4d5e-6f70-4a81-9b2c-3d4e5f607182';
+  const db = miniFirestore();
+  const codeClock = { now: () => clockState.value };
+  const keys = developerLoginKeys(randomBytes(32));
+  const connectKey = randomBytes(32);
+  const connectHasher = { hash: (purpose, value) => createHmac('sha256', connectKey).update(`${purpose}\0${value}`).digest('hex') };
+  const store = new DeveloperLoginStore({ db, scope: { projectId, databaseId: '(default)', namespace, purpose: DEVELOPER_LOGIN_PURPOSE }, hasher: keys.hasher, sealer: keys.sealer, clock: codeClock, random: defaultRandom });
+  const storage = new ConnectStorage({
+    db,
+    namespace,
+    hasher: connectHasher,
+    box: { seal: async (purpose, plaintext) => `s:${Buffer.from(plaintext).toString('base64url')}`, open: async (purpose, sealed) => Buffer.from(sealed.slice(2), 'base64url').toString() },
+    clock: codeClock,
+    ownerInactivityMs: 90 * 24 * 60 * 60_000,
+    interactionTtlMs: 10 * 60_000,
+  });
+  const customTokens = new Map();
+  const users = new Set();
+  const auth = {
+    async createUser({ uid }) {
+      users.add(uid);
+    },
+    async createCustomToken(uid, claims) {
+      const token = `ct.${randomUUID()}`;
+      customTokens.set(token, { uid, claims });
+      return token;
+    },
+  };
+  const exchange = createDeveloperCodeExchange({ store, auth, clock: codeClock, accessIdentityHash: (uid) => connectIdentityHash(connectHasher, namespace, { projectId, uid }) });
+  const claimSecret = randomBytes(32).toString('base64url');
+  const issued = await store.issue({ claimSecret });
+  const exchanged = await exchange.exchange({ code: issued.code, interactionKey: 'interaction-delivery', sourceKey: '127.0.0.1' });
+  assert.equal(exchanged.kind, 'token');
+  assert.equal(users.size, 1);
+
+  // custom tokenでSDKログインした後のID token（合成。署名検証はFirebase SDKの役で、ここでは結果だけ）。
+  const { uid, claims } = customTokens.get(exchanged.customToken);
+  const idTokens = new Map();
+  const codeIdToken = `code.${randomBytes(12).toString('base64url')}.sig`;
+  idTokens.set(codeIdToken, { aud: projectId, iss: `https://securetoken.google.com/${projectId}`, sub: uid, auth_time: Math.floor(BASE / 1000), firebase: { sign_in_provider: 'custom' }, ...claims });
+  const verifier = createFirebaseAdminVerifier({
+    auth: {
+      async verifyIdToken(token) {
+        const decoded = idTokens.get(token);
+        if (decoded === undefined) throw Object.assign(new Error('x'), { code: 'auth/invalid-id-token' });
+        return decoded;
+      },
+      async getUser() {
+        return { disabled: false };
+      },
+    },
+    projectId,
+    codeIdentities: createCodeIdentityLookup(store),
+  });
+  // 接続server側のlogin相当: 予定UID1件だけの利用許可でownerを作る（Appleのownerへ紐付けない）。
+  const admission = await storage.resolveOwner(await verifier.verifyIdToken(codeIdToken));
+  assert.equal(admission.kind, 'admitted');
+
+  const fx = kmsFixture();
+  const findCodeOwner = async (verified) => storage.findOwner(verified);
+  const handler = createIngressOperationDeliveryRequestHandler({ identity: verifier, findOwner: findCodeOwner, service: fx.service, clock, log, lifetime: fx.lifetime.signal, ingress: ingressSource });
+  const { port } = await startServer(handler, (req) => {
+    const controller = new AbortController();
+    req.socket.once('close', () => controller.abort());
+    ingressState.next = { receivedAt: clockState.value, deadlineAt: clockState.value + 20_000, signal: controller.signal };
+  });
+  const bearer = [['Authorization', `Bearer ${codeIdToken}`]];
+  const post = (text) => {
+    const commandId = randomUUID();
+    return send(port, 'POST', '/v2/commands', {
+      headers: [...bearer, ...json, ['Idempotency-Key', commandId]],
+      body: JSON.stringify({ schemaVersion: 2, commandId, text, createdAt: iso(BASE), expiresAt: iso(BASE + 60_000) }),
+    }).done;
+  };
+  for (const text of ['first text via code', 'second text via code']) {
+    const response = await post(text);
+    assert.equal(response.status, 200);
+    assert.equal(response.json.state, 'delivered');
+  }
+  assert.equal(fx.calls.send.length, 2, 'two texts reached the sender');
+  assert.equal(fx.calls.prepare.length, 2);
+  assert.ok(JSON.stringify(fx.calls.prepare).includes(admission.ownerId), 'delivered for the code owner');
+
+  // 同じ発行元の再発行: 旧familyの接続は止まり、送出は増えない。
+  await store.issue({ claimSecret, previousOperationId: issued.operationId });
+  const after = await post('third text after reissue');
+  assert.equal(after.status, 401);
+  assert.equal(fx.calls.send.length, 2);
+});

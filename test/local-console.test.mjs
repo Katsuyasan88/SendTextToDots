@@ -316,3 +316,64 @@ test('P5 bounds: a legitimate 4096-byte text whose JSON escapes to several times
   assert.equal(up.calls.at(-1).aborted, true, 'upstream aborted on a declared length over the limit');
   results.P5 = { escapedPayloadBytes: Buffer.byteLength(payload, 'utf8'), floodedChunks: call.stream.pulled };
 });
+
+// ---------- 開発者向けコード: 明示operator modeの経路（合成のstore/auth。実SDK・資格0） ----------
+
+import { createOperatorRoutes } from '../dist/console/operator-server.js';
+
+function syntheticOperatorRoutes() {
+  const calls = { issue: 0 };
+  const routes = createOperatorRoutes({
+    store: {
+      async issue() {
+        calls.issue += 1;
+        return { kind: 'issued', code: '012345', operationId: 'o'.repeat(43), issuedAt: Date.now(), authExpiresAt: Date.now() + 600_000, candidates: 1 };
+      },
+      async claim() {
+        return { kind: 'pending' };
+      },
+      async cancel() {
+        return 'revoked';
+      },
+    },
+    auth: { createCustomToken: async () => 'synthetic-custom-token' },
+    clock: { now: () => Date.now() },
+  });
+  return { routes, calls };
+}
+
+test('T065 local console: operator routes only in explicit operator mode; the normal mode refuses them with 404', async () => {
+  const normal = await start();
+  const port = normal.server.port;
+  const post = (p, nonce) =>
+    raw(p, {
+      method: 'POST',
+      path: '/v1/operator/code/issue',
+      headers: { Origin: `http://localhost:${p}`, 'X-Sttd-Local-Nonce': nonce, 'Content-Type': 'application/json', 'Content-Length': '2' },
+      body: '{}',
+    });
+  const refused = await post(port, normal.server.nonce);
+  assert.equal(refused.status, 404);
+  assert.equal(refused.headers['x-sttd-local-refusal'], '1');
+  assert.equal((await raw(port, { path: '/console/operator.js' })).status, 404);
+  const normalPage = await raw(port, { path: '/console' });
+  assert.ok(normalPage.body.includes('id="sttd-code-not-configured"'));
+  assert.equal(normalPage.body.includes('id="sttd-code-issue"'), false);
+  if (Array.isArray(normal.up.calls)) assert.equal(normal.up.calls.length, 0, 'no upstream call');
+
+  const { routes, calls } = syntheticOperatorRoutes();
+  const operator = await start({ operator: routes });
+  const op = operator.server.port;
+  const page = await raw(op, { path: '/console' });
+  assert.ok(page.body.includes('id="sttd-code-issue"'));
+  assert.ok(page.body.includes('<script type="module" src="/console/operator.js"></script>'));
+  assert.equal((await raw(op, { path: '/console/operator.js' })).status, 200);
+  assert.equal((await post(op, 'f'.repeat(64))).status, 403, 'wrong nonce');
+  assert.equal(calls.issue, 0);
+  const issued = await post(op, operator.server.nonce);
+  assert.equal(issued.status, 200);
+  assert.equal(JSON.parse(issued.body).code, '012345');
+  assert.equal(calls.issue, 1);
+  assert.equal((await raw(op, { method: 'POST', path: '/v1/operator/code/issue', host: 'evil.example', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 400, 'Host is checked by the helper first');
+  if (Array.isArray(operator.up.calls)) assert.equal(operator.up.calls.length, 0, 'no upstream call');
+});

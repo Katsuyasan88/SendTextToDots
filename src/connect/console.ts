@@ -86,6 +86,8 @@ export interface ConsolePageOptions {
    * 未指定ならURLを推定・表示せず、配置のMCP originへ/mcpを付ける案内だけを出す。形が違えばConsoleConfigError。
    */
   readonly mcpOrigin?: string | undefined;
+  /** ステップ1の方式選択（Apple/コード）部品のHTML（console/operator-config.tsのrenderOperatorSectionが作るescape済みの値）。 */
+  readonly operatorSection?: string | undefined;
 }
 
 /**
@@ -174,6 +176,7 @@ ${stepHead(5, 'wizard.step5')}
 <button type="button" id="sttd-login"${i18n('common.appleLogin')}>${t('common.appleLogin')}</button>
 <button type="button" id="sttd-switch" hidden${i18n('common.switchAccount')}>${t('common.switchAccount')}</button>
 </div>
+${options.operatorSection ?? ''}
 </section>
 <section id="sttd-panel-2" class="sttd-panel" aria-labelledby="sttd-panel-2-title" data-sttd-state="locked" tabindex="0">
 <h2 id="sttd-panel-2-title" class="sttd-panel-title"${i18n('wizard.step2')}>${t('wizard.step2')}</h2>
@@ -404,7 +407,7 @@ function canAct(n) {
 /** stepが使えるか（DOMの見た目に頼らず、各handlerもこれで検査する）。確認中は3以降を一時封鎖。 */
 function available(n) {
   if (n === 1) return true;
-  if (n === 2) return done[1];
+  if (n === 2) return done[1] || (method === 'code' && codeIssued);
   if (checking) return false;
   if (n === 3) return done[2];
   if (n === 4) return done[3];
@@ -616,7 +619,7 @@ function ensureSdk() {
     sdkLoading = loadSdkModules()
       .then(([app, authModule]) => {
         const auth = authModule.getAuth(app.initializeApp(FIREBASE));
-        sdk = { auth, OAuthProvider: authModule.OAuthProvider, signInWithPopup: authModule.signInWithPopup, signOut: authModule.signOut };
+        sdk = { auth, OAuthProvider: authModule.OAuthProvider, signInWithPopup: authModule.signInWithPopup, signOut: authModule.signOut, signInWithCustomToken: authModule.signInWithCustomToken };
         return sdk;
       })
       .catch((error) => {
@@ -635,6 +638,7 @@ function popupBlocked(error) {
 /** 明示ログイン（switchingは別account）。開始時に2以降を戻す。世代が変わった古い結果では何も解放しない。 */
 async function login(switching) {
   if (!canAct(1) || busy() || inFlight()) return;
+  if (method === 'code') await chooseMethod('apple');
   const gen = ++loginGeneration;
   const hadProgress = done[1];
   resetFrom(2);
@@ -657,6 +661,8 @@ async function login(switching) {
     if (gen !== loginGeneration) return;
     if (switching && s.auth.currentUser) await s.signOut(s.auth);
     await s.auth.authStateReady();
+    if (gen !== loginGeneration) return;
+    if (isCodeUser(s.auth.currentUser)) await s.signOut(s.auth);
     if (gen !== loginGeneration) return;
     if (!s.auth.currentUser || switching) {
       try {
@@ -778,6 +784,7 @@ async function request(path, method, ms, headers, payload) {
 // ---- 2 接続確認（手動1回。確認中は3以降を封鎖。subscribed継続なら進捗保持、他は3以降を戻す） ----
 
 async function checkConnection(internal) {
+  if (!signedIn) return;
   if (!available(2) || busy() || inFlight() || confirming) return;
   if (!internal && !canAct(2)) return;
   const gen = ++checkGeneration;
@@ -1063,6 +1070,143 @@ function newTest() {
   sendNote = warn ? 'console.duplicateWarning' : '';
   render();
 }
+
+// ---- 開発者向けコード（operator modeの部品が明示callbackで呼ぶ。通常modeでは呼ばれない） ----
+
+let method = null;
+let codeEpoch = 0;
+let codeIssued = false;
+const codeListeners = [];
+
+function isCodeUser(user) {
+  return Boolean(user) && typeof user.uid === 'string' && user.uid.startsWith('sttdc_');
+}
+
+function codeState() {
+  const state = Object.freeze({ method, epoch: codeEpoch, signedIn, step, codeIssued });
+  for (const listener of codeListeners) {
+    try {
+      listener(state);
+    } catch {
+      // 部品側の失敗で本体の状態を変えない。
+    }
+  }
+}
+
+/**
+ * 方式の明示選択（apple / code）。変わったら手順1へ戻し、後続を封鎖し、旧owner・進行中のログイン/確認/コード結果を無効にする
+ * （世代を進める）。以前の方式のSDK sessionは閉じる。プラグインの旧接続はここでは止めない（本人の削除・再導入の案内だけ）。
+ */
+async function chooseMethod(next) {
+  if (next !== 'apple' && next !== 'code') return false;
+  if (method === next) {
+    codeState();
+    return true;
+  }
+  // 送信中だけは切り替えない（ログイン・確認の途中は世代を進めて古い結果を捨てる）。
+  if (inFlight()) return false;
+  const hadProgress = method !== null && (done[1] || codeIssued);
+  method = next;
+  codeEpoch += 1;
+  codeIssued = false;
+  loginGeneration += 1;
+  checkGeneration += 1;
+  checking = false;
+  accountBusy = false;
+  resetFrom(2);
+  signedIn = false;
+  done[1] = false;
+  ownerUid = null;
+  step = 1;
+  accountKey = 'console.accountSignedOut';
+  noteKey = hadProgress ? 'wizard.loginReset' : '';
+  render();
+  codeState();
+  if (sdk !== null && sdk.auth.currentUser) {
+    try {
+      await sdk.signOut(sdk.auth);
+    } catch {
+      // 閉じられなくても、以降のログインはcode/Appleの区別で受理しない。
+    }
+  }
+  return true;
+}
+
+/** コード発行の成功（この世代のコード方式だけ）。手順2（プラグイン追加）だけを開く。 */
+function codeIssuedFor(epoch) {
+  if (method !== 'code' || epoch !== codeEpoch) return false;
+  codeIssued = true;
+  render();
+  codeState();
+  return true;
+}
+
+/** 接続確認で得たcustom tokenによるSDKログイン。世代・方式が変わった遅い結果は採らず、残ったcode sessionも閉じる。 */
+async function codeSignIn(epoch, customToken) {
+  if (method !== 'code' || epoch !== codeEpoch || typeof customToken !== 'string' || customToken === '') return false;
+  if (accountBusy || busy() || inFlight()) return false;
+  const gen = ++loginGeneration;
+  const stale = () => gen !== loginGeneration || method !== 'code' || epoch !== codeEpoch;
+  accountBusy = true;
+  accountKey = sdk === null ? 'wizard.loginLoading' : 'console.accountChecking';
+  render();
+  try {
+    let s;
+    try {
+      s = await ensureSdk();
+    } catch {
+      if (!stale()) accountKey = 'wizard.loginLoadFailed';
+      return false;
+    }
+    if (stale()) return false;
+    if (typeof s.signInWithCustomToken !== 'function') {
+      accountKey = 'common.loginFailed';
+      return false;
+    }
+    if (s.auth.currentUser) await s.signOut(s.auth);
+    await s.signInWithCustomToken(s.auth, customToken);
+    const user = s.auth.currentUser;
+    if (stale()) {
+      if (isCodeUser(user)) await s.signOut(s.auth);
+      return false;
+    }
+    if (!isCodeUser(user)) {
+      accountKey = 'common.loginFailed';
+      return false;
+    }
+    await user.getIdToken();
+    if (stale() || s.auth.currentUser !== user) return false;
+    ownerUid = user.uid;
+    signedIn = true;
+    done[1] = true;
+    codeIssued = true;
+    accountKey = 'wizard.loginDone';
+    step = 2;
+    observeAuth(s);
+    return true;
+  } catch {
+    if (!stale()) accountKey = 'common.loginFailed';
+    return false;
+  } finally {
+    if (gen === loginGeneration) {
+      accountBusy = false;
+      render();
+      codeState();
+    }
+  }
+}
+
+/** operator部品への明示の口（同じページのscriptだけが使う。秘密・tokenを保持しない）。 */
+globalThis.sttdConsoleCode = Object.freeze({
+  chooseMethod: (next) => chooseMethod(next),
+  issued: (epoch) => codeIssuedFor(epoch),
+  signIn: (epoch, customToken) => codeSignIn(epoch, customToken),
+  subscribe(listener) {
+    if (typeof listener !== 'function') return;
+    codeListeners.push(listener);
+    listener(Object.freeze({ method, epoch: codeEpoch, signedIn, step, codeIssued }));
+  },
+});
 
 function start() {
   for (const n of STEPS) {

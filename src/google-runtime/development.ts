@@ -21,6 +21,7 @@
 // SDK/Auth/Gaxiosのprivate field・shared prototypeは変更しない。token・元例外・URL・本人情報をログ/返却値へ出さない。試験の注入口は無い。
 // SDK・metadata処理の物理取消の完了、token文字列・SDK/OS内RAMの物理消去は保証しない。callerはHTTP/アプリruntimeを先に止めてから閉じる。
 
+import { createLateCodeIdentityCheck, type CodeAuthAdmin, type LateCodeIdentityCheck } from '../identity/developer-code-identity.js';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { types } from 'node:util';
@@ -138,12 +139,20 @@ export interface DevelopmentGoogleSdkOptions {
   readonly operation: { readonly deadlineAt: number; readonly signal: AbortSignal };
 }
 
+/** 開発者向けコードの起動部品（SDKごと。別のSDK・起動とは共有しない）。 */
+export interface DevelopmentDeveloperCode {
+  readonly lookup: LateCodeIdentityCheck;
+  readonly auth: CodeAuthAdmin;
+}
+
 export interface DevelopmentGoogleSdk {
   readonly db: Firestore;
   readonly kmsClient: KeyManagementServiceClient;
   readonly secretClient: SecretManagerServiceClient;
   /** 既存createFirebaseAdminVerifier（専有named AppのAuth）。 */
   readonly identity: IdentityVerifier;
+  /** 開発者向けコード: 共通verifierへ後から結ぶcode identity照合と、専用UIDの作成・custom token署名（同じ専有App）。 */
+  readonly developerCode: DevelopmentDeveloperCode;
   /** 共有Promise・一度だけ。全SDKを各1回試み、最大5秒。非成功・未完はclose_failed。 */
   close(): Promise<void>;
 }
@@ -444,7 +453,17 @@ export async function openDevelopmentGoogleSdk(options: DevelopmentGoogleSdkOpti
     };
     const ownApp = adminAppModule.initializeApp({ projectId: PROJECT_ID, credential }, `${ADMIN_APP_PREFIX}${randomUUID()}`);
     app = ownApp;
-    const identity = createFirebaseAdminVerifier({ auth: adminAuthModule.getAuth(ownApp) as unknown as AdminAuthLike, projectId: PROJECT_ID });
+    const ownAuth = adminAuthModule.getAuth(ownApp) as unknown as AdminAuthLike & CodeAuthAdmin;
+    // 開発者向けコードの照合は、起動口が秘密を読んだ後に同じ配置の保存層を結ぶ（未結合＝機能off。customのID tokenを受けない）。
+    const codeIdentities = createLateCodeIdentityCheck();
+    const identity = createFirebaseAdminVerifier({ auth: ownAuth, projectId: PROJECT_ID, codeIdentities });
+    const developerCode: DevelopmentDeveloperCode = Object.freeze({
+      lookup: codeIdentities,
+      auth: Object.freeze({
+        createUser: (properties: Parameters<CodeAuthAdmin['createUser']>[0]) => ownAuth.createUser(properties),
+        createCustomToken: (uid: string, claims: Record<string, unknown>) => ownAuth.createCustomToken(uid, claims),
+      }),
+    });
 
     // KMS/SMのinitializeを各1回、元の初期化期限内で。遅い成功は採用しない（後着は処理済みにし、生成済みstubはcloseが閉じる）。
     const first = now();
@@ -478,7 +497,7 @@ export async function openDevelopmentGoogleSdk(options: DevelopmentGoogleSdkOpti
     stopWaiting = null;
     // ready後は起動operationを監視しない（以後の終了はcallerのclose）。
     signal.removeEventListener('abort', onAbort);
-    return Object.freeze({ db: ownDb, kmsClient: ownKms, secretClient: ownSecrets, identity, close });
+    return Object.freeze({ db: ownDb, kmsClient: ownKms, secretClient: ownSecrets, identity, developerCode, close });
   } catch (error) {
     clearTimeout(initTimer);
     stopWaiting = null;

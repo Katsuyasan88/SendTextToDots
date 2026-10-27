@@ -15,6 +15,8 @@
 //     含む）、起動失敗ではなく固定のclose failureで返す。errorは固定のconfig/startup/closeの3種だけ（元error・cause・値を転記しない）。
 // 既に始めたSDK・HTTPの物理取消、Cloudのcold startの所要時間、RAMの物理消去は保証しない。
 
+import { DEVELOPER_LOGIN_MODE } from '../config/validate.js';
+import type { CodeIdentityLookup } from '../identity/developer-code-identity.js';
 import { types } from 'node:util';
 
 import { cryptoKeyLocation, loadDeploymentConfig, type DeploymentConfig } from '../config/validate.js';
@@ -349,6 +351,16 @@ export async function startOwnedDevelopmentConnectServer(options: OwnedDevelopme
           clock,
           publicOrigin: config.publicOrigin,
           ...(config.log !== undefined ? { log: config.log } : {}),
+          // 開発者向けコード（配置設定でonの時だけ）。保存層は接続serverが読んだidentifierKeyから作り、同じSDKの共通verifierへ結ぶ。
+          ...(config.deployment.developerLogin === DEVELOPER_LOGIN_MODE
+            ? {
+                developerCode: {
+                  auth: ownedSdk.developerCode.auth,
+                  databaseId: config.deployment.databaseId,
+                  bindLookup: (lookup: CodeIdentityLookup) => ownedSdk.developerCode.lookup.bind(lookup),
+                },
+              }
+            : {}),
           startupOperation: operation,
         },
         kms: {

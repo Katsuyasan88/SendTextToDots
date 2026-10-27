@@ -31,6 +31,8 @@ const TOP_KEYS = [
 ] as const;
 /** 利用許可の唯一の方式（運営者が明示登録した利用者だけ）。欠落・未知値は設定error（全員許可・旧版へのfallbackなし）。 */
 export const ACCESS_POLICY = 'explicit-allow-v1';
+/** 開発者向け6桁コードの有効値（省略・'off'は無効）。 */
+export const DEVELOPER_LOGIN_MODE = 'operator-code-v1';
 const API_KEYS = ['functionName', 'serviceName', 'serviceAccount', 'invoker', 'publicOrigin'] as const;
 const CONNECT_KEYS = ['serviceName', 'serviceAccount', 'publicOrigin', 'invoker'] as const;
 const KMS_KEYS = ['environment', 'projectId', 'databaseId', 'namespace', 'cryptoKey', 'writeVersion', 'readVersions'] as const;
@@ -67,6 +69,8 @@ export class DeploymentConfigError extends Error {
 
 export interface DeploymentConfig {
   readonly accessPolicy: typeof ACCESS_POLICY;
+  /** 開発者向け6桁コード（既定'off'）。 */
+  readonly developerLogin: 'off' | typeof DEVELOPER_LOGIN_MODE;
   readonly projectId: string;
   readonly projectNumber: string;
   readonly databaseId: string;
@@ -168,13 +172,16 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
   let top: Map<string, unknown>;
   try {
     // accessPolicyは配布placeholder（未設定）の判定を先に保つため存在だけ任意で読み、設定済みの時は下で必須にする。
-    top = dataFields(raw, TOP_KEYS, ['accessPolicy']);
+    top = dataFields(raw, TOP_KEYS, ['accessPolicy', 'developerLogin']);
   } catch {
     throw invalid();
   }
   if (top.get('configured') !== true) throw new DeploymentConfigError('deployment_config_unconfigured');
   try {
     requireThat(top.get('accessPolicy') === ACCESS_POLICY);
+    // 省略は既定off。'off'か'operator-code-v1'だけ（未知値は設定error）。
+    const developerLogin = top.has('developerLogin') ? top.get('developerLogin') : 'off';
+    requireThat(developerLogin === 'off' || developerLogin === DEVELOPER_LOGIN_MODE);
     const projectId = str(top, 'projectId');
     const projectNumber = str(top, 'projectNumber');
     const databaseId = str(top, 'databaseId');
@@ -247,6 +254,7 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
 
     return deepFreeze({
       accessPolicy: ACCESS_POLICY,
+      developerLogin: developerLogin as 'off' | typeof DEVELOPER_LOGIN_MODE,
       projectId,
       projectNumber,
       databaseId,

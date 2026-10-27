@@ -113,7 +113,7 @@ eventIdは識別子鍵＋owner/commandIdのHMACから作るUUIDv8で、同じown
 
 ## Firebaseのsessionと自動送信
 
-現在の認証はFirebase AuthenticationのApple providerだけに対応し、Dotsを接続した本人と同じFirebase project・UIDを使います。このAPI契約を満たすアプリやスクリプトが入力元になり、特定のスマートフォン・時計・入力元アプリは必須ではありません。受信側MCPのOAuth接続と、入力元のFirebase sessionは別です。
+現在の認証はFirebase AuthenticationのApple provider（配置が`developerLogin: 'operator-code-v1'`で有効にした場合は開発者向け6桁コードの利用単位も）に対応し、Dotsを接続した本人と同じFirebase project・UIDを使います。このAPI契約を満たすアプリやスクリプトが入力元になり、特定のスマートフォン・時計・入力元アプリは必須ではありません。受信側MCPのOAuth接続と、入力元のFirebase sessionは別です。
 
 Firebase ID tokenは約1時間で期限切れになります。Firebase clientの認証sessionを使うアプリは、送信前にSDKで有効なtokenを取得してください。ローカル送信画面では認証が必要な操作ごとに`user.getIdToken()`を呼び、期限切れまたは期限間近なら更新できます。通常は毎時間Appleへ手動で再ログインする必要はありません。サインアウト・失効・認証上の問題があれば再ログインが必要になることはあります。[Firebaseのsession寿命](https://firebase.google.com/docs/auth/admin/manage-sessions)と[getIdToken](https://firebase.google.com/docs/reference/js/auth.user.md#usergetidtoken)も参照してください。
 
@@ -154,3 +154,7 @@ console.log(response.status, await response.json());
 応答の一例は`{"commandId":"d8d32ec5-9531-4b12-841a-b809ab45d3ef","state":"delivered","expiresAt":"2026-10-25T00:01:00.000Z","acknowledgedAt":"2026-10-25T00:00:01.000Z"}`です。実際のID・時刻は異なります。新規POSTは通常HTTP 200で`delivered`・`failed`・`cancelled`・`expired`・`delivery_unknown`のいずれかを返します。同一commandの再POSTは処理中なら202 `in_flight`の場合があります。HTTP 2xxだけで配送成功とせず`state`を確認してください。`delivered`はcallback受領で、Dotsの処理完了ではありません。
 
 要求や応答の解析に失敗してもIDを使えるよう、送信前に表示します。結果不明時に自動再送せず、同じ認証で`GET /v2/commands/{commandId}`を照会してください。error・中止・件数枠・冪等性の詳細は[API](API.md)を参照してください。
+
+## プラグイン接続画面のコード入力（開発者向け6桁コード）
+
+機能が有効な配置だけ、OAuth interactionのlogin画面に「コードで接続」が表示されます。`POST /interaction/{uid}/code`（同origin・interaction cookie・CSRF必須、JSON `{"csrf","code"}` 1KiBまで）は成功時だけ同originの応答でcustom tokenを返し、画面がFirebase SDKでログインして既存の`/login`へID tokenを送ります（同意・購読は通常どおり）。不存在・期限切れ・使用済み・取消は同じ`400 code_rejected`、試行上限は`429`、作成/署名の失敗は`503 code_failed`（コンソールで新しいコードを発行）、その他の障害は`503`です。機能offでは`404`です。API/MCPのBearerは従来どおりFirebase ID tokenで、送信回数はコードで制限しません。

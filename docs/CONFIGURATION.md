@@ -93,3 +93,20 @@ serviceへattachしたruntime SAのmetadata資格だけを使います。ロー�
 `invoker: private`はsourceの許可値です。browser/Dotsがserviceへ到達するためのCloud側の公開到達設定は別に必要で、設定fileのinvokerをpublicへ変更して解決しません。アプリのFirebase ID token/OAuth認証は常に必須です。
 
 実際の設定値や秘密を公開Gitへcommitせず、導入者が管理する環境で保管してください。試験が合格しても実配置値の正しさ・IAM・秘密の登録・URL到達を検証したことにはなりません。
+
+## 開発者向け6桁コード（既定off）
+
+配置設定（`src/config/deployment.ts`）の`developerLogin`で有効にします。省略・`'off'`は無効（既定）、`'operator-code-v1'`だけが有効値で、他の値は起動前の設定errorです。offの間はコード入力の口が無く（固定404）、custom providerのID tokenも送信API・MCPの両方で受け付けません。onにすると、接続server（MCP）はプラグイン接続画面のコード入力を受け、接続serverと送信APIの共通の本人確認がコード由来の利用単位を照合します。
+
+コードの予約HMACと予定UIDの封緘の鍵は、既存の`secretVersions.identifierKey`（配置ごとの32byteの秘密）からHKDFで用途を分けて導きます。新しい秘密は増えません。identifierKeyを切り替えると同じ番号の予約が別IDになるため、鍵の指紋が違う間は時間に関係なく発行を拒否します。切替は発行を停止し、全予約の削除を確認してから管理者が明示的に行ってください。
+
+operator modeの設定ファイル（例: `operator.local.json`、commitしない）は次のexact schemaだけを受けます。
+
+| key | 内容 |
+| --- | --- |
+| version | `1` |
+| projectId / databaseId | 配置設定と同じFirebase project・Firestore database |
+| namespace | 配置設定と同じ接続保存のnamespace（`t256_<UUID>`） |
+| identifierKeySecretVersion | 配置設定の`secretVersions.identifierKey`と同じSecret Manager版名（`projects/<projectNumber>/secrets/<id>/versions/<n>`）。値をファイル・ブラウザ・配布物へ書かない |
+
+初期値（小規模な自己配置向け）: コード10分・予約は発行から24時間以上、発行候補20個・DB transaction最大5回・全体15秒。同時有効コードはnamespace 5・発行元1、発行は発行元3回/時・namespace 20回/時、入力はinteraction 5回・送信元5回・namespace全体の失敗5回/10分。onにする配置では、接続serverのservice accountにFirebaseユーザー作成とcustom token署名の権限が要ります（送信APIは照合の読取りだけ）。operator helperの資格もユーザー情報の署名・該当collectionの読み書き・identifierKeyの読取りに限ってください。TTLを使う場合は`developerLoginCodeReservations.deleteAfter`等へ配置側で設定します（認証期限の判定にはTTLを使いません）。

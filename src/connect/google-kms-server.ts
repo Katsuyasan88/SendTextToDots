@@ -95,7 +95,7 @@ export type GoogleKmsConnectServer = KmsConnectServer;
 
 const TOP_KEYS = ['server', 'kms', 'google'] as const;
 const SERVER_KEYS = ['bindPort', 'db', 'namespace', 'identity', 'web', 'clientEgress', 'verificationSender', 'clock', 'publicOrigin'] as const;
-const SERVER_OPTIONAL = ['log', 'startupOperation'] as const;
+const SERVER_OPTIONAL = ['log', 'startupOperation', 'developerCode'] as const;
 const STARTUP_OPERATION_KEYS = ['deadlineAt', 'signal'] as const;
 /** setTimeoutの遅延の上限（これを越える値はNodeが1msへ置き換える）。 */
 const MAX_TIMER_MS = 2_147_483_647;

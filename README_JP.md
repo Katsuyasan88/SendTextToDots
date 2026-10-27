@@ -74,9 +74,7 @@ Firebase ID tokenの寿命は約1時間です。Firebase clientの認証session�
 今後の開発では、次の対応を検討しています。
 
 - **Googleログイン**：Appleに加えるログイン手段。
-- **開発者向けの一度限りのログインコード**：Appleログインの代わりに使う一時コード。有効期間・発行方法・既存アカウントとの紐付けなどは未定です。
-
-これらはまだ利用できません。方式・対応順・提供時期は未定で、計画は変更される場合があります。現在の本人確認はFirebaseのApple providerだけに対応し、利用には運営者による明示登録も必要です。[現在の認証とsessionの制約](docs/API.md#firebase-sessions)を確認してください。
+Googleログインはまだ利用できません。方式・対応順・提供時期は未定で、計画は変更される場合があります。本人確認は既定でFirebaseのApple providerを使い、配置が明示的に有効にした場合だけ開発者向け6桁コード（下記。既定off）も使えます。Appleでの利用には運営者による明示登録も必要です。[現在の認証とsessionの制約](docs/API.md#firebase-sessions)を確認してください。
 
 ## 互換性
 
@@ -88,7 +86,7 @@ Firebase ID tokenの寿命は約1時間です。Firebase clientの認証session�
 - 追加の本人提供資料で、MacでGitHubのcommit `ad276fccc504bc367df209edb694809570496c3e` を取得し、配置設定だけを変更してbuildに成功、`/console`からの1件が実Dotsに入力どおり届いた実績を記録しています。Macの自動試験は108/112成功で、4件は`127.0.0.2`へのlisten時の`EADDRNOTAVAIL`で失敗。同じsourceのLinux Cloud Buildでは合成試験112/112成功との報告です。第三者独立検証や長期の本番運用受入とは区別します。環境と残る制約は[LIMITATIONS](docs/LIMITATIONS.md)を参照してください。
 - 本番の信頼性・負荷・費用・同UIDの複数入口・1件ごとの即時処理は保証しません。受信側でまとめて処理される場合があります。Events草案の変更も互換性に影響し得ます。
 - 使えるのは運営者が管理CLIで明示登録した利用者だけです（自分も含む）。停止・再登録の後は以前のGrant・購読で新しい送信・購読ができず、OAuthの同意と購読のやり直しが必要です。状態の照会・取消・接続解除は停止中も使えます（[CONFIGURATION](docs/CONFIGURATION.md#access-admin)）。
-- 本人確認はFirebaseのApple providerだけです。認証省略や任意endpoint・資格・emulator・HTTP経由の設定overrideはありません。
+- 本人確認はFirebaseのApple providerと、配置が明示的に有効にした場合（`developerLogin: 'operator-code-v1'`）だけの開発者向け6桁コードの利用単位です。認証省略や任意endpoint・資格・emulator・HTTP経由の設定overrideはありません。
 - 本serviceは本文を永続保存しません。期限切れの保存metadataは利用不可になりますが、物理削除とaccount全削除は未実装です。受信後の保持・処理は受信サービスの条件に従います。RAM・SDK・OS内の物理消去も保証しません。
 - MITが許諾するのは本sourceで、外部サービスやSDKの利用権を再許諾しません。[SECURITY](docs/SECURITY.md)と[LIMITATIONS](docs/LIMITATIONS.md)を参照してください。
 
@@ -117,3 +115,7 @@ Firebase ID tokenの寿命は約1時間です。Firebase clientの認証session�
 ## License
 
 [MIT](LICENSE) © 2026 Katsuyasan88。第三者のpackage・SDK・参照dataは [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)（[English](THIRD_PARTY_NOTICES_EN.md)）を参照してください。
+
+## 開発者向け6桁コード（任意・既定off）
+
+自分で配置したコンソールのoperator modeでは、Appleの代わりに6桁のコードで接続できます。コードは発行から10分以内に1回だけ使え、同じ番号は少なくとも24時間発行しません。コードごとに新しい利用単位になり、接続後の送信回数は制限しません。詳しくは[ローカル送信画面](docs/LOCAL_CONSOLE.md)・[設定](docs/CONFIGURATION.md)・[セキュリティ](docs/SECURITY.md)を参照してください。

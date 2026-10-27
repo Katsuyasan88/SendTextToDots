@@ -74,10 +74,51 @@ ${body}
 </body></html>`;
 }
 
-/** OAuth interactionの1画面目: Appleでログイン。 */
-export function renderInteractionLogin(web: FirebaseWebConfig, uid: string, clientLabel: string, csrf: string, language: Language = DEFAULT_LANGUAGE): string {
+/** 開発者向けコードの入力の固定文言（en/ja。画面とscriptで同じ辞書）。 */
+export const CODE_TEXT = Object.freeze({
+  en: Object.freeze({
+    heading: 'Connect with a code',
+    guide: 'Enter the 6-digit code issued in your console. A code works once, within 10 minutes of issue.',
+    label: '6-digit code',
+    submit: 'Connect with this code',
+    rejected: 'This code cannot be used to connect. Generate a new code in the console.',
+    limited: 'Too many attempts. Wait a while, then generate a new code in the console.',
+    failed: 'The connection could not be completed. Generate a new code in the console.',
+    busy: 'Connecting…',
+  }),
+  ja: Object.freeze({
+    heading: 'コードで接続',
+    guide: 'コンソールで発行した6桁のコードを入力してください。発行から10分以内に1回だけ使えます。',
+    label: '6桁のコード',
+    submit: 'このコードで接続',
+    rejected: 'このコードでは接続できません。コンソールで新しいコードを発行してください。',
+    limited: '試行が多すぎます。しばらく待ってから、コンソールで新しいコードを発行してください。',
+    failed: '接続を完了できませんでした。コンソールで新しいコードを発行してください。',
+    busy: '接続しています…',
+  }),
+});
+
+/** OAuth interactionの1画面目: Appleでログイン（開発者向けコードが有効な配置ではコード入力も）。 */
+export function renderInteractionLogin(
+  web: FirebaseWebConfig,
+  uid: string,
+  clientLabel: string,
+  csrf: string,
+  language: Language = DEFAULT_LANGUAGE,
+  codeEnabled = false,
+): string {
   const lang = languageOf(language);
   const t = (key: MessageKey) => escapeHtml(text(lang, key));
+  const c = (key: keyof (typeof CODE_TEXT)['en']) => escapeHtml(CODE_TEXT[lang][key]);
+  // scriptが参照する要素は常に置き、機能offでは区画ごとhidden・無効（scriptも結び付けず、serverのcode routeは404）。
+  const codeSection = `
+<section id="sttd-code-section" aria-labelledby="sttd-code-heading"${codeEnabled ? '' : ' hidden'}>
+<h2 id="sttd-code-heading">${c('heading')}</h2>
+<p>${c('guide')}</p>
+<label for="sttd-code-input">${c('label')}</label>
+<input id="sttd-code-input" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" minlength="6" required${codeEnabled ? '' : ' disabled'}>
+<button type="button" id="sttd-code-submit"${codeEnabled ? '' : ' disabled'}>${c('submit')}</button>
+</section>`;
   return shell(
     web,
     'interaction-login',
@@ -87,9 +128,9 @@ export function renderInteractionLogin(web: FirebaseWebConfig, uid: string, clie
 <p>${t('interaction.loginGuide')}</p>
 <button type="button" id="sttd-continue" hidden>${t('common.continueSignedIn')}</button>
 <button type="button" id="sttd-apple-login" hidden>${t('common.appleLogin')}</button>
-<button type="button" id="sttd-switch-account" hidden>${t('common.switchAccount')}</button>
+<button type="button" id="sttd-switch-account" hidden>${t('common.switchAccount')}</button>${codeSection}
 <p id="sttd-message" role="status"></p>`,
-    { 'sttd-interaction': uid, 'sttd-csrf': csrf },
+    { 'sttd-interaction': uid, 'sttd-csrf': csrf, 'sttd-code': codeEnabled ? 'on' : 'off' },
   );
 }
 
@@ -133,12 +174,13 @@ export function renderInteractionAccessDenied(web: FirebaseWebConfig, uid: strin
  * 文言はbodyのdata-sttd-language（サーバーが選んだ言語）で、埋め込んだ固定辞書から引く。接続状態の表示・解除はこの画面に無い（送信画面の役割）。
  */
 export const INTERACTION_SCRIPT = `import { initializeApp } from '${SDK_BASE}firebase-app.js';
-import { getAuth, OAuthProvider, signInWithPopup, signOut } from '${SDK_BASE}firebase-auth.js';
+import { getAuth, OAuthProvider, signInWithCustomToken, signInWithPopup, signOut } from '${SDK_BASE}firebase-auth.js';
 
 const body = document.body;
 const view = body.dataset.sttdView;
 const auth = getAuth(initializeApp(JSON.parse(body.dataset.sttdFirebase)));
 const TEXT = ${messagesJson()};
+const CODE_TEXT = ${JSON.stringify(CODE_TEXT)};
 const lang = Object.hasOwn(TEXT, body.dataset.sttdLanguage) ? body.dataset.sttdLanguage : 'en';
 const T = (key) => (Object.hasOwn(TEXT[lang], key) ? TEXT[lang][key] : '');
 const el = (id) => document.getElementById(id);
@@ -200,8 +242,40 @@ async function accessRefused(response) {
   }
 }
 
+// 開発者向けコード: 本人の明示操作だけで送る（自動送信・pollなし）。成功時の同origin応答のcustom tokenでFirebase SDKにログインし、
+// 既存の/loginへID tokenを送る（同意・購読は通常どおり）。tokenを表示・保存・URLへ入れない。二重クリックはボタンを止めて防ぐ。
+const C = (key) => (Object.hasOwn(CODE_TEXT[lang], key) ? CODE_TEXT[lang][key] : '');
+async function codeLogin() {
+  const input = el('sttd-code-input');
+  const button = el('sttd-code-submit');
+  const code = input.value.trim();
+  if (!/^[0-9]{6}$/.test(code)) return say(C('rejected'));
+  button.disabled = true;
+  say(C('busy'));
+  try {
+    const response = await fetch('/interaction/' + encodeURIComponent(body.dataset.sttdInteraction) + '/code', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ csrf: body.dataset.sttdCsrf, code }),
+    });
+    input.value = '';
+    if (response.status !== 200) return say(C(response.status === 429 ? 'limited' : response.status === 400 ? 'rejected' : 'failed'));
+    const parsed = await response.json();
+    if (parsed === null || typeof parsed !== 'object' || typeof parsed.customToken !== 'string') return say(C('failed'));
+    if (auth.currentUser) await signOut(auth);
+    const credential = await signInWithCustomToken(auth, parsed.customToken);
+    await interactionLogin(await credential.user.getIdToken());
+  } catch {
+    say(C('failed'));
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function start() {
   if (view !== 'interaction-login') return;
+  if (body.dataset.sttdCode === 'on') el('sttd-code-submit').onclick = () => codeLogin();
   el('sttd-apple-login').onclick = () => run(async () => interactionLogin(await popupIdToken()), T('common.loginFailed'));
   el('sttd-switch-account').onclick = () => run(async () => interactionLogin(await switchedIdToken()), T('common.loginFailed'));
   await auth.authStateReady();

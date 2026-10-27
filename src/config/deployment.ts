@@ -11,6 +11,8 @@ export const DEPLOYMENT_CONFIG = {
   configured: false,
   /** Access policy. Only `explicit-allow-v1` is accepted: only users the operator registers with the admin CLI can use the service (there is no allow-everyone mode). */
   accessPolicy: 'explicit-allow-v1',
+  /** Developer 6-digit code. `off` (default) or `operator-code-v1` (codes issued by the operator-mode local console). See docs/CONFIGURATION_EN.md. */
+  developerLogin: 'off',
   /** Google Cloud / Firebase project ID (6 to 30 characters). */
   projectId: 'your-project-id',
   /** Numeric project number of the same project. */

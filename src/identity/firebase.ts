@@ -30,7 +30,26 @@ export interface VerifiedIdentity {
   readonly uid: string;
   /** Firebaseへの認証時刻（epoch秒）。 */
   readonly authTimeSec: number;
+  /** 開発者向けコード由来の利用単位だけ'developer_code'（Appleは省略）。 */
+  readonly method?: 'developer_code';
 }
+
+/**
+ * 開発者向けコードのidentity照合（任意。未設定ならcustom providerは従来どおりwrong_provider）。providerがcustomというだけでは受理せず、
+ * 認証marker・専用UID形・保存されたcode identityのstate/familyを確かめる。
+ */
+export interface CodeIdentityCheck {
+  status(uid: string, familyId: string | null): Promise<'active' | 'revoked' | 'missing'>;
+  /** 任意。falseの間は機能offと同じ（起動口が秘密の読込み後に照合を結ぶまで）。 */
+  enabled?(): boolean;
+}
+
+function codeEnabled(check: CodeIdentityCheck | undefined): check is CodeIdentityCheck {
+  return check !== undefined && (check.enabled === undefined || check.enabled() === true);
+}
+const CUSTOM_PROVIDER_ID = 'custom';
+const CODE_UID = /^sttdc_[A-Za-z0-9_-]{32}$/;
+const CODE_FAMILY = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export type AccountStatus = 'active' | 'disabled' | 'revoked' | 'deleted';
 
@@ -89,8 +108,23 @@ function classify(error: unknown, idToken: string, projectId: string): IdentityF
   }
 }
 
-export function createFirebaseAdminVerifier(deps: { readonly auth: AdminAuthLike; readonly projectId: string }): IdentityVerifier {
-  const { auth, projectId } = deps;
+async function codeStatus(codeIdentities: CodeIdentityCheck, uid: string, familyId: string | null): Promise<'active' | 'revoked' | 'missing'> {
+  let status: unknown;
+  try {
+    status = await codeIdentities.status(uid, familyId);
+  } catch {
+    throw new IdentityError('unavailable');
+  }
+  if (status !== 'active' && status !== 'revoked' && status !== 'missing') throw new IdentityError('unavailable');
+  return status;
+}
+
+export function createFirebaseAdminVerifier(deps: {
+  readonly auth: AdminAuthLike;
+  readonly projectId: string;
+  readonly codeIdentities?: CodeIdentityCheck | undefined;
+}): IdentityVerifier {
+  const { auth, projectId, codeIdentities } = deps;
   if (!PROJECT_ID_PATTERN.test(projectId)) throw new Error('identity: invalid project id');
   return {
     projectId,
@@ -106,13 +140,39 @@ export function createFirebaseAdminVerifier(deps: { readonly auth: AdminAuthLike
       if (decoded.aud !== projectId || decoded.iss !== `${ISSUER_PREFIX}${projectId}`) throw new IdentityError('wrong_project');
       const firebase = decoded.firebase as { sign_in_provider?: unknown; tenant?: unknown } | undefined;
       if (firebase?.tenant !== undefined) throw new IdentityError('wrong_project');
-      if (firebase?.sign_in_provider !== APPLE_PROVIDER_ID) throw new IdentityError('wrong_provider');
       const { sub, auth_time: authTime } = decoded;
-      if (typeof sub !== 'string' || sub.length === 0 || sub.length > 128) throw new IdentityError('invalid');
-      if (typeof authTime !== 'number' || !Number.isSafeInteger(authTime) || authTime <= 0) throw new IdentityError('invalid');
-      return Object.freeze({ projectId, uid: sub, authTimeSec: authTime });
+      const subjectChecked = () => {
+        if (typeof sub !== 'string' || sub.length === 0 || sub.length > 128) throw new IdentityError('invalid');
+        if (typeof authTime !== 'number' || !Number.isSafeInteger(authTime) || authTime <= 0) throw new IdentityError('invalid');
+        return { sub, authTime };
+      };
+      if (firebase?.sign_in_provider === CUSTOM_PROVIDER_ID) {
+        const { sub, authTime } = subjectChecked();
+        // 開発者向けコード: 機能offではcustomを受けない。marker・専用UID・familyと保存identityのactiveが揃った時だけ。
+        if (!codeEnabled(codeIdentities)) throw new IdentityError('wrong_provider');
+        const family = decoded.sttd_fam;
+        if (decoded.sttd_dlc !== 1 || typeof family !== 'string' || !CODE_FAMILY.test(family) || !CODE_UID.test(sub)) {
+          throw new IdentityError('wrong_provider');
+        }
+        const status = await codeStatus(codeIdentities, sub, family);
+        if (status === 'missing') throw new IdentityError('deleted');
+        if (status !== 'active') throw new IdentityError('revoked');
+        return Object.freeze({ projectId, uid: sub, authTimeSec: authTime, method: 'developer_code' as const });
+      }
+      if (firebase?.sign_in_provider !== APPLE_PROVIDER_ID) throw new IdentityError('wrong_provider');
+      const subject = subjectChecked();
+      // code専用UIDの形はAppleとして受けない（rollback時に旧code identityをApple相当で通さない）。
+      if (CODE_UID.test(subject.sub)) throw new IdentityError('wrong_provider');
+      return Object.freeze({ projectId, uid: subject.sub, authTimeSec: subject.authTime });
     },
     async accountStatus(uid, sinceSec) {
+      // code専用UIDは保存identityのstateも見る（再発行・取消でrefresh/交換を止める）。機能offではcode UIDを有効にしない。
+      if (CODE_UID.test(uid)) {
+        if (!codeEnabled(codeIdentities)) return 'revoked';
+        const status = await codeStatus(codeIdentities, uid, null);
+        if (status === 'missing') return 'deleted';
+        if (status !== 'active') return 'revoked';
+      }
       let user: Awaited<ReturnType<AdminAuthLike['getUser']>>;
       try {
         user = await auth.getUser(uid);

@@ -69,3 +69,12 @@ Callback verification, delivery and CIMD retrieval share the same egress compone
 ## Reporting vulnerabilities
 
 See the English [security policy and reporting channel status](../SECURITY.md). Report vulnerabilities through the GitHub private reporting channel described there. Do not put vulnerability details, secrets, real data or tokens in public issues. If the reporting button is unavailable, ask only for a private security contact without disclosing the issue.
+
+## Developer 6-digit code
+
+- Codes are cryptographically random 000000–999999 and authenticate once, within 10 minutes of issue. After use or cancellation the same number is not issued for at least 24 hours from issue (longer while deletion is delayed). Plain codes are never stored in the database or logs; reservations are identified by an HMAC under a key derived, per purpose, from the deployment secret (identifierKey).
+- Six digits are weak against guessing, so attempts are reserved and counted before comparison (per interaction, per source, and namespace-wide); the namespace limit cannot be bypassed by changing IP or interaction. The limit can also let a third party temporarily block use.
+- Each code creates a new internal account (dedicated UID) and is never linked to an Apple account automatically. Access is granted only to the one UID planned by the operator for that issuance.
+- API and MCP share one identity check that never accepts a token merely because the provider is custom: it checks the marker, the dedicated UID, the stored identity state/family, and the access generation. Reissue or cancel revokes only that family and never affects Apple or other consoles.
+- The 6 digits alone never yield console credentials or the right to reissue (the 32-byte claim secret held in the issuing helper's memory is required).
+- A Firebase create/sign failure, lost response, or deadline never returns a code to unused. A connection that commits late, after the deadline, is revoked.

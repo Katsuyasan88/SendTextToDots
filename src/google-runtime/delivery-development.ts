@@ -24,6 +24,12 @@
 //     cause・値は持たない・写さない（記録はentryが最大1件だけ行う）。
 // 既に始めたSDK・HTTPの物理取消、RAMの物理消去、Cloudのcold startの所要時間は保証しない。
 
+import { DeveloperLoginError } from '../identity/developer-login.js';
+import type { DevelopmentDeveloperCode } from './development.js';
+import { DEVELOPER_LOGIN_MODE } from '../config/validate.js';
+import { createCodeIdentityLookup } from '../identity/developer-code-identity.js';
+import { DEVELOPER_LOGIN_PURPOSE, defaultRandom, developerLoginKeys } from '../identity/developer-login.js';
+import { DeveloperLoginStore } from '../identity/developer-login-store.js';
 import { timingSafeEqual } from 'node:crypto';
 import { types } from 'node:util';
 
@@ -562,6 +568,22 @@ async function startWith(config: Captured): Promise<OwnedDevelopmentDeliveryFunc
 
     // 組立て（同期・I/Oなし）: hasher（所有identifier Bufferを参照）・transport・context・box・ConnectStorage・Functions app。
     const hasher = createHmacHasher(identifierKey);
+    // 開発者向けコード（配置設定でonの時だけ）: 送信APIの共通verifierへ、同じ配置の保存層のcode identity照合（読取りだけ）を結ぶ。
+    if (config.deployment.developerLogin === DEVELOPER_LOGIN_MODE) {
+      const developerKeys = developerLoginKeys(identifierKey);
+      const developerStore = new DeveloperLoginStore({
+        db: sdk.db,
+        scope: { projectId: config.deployment.projectId, databaseId: config.deployment.databaseId, namespace: config.connectNamespace, purpose: DEVELOPER_LOGIN_PURPOSE },
+        hasher: developerKeys.hasher,
+        sealer: developerKeys.sealer,
+        clock,
+        random: defaultRandom,
+      });
+      // SDK部品が無い構成では有効化せず起動失敗に閉じる（offへ黙って落とさない）。
+      const developerCode = (sdk as unknown as { readonly developerCode?: DevelopmentDeveloperCode }).developerCode;
+      if (developerCode === undefined) throw new DeveloperLoginError('unavailable');
+      developerCode.lookup.bind(createCodeIdentityLookup(developerStore));
+    }
     const transport = createGoogleKmsTransport({
       client: sdk.kmsClient,
       projectId: policy.projectId,
