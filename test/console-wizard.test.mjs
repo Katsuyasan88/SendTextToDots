@@ -221,6 +221,12 @@ test('W3 connection check: one manual GET; linked or subscribed with access allo
     assert.deepEqual([ui.stepState(2), ui.stepState(3)], ['current', 'locked'], connection);
   }
   assert.equal(ui.web('/v1/web/connection').length, 3, 'one GET per click, no polling');
+  // 正の遷移（2→3、3→4、4→5）だけが表示先panelをscroll/focusする。失敗・留まる結果では動かない。
+  const moves = [];
+  for (const n of [2, 3, 4, 5]) {
+    el('sttd-panel-' + n).scrollIntoView = () => moves.push('scroll' + n);
+    el('sttd-panel-' + n).focus = () => moves.push('focus' + n);
+  }
   // 接続許可（linked）で3へ。受信の開始は3、受信の確認は4で行う。
   state.connection = 'linked';
   el('sttd-refresh').click();
@@ -244,6 +250,18 @@ test('W3 connection check: one manual GET; linked or subscribed with access allo
   await settle();
   assert.deepEqual([ui.stepState(4), ui.stepState(5), el('sttd-receive-text').textContent], ['done', 'current', JA('wizard.receive.ok')]);
   assert.equal(ui.web('/v1/web/connection').length, 6, 'one GET per explicit click');
+  assert.deepEqual(moves, ['scroll3', 'focus3', 'scroll4', 'focus4', 'scroll5', 'focus5'], 'linked in step 4 does not move');
+  // 手順2の明示確認の成功は、既に完了済みでも手順3を表示する。失敗では動かない。
+  assert.equal(ui.clickPanel(2), true);
+  el('sttd-refresh').click();
+  await settle();
+  assert.deepEqual([ui.stepState(3), moves.slice(6)], ['current', ['scroll3', 'focus3']]);
+  assert.equal(ui.clickPanel(2), true);
+  state.mode = 'webFail';
+  el('sttd-refresh').click();
+  await settle();
+  state.mode = 'deliver';
+  assert.deepEqual([ui.stepState(2), moves.length], ['current', 8], 'a failed check does not move');
   // 3を済ませてから再確認（subscribed継続）: 進捗保持。確認中は3以降を封鎖。保留中のGETを合成するため接続応答を遅らせる。
   const held = gate();
   const normal = onFetch;
@@ -283,9 +301,10 @@ test('W3 connection check: one manual GET; linked or subscribed with access allo
   assert.deepEqual([uiB.panelState(3) === 'current', uiB.panelState(4) === 'current'], [false, false], 'steps 3+ cannot be opened while checking');
   held.release();
   await settle();
-  assert.deepEqual([uiB.stepState(2), uiB.stepState(3), uiB.stepState(4)], ['current', 'done', 'ready'], 'subscribed again: progress kept');
+  assert.deepEqual([uiB.stepState(2), uiB.stepState(3), uiB.stepState(4)], ['done', 'current', 'ready'], 'subscribed again: progress kept and the explicit success shows step 3');
   // 非subscribedへ変化 → 3以降を戻し案内。
   state.connection = 'expired';
+  uiB.clickPanel(2);
   uiB.el('sttd-refresh').click();
   await settle();
   assert.deepEqual([uiB.stepState(3), uiB.stepState(4)], ['locked', 'locked']);
@@ -1124,6 +1143,8 @@ test('W16 receiving check in step 4: only an explicit click sends one GET; linke
   ui2.el('sttd-manual-test').click();
   ui2.el('sttd-done-test').click();
   await settle();
+  const moved = [];
+  ui2.el('sttd-panel-5').scrollIntoView = () => moved.push(5);
   h2.state.connection = 'subscribed';
   hold = true;
   ui2.el('sttd-receive-check').click();
@@ -1134,5 +1155,6 @@ test('W16 receiving check in step 4: only an explicit click sends one GET; linke
   held.release();
   await settle();
   assert.deepEqual([1, 2, 3, 4, 5, 6].map(ui2.stepState), ['current', 'locked', 'locked', 'locked', 'locked', 'locked'], 'the stale result unlocks nothing');
+  assert.deepEqual(moved, [], 'the stale result does not move the view');
   results.W16 = { gets: ui.web('/v1/web/connection').length };
 });

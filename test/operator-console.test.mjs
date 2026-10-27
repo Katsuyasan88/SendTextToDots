@@ -492,14 +492,14 @@ test('B7 the code input guide appears only after a successful issue; hidden on f
   assert.equal(ui.el('sttd-code-guide').hidden, true, 'hidden after a method switch');
 });
 
-test('B8 after the code sign-in step 2 uses the normal connection check only; switching after an Apple sign-in shows the reinstall notice', async () => {
+test('B8 after the code sign-in step 2 uses the normal connection check only (reissue and cancel stay); switching after an Apple sign-in shows the reinstall notice', async () => {
   const ui = await runConsoleWithOperator({ onOperator: async (action) => (action === 'issue' ? issuedJson() : activeJson()) });
   await ui.click('sttd-method-code');
   await ui.click('sttd-method-continue');
   await ui.click('sttd-code-confirm');
   assert.equal(ui.el('sttd-refresh').hidden, false, 'normal connection check after the code sign-in');
   assert.equal(ui.el('sttd-code-confirm').hidden, true, 'no second (code) check');
-  assert.equal(ui.el('sttd-code-reissue').hidden, true);
+  assert.deepEqual([ui.el('sttd-code-reissue').hidden, ui.el('sttd-code-cancel').hidden], [false, false], 'reissue and cancel stay in step 2');
   const apple = await runConsoleWithOperator({ onOperator: async () => issuedJson() });
   await apple.click('sttd-method-continue');
   assert.equal(apple.base.calls.popups, 1);
@@ -582,4 +582,34 @@ test('B5 a slow custom-token SDK result after switching is signed out; a restore
   assert.equal(restored.base.calls.popups, 1, 'Apple sign-in is explicit');
   assert.notEqual(restored.base.auth.currentUser?.uid, CODE_UID);
   assert.equal(restored.stepState(2), 'current');
+});
+
+test('B9 after the code sign-in a failed reissue keeps the connection; a successful reissue or cancel ends the old owner and the later steps through the controller', async () => {
+  let reissue = 'fail';
+  const ui = await runConsoleWithOperator({
+    onOperator: async (action) => {
+      if (action === 'issue') return issuedJson();
+      if (action === 'reissue') return reissue === 'ok' ? issuedJson() : { status: 503, json: { error: { code: 'issue_failed' } } };
+      if (action === 'cancel') return { status: 200, json: { state: 'cancelled' } };
+      return activeJson();
+    },
+  });
+  await ui.click('sttd-method-code');
+  await ui.click('sttd-method-continue');
+  await ui.click('sttd-code-confirm');
+  assert.deepEqual([ui.stepState(1), ui.stepState(2), ui.el('sttd-login').hidden], ['done', 'current', true]);
+  await ui.click('sttd-code-reissue');
+  assert.deepEqual([ui.stepState(1), ui.stepState(2), ui.el('sttd-login').hidden], ['done', 'current', true], 'a failed reissue keeps the current connection');
+  assert.notEqual(ui.base.auth.currentUser, null);
+  reissue = 'ok';
+  const signOuts = ui.base.calls.signOuts;
+  await ui.click('sttd-code-reissue');
+  assert.equal(ui.base.auth.currentUser, null, 'the old code owner is signed out');
+  assert.ok(ui.base.calls.signOuts > signOuts);
+  assert.deepEqual([1, 2, 3, 4, 5, 6].map(ui.stepState), ['ready', 'current', 'locked', 'locked', 'locked', 'locked'], 'the new code opens only step 2');
+  assert.deepEqual([ui.el('sttd-code-confirm').hidden, ui.el('sttd-code-value').textContent], [false, '012345']);
+  await ui.click('sttd-code-cancel');
+  assert.deepEqual([1, 2, 3, 4, 5, 6].map(ui.stepState), ['current', 'locked', 'locked', 'locked', 'locked', 'locked'], 'cancel locks step 2 and later');
+  assert.equal(ui.el('sttd-code-reissue').hidden, true);
+  assert.equal(ui.fetches.filter((f) => !f.url.startsWith('/v1/operator/')).length, 0, 'no upstream call');
 });

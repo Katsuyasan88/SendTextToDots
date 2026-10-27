@@ -580,6 +580,13 @@ function chooseLanguage(next) {
   document.cookie = LANGUAGE_COOKIE + '=' + next + '; ' + COOKIE_ATTRIBUTES;
 }
 
+/** 正の遷移先panelを表示する（scroll＋focus）。失敗・古い結果・再選択では呼ばない。 */
+function reveal(n) {
+  const panel = el('sttd-panel-' + n);
+  if (panel && typeof panel.scrollIntoView === 'function') panel.scrollIntoView({ block: 'start' });
+  if (panel && typeof panel.focus === 'function') panel.focus();
+}
+
 function selectStep(n) {
   if (!available(n)) return;
   step = n;
@@ -814,20 +821,24 @@ async function checkConnection(internal) {
   const json = await connectionGet(2);
   if (json === undefined) return;
   if (json === null) return render();
+  let moveTo = 0;
   if ((json.state === 'linked' || json.state === 'subscribed') && access === 'allowed') {
     // 接続許可（linked）で手順3へ。受信の開始と確認は手順3/4で行う（ここではsubscribedを要求しない）。
     const first = !done[2];
     done[2] = true;
     noteKey = '';
     if (json.state === 'linked' && done[4]) receiveLost();
-    if (first) step = 3;
+    // 明示の確認の成功は、既に完了済みでも手順3を表示する。
+    if (first || !internal) moveTo = 3;
   } else if ((json.state === 'linked' || json.state === 'subscribed') && done[2]) {
     // 接続のまま利用許可だけが無い: 進捗（前の送信の確認・中止を含む）は残し、新しい送信だけを止める（sendableNowがallowedを要求）。
     if (json.state === 'linked' && done[4]) receiveLost();
   } else {
     connectionLost();
   }
+  if (moveTo !== 0) step = moveTo;
   render();
+  if (moveTo !== 0) reveal(moveTo);
 }
 
 /** 手順4: 受信状態の確認（明示1回GET）。subscribed＋allowedだけが手順5を開く。linkedは手順4に留めて受信開始を案内する。 */
@@ -845,6 +856,9 @@ async function checkReceiving() {
     noteKey = '';
     receiveKey = 'wizard.receive.ok';
     step = 5;
+    render();
+    reveal(5);
+    return;
   } else if (json.state === 'linked') {
     receiveKey = access === 'allowed' ? 'wizard.receive.linked' : 'wizard.access.' + access;
     if (done[4]) receiveLost();
@@ -1011,6 +1025,7 @@ function completeTest() {
   noteKey = reapplied ? 'wizard.testReapplied' : '';
   step = 4;
   render();
+  reveal(4);
 }
 
 /** 5の完了操作: 本人がDotsで一致を確認した明示操作（受領/不明の終端だけ）。 */
@@ -1205,9 +1220,33 @@ function codeIssuedFor(epoch) {
   if (guide) guide.open = true;
   render();
   codeState();
-  const panel = el('sttd-panel-2');
-  if (panel && typeof panel.scrollIntoView === 'function') panel.scrollIntoView({ block: 'start' });
-  if (panel && typeof panel.focus === 'function') panel.focus();
+  reveal(2);
+  return true;
+}
+
+/**
+ * コードの再発行/取消の成功（この世代のコード方式だけ）。旧コードとその接続はhelper側で終了済みなので、旧owner・後続の進捗（受信確認・送信を含む）を
+ * 無効にして手順1へ戻す（再発行は続くissuedで手順2へ）。失敗時は呼ばれず、現在の接続を保持する。
+ */
+function codeEndedFor(epoch) {
+  if (method !== 'code' || epoch !== codeEpoch) return false;
+  const hadProgress = done[1] || signedIn;
+  codeIssued = false;
+  loginGeneration += 1;
+  checkGeneration += 1;
+  checking = false;
+  accountBusy = false;
+  confirming = false;
+  resetFrom(2);
+  signedIn = false;
+  done[1] = false;
+  ownerUid = null;
+  step = 1;
+  accountKey = 'console.accountSignedOut';
+  noteKey = hadProgress ? 'wizard.loginReset' : '';
+  render();
+  codeState();
+  if (sdk !== null && sdk.auth.currentUser) Promise.resolve().then(() => sdk.signOut(sdk.auth)).catch(() => {});
   return true;
 }
 
@@ -1274,6 +1313,7 @@ globalThis.sttdConsoleCode = Object.freeze({
   // 認証済み・発行済み等の進捗の有無（方式切替時の旧plugin再追加の案内に使う）
   progressed: () => done[1] || codeIssued || signedIn,
   issued: (epoch) => codeIssuedFor(epoch),
+  ended: (epoch) => codeEndedFor(epoch),
   signIn: (epoch, customToken) => codeSignIn(epoch, customToken),
   subscribe(listener) {
     if (typeof listener !== 'function') return;

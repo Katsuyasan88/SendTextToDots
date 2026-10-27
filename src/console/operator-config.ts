@@ -257,11 +257,11 @@ function hideCode() {
 }
 
 function controls() {
-  // コードで認証済みになった後は、手順2の通常の接続確認だけを使う（コードの確認/再発行/取消は出さない）
+  // コードで認証済みになった後は、二重になるコードの接続確認だけを隠す（通常の接続確認を使う）。再発行/取消は手順2に残す
   const signed = chosen === 'code' && last !== null && last.signedIn === true;
-  show('sttd-code-reissue', issuedOnce && !signed);
+  show('sttd-code-reissue', issuedOnce || signed);
   show('sttd-code-confirm', issuedOnce && !signed);
-  show('sttd-code-cancel', issuedOnce && !signed);
+  show('sttd-code-cancel', issuedOnce || signed);
 }
 
 function tick() {
@@ -294,6 +294,8 @@ async function issue(action) {
     const { status, body } = await call(action);
     if (!current(at)) return;
     if (status === 200 && typeof body.code === 'string' && /^[0-9]{6}$/.test(body.code) && Number.isSafeInteger(body.authExpiresAt)) {
+      // 再発行の成功は旧コードの接続を終えている: 本体の旧owner・後続・送信を無効にしてから新しいコードを出す
+      if (action === 'reissue' && typeof bridge.ended === 'function') bridge.ended(at);
       return showCode(body.code, body.authExpiresAt, at);
     }
     if (status === 409 && body.error && body.error.code === 'use_reissue') {
@@ -336,6 +338,8 @@ async function cancelCode() {
   try {
     const { status } = await call('cancel');
     if (status === 200) {
+      // 取消の成功は旧コードの接続を終えている: 本体の旧owner・後続・送信を無効にする（失敗時は現在の接続を保持）
+      if (typeof bridge.ended === 'function') bridge.ended(epoch);
       hideCode();
       issuedOnce = false;
       controls();
