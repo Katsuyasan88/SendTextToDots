@@ -19,6 +19,28 @@ const IDENTITY_HASH = /^[0-9a-f]{64}$/;
 const RECORD_KEYS = ['version', 'state', 'generation', 'updatedAt'] as const;
 const GRANT_META_LEGACY_KEYS = ['ownerId', 'authTimeSec', 'createdAt'] as const;
 const GRANT_META_KEYS = ['ownerId', 'authTimeSec', 'createdAt', 'accessGeneration'] as const;
+const GRANT_META_RECEIVER_KEYS = ['ownerId', 'authTimeSec', 'createdAt', 'accessGeneration', 'receiverGeneration'] as const;
+
+/** 受信reset世代（ownerの受信先設定一式を消した回数）。安全な整数で、下限以上の時だけ有効。 */
+function isReceiverGeneration(value: unknown, min: number): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= min;
+}
+
+/**
+ * grantMetaの受信reset世代（欠落は既存の0）。値はgrantGenerationOfでboundと判定した記録だけに使う。不正はnull。
+ * 受信先の設定（購読）の利用だけに使い、利用許可の世代の判定（grantUseVerdict）は変えない。
+ */
+export function grantReceiverGenerationOf(value: unknown): number | null {
+  const data = plainData(value);
+  if (data === null) return null;
+  try {
+    if (!Object.hasOwn(data, 'receiverGeneration')) return 0;
+    const generation = ownValue(data, 'receiverGeneration');
+    return isReceiverGeneration(generation, 1) ? generation : null;
+  } catch {
+    return null;
+  }
+}
 /** 接続保存の内部owner ID（randomUUIDの小文字UUID）。 */
 const OWNER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -126,10 +148,10 @@ export function grantGenerationOf(exists: boolean, value: unknown): GrantGenerat
   const data = plainData(value);
   if (data === null) return { kind: 'invalid' };
   try {
-    // exact key: 旧形式は{ownerId, authTimeSec, createdAt}、現行はそれにaccessGeneration。余分・欠落は不正。
+    // exact key: 旧形式は{ownerId, authTimeSec, createdAt}、現行はそれにaccessGeneration（受信reset世代が1以上ならreceiverGenerationも）。余分・欠落は不正。
     const keys = Reflect.ownKeys(data);
     const legacy = !Object.hasOwn(data, 'accessGeneration');
-    const expected: readonly string[] = legacy ? GRANT_META_LEGACY_KEYS : GRANT_META_KEYS;
+    const expected: readonly string[] = legacy ? GRANT_META_LEGACY_KEYS : Object.hasOwn(data, 'receiverGeneration') ? GRANT_META_RECEIVER_KEYS : GRANT_META_KEYS;
     if (keys.length !== expected.length || !keys.every((key) => typeof key === 'string' && expected.includes(key))) return { kind: 'invalid' };
     const ownerId = ownValue(data, 'ownerId');
     const authTimeSec = ownValue(data, 'authTimeSec');
@@ -141,6 +163,7 @@ export function grantGenerationOf(exists: boolean, value: unknown): GrantGenerat
     if (legacy) return { kind: 'legacy' };
     const generation = ownValue(data, 'accessGeneration');
     if (!isAccessGeneration(generation)) return { kind: 'invalid' };
+    if (Object.hasOwn(data, 'receiverGeneration') && !isReceiverGeneration(ownValue(data, 'receiverGeneration'), 1)) return { kind: 'invalid' };
     return { kind: 'bound', ownerId, generation };
   } catch {
     return { kind: 'invalid' };

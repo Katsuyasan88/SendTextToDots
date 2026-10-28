@@ -75,6 +75,7 @@ import {
   renderInteractionAccessDenied,
   renderInteractionConsent,
   renderInteractionLogin,
+  renderReceiverResetOutcome,
   type FirebaseWebConfig,
 } from './pages.js';
 
@@ -812,6 +813,8 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         interactionTtlMs: PRODUCT_POLICY.interactionTtlMs,
         // providerの接続profileが次のrefresh tokenへ与える無活動窓と同じ値。
         grantInactivityMs: PRODUCT_POLICY.refreshFamilyMaxSec * 1000,
+        // 受信先設定（購読保存の既存marker確認済みnamespace）。同意画面での削除の確認と、確認後の1つのtransactionだけに使う。
+        receiverSubscriptions: (ownerId: string) => db.collection(AUTH_STORAGE_ROOT).doc(policy.namespace).collection('subscriptions').doc(ownerId),
       });
       context.current();
       return { hasher, storage };
@@ -1088,11 +1091,23 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       const opened = await guarded(() => storage.openInteraction(uid));
       if (opened === undefined) throw apiErrors.linkUnavailable();
       const { language, headers } = pageLanguage(req, url);
+      // 同意画面では、Appleのloginで受信先設定がある時だけ、削除の確認（不透明token）を出す。読取りだけで、何も消さない。
+      const offer = opened.ownerId === null ? null : await guarded(() => storage.receiverResetOffer(uid));
       const html =
         opened.ownerId === null
           ? renderInteractionLogin(web, uid, label, opened.csrf, language, developerExchange() !== null)
-          : renderInteractionConsent(web, uid, label, opened.csrf, language);
+          : renderInteractionConsent(web, uid, label, opened.csrf, language, offer === null ? null : { token: offer.token });
       send(res, 200, 'text/html; charset=utf-8', html, { ...pageSecurityHeaders(web), ...headers });
+    }
+
+    /** 削除をしなかった（未確認・設定の変化）時の同意画面の再表示（409）。interactionは消費していない。 */
+    async function reshowConsent(req: IncomingMessage, res: ServerResponse, uid: string, url: URL, label: string): Promise<void> {
+      const opened = await guarded(() => storage.openInteraction(uid));
+      if (opened === undefined || opened.ownerId === null) throw apiErrors.linkUnavailable();
+      const offer = await guarded(() => storage.receiverResetOffer(uid));
+      const { language, headers } = pageLanguage(req, url);
+      const html = renderInteractionConsent(web, uid, label, opened.csrf, language, offer === null ? null : { token: offer.token, required: true });
+      send(res, 409, 'text/html; charset=utf-8', html, { ...pageSecurityHeaders(web), ...headers });
     }
 
     async function loginInteraction(req: IncomingMessage, res: ServerResponse, uid: string): Promise<void> {
@@ -1107,7 +1122,9 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       if (admission.kind === 'denied') throw accessDenied();
       if (admission.kind !== 'admitted') throw apiErrors.forbidden();
       const { ownerId } = admission;
-      const bound = await guarded(() => storage.bindInteraction(uid, body.csrf, ownerId, verified.authTimeSec, admission.accessGeneration));
+      // login方法は検証済みのID tokenから決めた値だけ（開発者向けコードはserverが判定したmethod）。clientの申告は使わない。
+      const loginMethod = verified.method === 'developer_code' ? 'developer_code' : 'apple';
+      const bound = await guarded(() => storage.bindInteraction(uid, body.csrf, ownerId, verified.authTimeSec, admission.accessGeneration, loginMethod));
       if (bound === 'other_owner') throw new ApiError(409, 'owner_mismatch');
       if (bound === 'denied') throw accessDenied();
       if (bound !== 'ok') throw apiErrors.linkUnavailable();
@@ -1184,26 +1201,58 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
 
     async function consentInteraction(req: IncomingMessage, res: ServerResponse, uid: string, url: URL): Promise<void> {
       requireSameOrigin(req);
-      const form = await guarded(() => readForm(req, ['csrf']));
+      const form = await guarded(() => readForm(req, ['csrf', 'receiverReset', 'receiverToken']));
       const interaction = await browserInteraction(req, res, uid);
-      const consent = await guarded(() => storage.consumeInteraction(uid, form.get('csrf') ?? ''));
+      const csrf = form.get('csrf') ?? '';
+      const confirmed = form.get('receiverReset') === '1';
+      // 受信先設定の削除は、本人が確認欄を選んだ時だけ1つのtransactionで行う（Appleのloginでない・機能なしは'not_applicable'で通常の同意へ）。
+      // 確認していないのに受信先設定がある時は、消費も削除もせず、確認付きの同意画面へ戻す。
+      let consent: Awaited<ReturnType<typeof storage.consumeInteraction>>;
+      if (confirmed) {
+        const reset = await guarded(() => storage.consumeInteractionWithReceiverReset(uid, csrf, form.get('receiverToken') ?? ''));
+        if (reset === 'changed') return reshowConsent(req, res, uid, url, await clientLabel(interaction.params.client_id));
+        consent = reset === 'not_applicable' ? await guarded(() => storage.consumeInteraction(uid, csrf)) : reset;
+      } else {
+        if (!(await guarded(() => storage.interactionAccepts(uid, csrf)))) throw apiErrors.linkUnavailable();
+        if ((await guarded(() => storage.receiverResetOffer(uid))) !== null) return reshowConsent(req, res, uid, url, await clientLabel(interaction.params.client_id));
+        consent = await guarded(() => storage.consumeInteraction(uid, csrf));
+      }
       if (consent === undefined) throw apiErrors.linkUnavailable();
       if (consent === 'denied') return sendAccessDenied(req, res, uid, url);
-      if (!(await guarded(() => storage.isOwnerActive(consent.ownerId)))) throw apiErrors.linkUnavailable();
-      // 同意は同ownerと元interactionへ単回で束縛し、Grantのresource scopeとgrantMetaを保存する。grantMetaは同じtransactionで
-      // 利用許可の世代を再確認し、停止を跨いだら作らない（metadataの無いGrantは新規利用に使えず、成功応答もしない）。
-      const grant = new provider.Grant({ accountId: consent.ownerId, clientId: String(interaction.params.client_id) });
-      grant.addResourceScope(resource, STTD_SCOPE);
-      const grantId = await guarded(() => grant.save());
-      if ((await guarded(() => storage.putGrantMeta(grantId, consent))) !== 'created') return sendAccessDenied(req, res, uid, url);
-      log({ event: 'interaction.consented' });
-      alive();
-      await provider.interactionFinished(
-        req,
-        res,
-        { login: { accountId: consent.ownerId, remember: false }, consent: { grantId } },
-        { mergeWithLastSubmission: false },
-      );
+      const receiverReset = consent.receiverReset === true;
+      if (receiverReset) log({ event: 'interaction.receiver_reset' });
+      try {
+        if (!(await guarded(() => storage.isOwnerActive(consent.ownerId)))) throw apiErrors.linkUnavailable();
+        // 同意は同ownerと元interactionへ単回で束縛し、Grantのresource scopeとgrantMetaを保存する。grantMetaは同じtransactionで
+        // 利用許可の世代と受信reset世代を再確認し、停止・別のresetを跨いだら作らない（metadataの無いGrantは新規利用に使えず、成功応答もしない）。
+        const grant = new provider.Grant({ accountId: consent.ownerId, clientId: String(interaction.params.client_id) });
+        grant.addResourceScope(resource, STTD_SCOPE);
+        const grantId = await guarded(() => grant.save());
+        if ((await guarded(() => storage.putGrantMeta(grantId, consent))) !== 'created') {
+          if (receiverReset) return sendReceiverResetOutcome(req, res, uid, url, 'incomplete');
+          return sendAccessDenied(req, res, uid, url);
+        }
+        log({ event: 'interaction.consented' });
+        alive();
+        await provider.interactionFinished(
+          req,
+          res,
+          { login: { accountId: consent.ownerId, remember: false }, consent: { grantId } },
+          { mergeWithLastSubmission: false },
+        );
+      } catch (error) {
+        // 削除の確定の後の失敗は、削除済みを隠さない。応答の前なら固定の案内、応答の後は二重に書かない。
+        if (!receiverReset) throw error;
+        if (res.headersSent) return;
+        return sendReceiverResetOutcome(req, res, uid, url, error instanceof ApiError ? 'incomplete' : 'unknown');
+      }
+    }
+
+    /** 受信先設定の削除の確定の後に、接続が完了しなかった・結果を確認できなかった時の固定案内（503）。 */
+    function sendReceiverResetOutcome(req: IncomingMessage, res: ServerResponse, uid: string, url: URL, outcome: 'incomplete' | 'unknown'): void {
+      log({ event: 'interaction.receiver_reset_incomplete', category: outcome });
+      const { language, headers } = pageLanguage(req, url);
+      send(res, 503, 'text/html; charset=utf-8', renderReceiverResetOutcome(web, uid, outcome, language), { ...pageSecurityHeaders(web), ...headers });
     }
 
     async function denyInteraction(req: IncomingMessage, res: ServerResponse, uid: string): Promise<void> {

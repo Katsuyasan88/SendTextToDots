@@ -31,6 +31,8 @@ import {
   type KmsSubscriptionPolicy,
 } from './kms-subscription-format.js';
 import { AUTH_STORAGE_ROOT, KMS_SUBSCRIPTION_CONFIG_DOC } from './kms-subscription-format.js';
+import { grantReceiverGenerationOf } from '../../access/policy.js';
+import { ownerReceiverGeneration } from './receiver-reset.js';
 import {
   applyActivation,
   applyCancel,
@@ -464,8 +466,11 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
     return { access, meta };
   }
 
-  /** 利用許可がactiveで、要求Grantの同意記録が同じownerの現在の世代か。不許可はgrant_inactive、不正・不明はunavailable。 */
-  function requireAccess(snapshots: AccessSnapshots, ownerId: string): void {
+  /**
+   * 利用許可がactiveで、要求Grantの同意記録が同じownerの現在の世代か。不許可はgrant_inactive、不正・不明はunavailable。
+   * さらに、要求Grantの受信reset世代がownerの現在の受信reset世代と同じこと（受信先設定一式を消した後に、前の同意のGrantで受信先設定を作らせない）。
+   */
+  function requireAccess(snapshots: AccessSnapshots, ownerId: string, owner: DocumentSnapshot): void {
     const decision = grantUseDecision(
       { exists: snapshots.access.exists, data: snapshots.access.exists ? snapshots.access.data() : undefined },
       { exists: snapshots.meta.exists, data: snapshots.meta.exists ? snapshots.meta.data() : undefined },
@@ -473,6 +478,15 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
     );
     if (decision === 'denied') throw registrationError('grant_inactive');
     if (decision !== 'allowed') throw registrationError('unavailable');
+    const grantReceiver = grantReceiverGenerationOf(snapshots.meta.data());
+    let ownerReceiver: number;
+    try {
+      ownerReceiver = ownerReceiverGeneration(owner.data());
+    } catch {
+      throw registrationError('unavailable');
+    }
+    if (grantReceiver === null) throw registrationError('unavailable');
+    if (grantReceiver !== ownerReceiver) throw registrationError('grant_inactive');
   }
 
   function requireMarker(snapshot: DocumentSnapshot): void {
@@ -592,7 +606,7 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
         if (!ownerActive(owner, at)) throw registrationError('grant_inactive');
         const generation = ownerGeneration(owner.data());
         if (!grantLive(requestGrant, auth.ownerId, auth.grantId, at)) throw registrationError('grant_inactive');
-        requireAccess(accessSnapshots, auth.ownerId);
+        requireAccess(accessSnapshots, auth.ownerId, owner);
         return {
           subscription: versionOf(subscription),
           generation,
@@ -619,7 +633,7 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
         const accessSnapshots = await readAccess(tx, operation, owner, requestMetaRef);
         const at = decisionTime(operation);
         const { generation, verdicts } = authorize(operation, auth, { owner, marker, grants: grantSnapshots }, proven, at);
-        requireAccess(accessSnapshots, auth.ownerId);
+        requireAccess(accessSnapshots, auth.ownerId, owner);
         if (generation !== first.generation || !sameDocVersion(versionOf(subscription), first.subscription)) throw registrationError('conflict');
         const state = readState(subscription, auth.ownerId) ?? emptyKmsState();
         projectBindings(state, at, verdictLookup(verdicts));
@@ -688,7 +702,7 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
         const accessSnapshots = await readAccess(tx, operation, owner, metaRef);
         const at = decisionTime(operation);
         const { generation, verdicts } = authorize(operation, auth, { owner, marker, grants: grantSnapshots }, record.grants, at);
-        requireAccess(accessSnapshots, auth.ownerId);
+        requireAccess(accessSnapshots, auth.ownerId, owner);
         // challengeの待機中の取消・再登録・延長・Grantの再保存は、同じid/hashへ戻っていても版違いのconflict（自動の再challenge・外側retry0）。
         if (generation !== record.generation || !sameDocVersion(versionOf(subscription), record.subscription)) throw registrationError('conflict');
         const state = readState(subscription, auth.ownerId) ?? emptyKmsState();

@@ -145,7 +145,7 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 
 表示言語: HTML画面（`/console`・OAuth interaction・利用者向けOAuthエラー）は英語/日本語で描きます。`?lang=en` / `?lang=ja` の明示選択は表示専用のsession cookie `sttd_language`（Path=/・SameSite=Lax・Secure・期限なし）へ保存し、送信画面での言語切替も同じcookieをbrowserで書くため最後の選択が残ります。無い時は `Accept-Language` の優先順位（日本語選好ならja、それ以外はen）で決めます。このcookieを認証・認可に使わず、machine code・field・scope・route・送信本文は翻訳しません。
 
-状態の優先順位: 有効なGrantが無い→unlinked、承認待ちの送信先置換→change_pending、有効な購読→subscribed、直前の購読が期限切れ→expired、それ以外（未購読・購読取消）→linked。
+状態の優先順位: 有効なGrantが無い→unlinked、承認待ちの送信先置換→change_pending、有効な購読→subscribed、直前の購読が期限切れ→expired、それ以外（未購読・購読取消）→linked。change_pending（既知の送信先と別の宛先）は、プラグインの接続をAppleでやり直し、最後の許可画面で本人が以前の受信先設定の削除を確認した時だけ解消します（受信先設定一式だけを消し、受信reset世代を進めます。それより前の同意のGrantでは、受信先を設定できません）。
 
 利用許可（`access`）は購読の`state`と別に返します。許可を読めない時もHTTP 200で`state`と`access: "unavailable"`を返し、新しい利用はできません。OAuth interactionのloginでは、未登録・停止中の本人は403 `access_denied`（画面は「このサービスの利用が許可されていません。運営者へ確認」）でownerを作りません。同意の時点で停止・再登録を跨いだ場合も同じ案内の403画面でGrantを使える状態にしません。code交換・refreshは同じ世代のGrantだけで、そうでなければ既存の`invalid_grant`です。MCPの`events/subscribe`（延長・secret更新を含む）は既存のForbidden（`data.reason` = `access_revoked`）で、challengeの前と最終の保存時の両方で確かめます。`events/unsubscribe`・接続解除・状態照会・取消は利用許可を条件にしません。
 

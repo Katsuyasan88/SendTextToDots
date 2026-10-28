@@ -1294,3 +1294,35 @@ test('U18 delivery store reads the same access record and Grant consent generati
   setAccess(other.ownerId, 'disabled');
   assert.equal((await store.read(other.ownerId, second.commandKey, op()))?.state, 'dispatching');
 });
+
+test('U20 receiver reset generation: a Grant of the previous receiver generation cannot create receiver settings (no timestamp involved); the current generation can; malformed values are temporary failures', { timeout: 30_000 }, async () => {
+  const auth = await who();
+  const meta = dataOf(metaPath(auth.grantId));
+  const owner = dataOf(ownerPath(auth.ownerId));
+  // 不正な受信reset世代（ownerとGrantの両方）: challenge前に一時障害、書込み0。
+  {
+    const count = counter();
+    db.write(ownerPath(auth.ownerId), { ...owner, receiverGeneration: -1 });
+    expectRt(await subscribe(auth, input(newUrl('u20x'), newSecret())), 'unavailable');
+    db.write(ownerPath(auth.ownerId), owner);
+    db.write(metaPath(auth.grantId), { ...meta, receiverGeneration: 0 });
+    expectRt(await subscribe(auth, input(newUrl('u20x'), newSecret())), 'unavailable');
+    const c = count();
+    assert.deepEqual({ sent: c.sent, writes: c.writes }, { sent: 0, writes: 0 });
+  }
+  // ownerがresetされた（受信reset世代1）。同じ時刻のままでも、世代0のGrantは受信先設定を作れない。
+  db.write(ownerPath(auth.ownerId), { ...owner, receiverGeneration: 1 });
+  db.write(metaPath(auth.grantId), meta);
+  {
+    const count = counter();
+    assert.equal((await subscribe(auth, input(newUrl('u20a'), newSecret()))).kind, 'sub:grant_inactive');
+    const c = count();
+    assert.deepEqual({ sent: c.sent, writes: c.writes }, { sent: 0, writes: 0 });
+    assert.equal(dataOf(subPath(auth.ownerId)), undefined);
+  }
+  // 現在の世代のGrant（resetの後の同意）は、通常のchallengeを経て受信先設定を作れる。
+  db.write(metaPath(auth.grantId), { ...meta, receiverGeneration: 1 });
+  const ok = await subscribe(auth, input(newUrl('u20b'), newSecret()));
+  assert.equal(typeof ok.value?.id, 'string');
+  assert.equal(dataOf(subPath(auth.ownerId)).active.id, ok.value.id);
+});
