@@ -963,14 +963,21 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         scoped(operation, (current) => service.unsubscribe(auth, identityInput, current)),
     });
 
-    const mcp = createRequestScopedMcpEntry({
-      issuer,
-      resource,
-      clock,
-      resolveOAuthOwner: resolver,
-      subscriptions,
-      onError: (category) => log({ event: 'mcp.error', category }),
-    });
+    const mcp = createRequestScopedMcpEntry(
+      {
+        issuer,
+        resource,
+        clock,
+        resolveOAuthOwner: resolver,
+        subscriptions,
+        onError: (category) => log({ event: 'mcp.error', category }),
+      },
+      {
+        // 購読の結果の固定分類だけ（診断ログが有効な時だけ出る）。
+        onSubscribe: (outcome) =>
+          log(outcome === 'ok' ? { event: 'events.subscribed' } : { event: 'events.subscribe_failed', category: outcome }),
+      },
+    );
     owned.mcp = mcp;
 
     const connections = new ConnectionService({

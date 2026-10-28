@@ -21,6 +21,26 @@ const DIAGNOSTIC_EVENTS: ReadonlyMap<string, readonly string[]> = new Map([
   ['oauth.server_error', ['authorization_code', 'refresh_token']],
   ['oauth.request_error', ['authorization_code', 'refresh_token']],
   ['oauth.grant_revoked', ['Grant', 'AccessToken', 'AuthorizationCode', 'RefreshToken']],
+  ['events.subscribed', []],
+  [
+    'events.subscribe_failed',
+    [
+      'invalid_request',
+      'unknown_event',
+      'cursor_unsupported',
+      'destination_change_pending',
+      'grant_inactive',
+      'conflict',
+      'callback_endpoint.connection_refused',
+      'callback_endpoint.timeout',
+      'callback_endpoint.tls_error',
+      'callback_endpoint.http_4xx',
+      'callback_endpoint.http_5xx',
+      'callback_endpoint.challenge_failed',
+      'context_unavailable',
+      'request_rejected',
+    ],
+  ],
 ]);
 
 const RFC3339_UTC = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?Z$/;

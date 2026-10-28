@@ -74,6 +74,29 @@ type EventsCapabilities = ServerCapabilities & { events: Record<string, never> }
 const REQUIRED = ['issuer', 'resource', 'clock', 'resolveOAuthOwner', 'subscriptions', 'onError'] as const;
 const OPTIONAL = ['budgetMs', 'closeBudgetMs'] as const;
 
+/**
+ * `events/subscribe`の1回の結果の固定分類（診断の通知だけに使う）。成功は`ok`、portの失敗はkind（callbackはreasonつき）、
+ * 期限・中止・close・contextの不一致は`context_unavailable`、それ以外は`other`。error.message等の内容は使わない。
+ * `Mcp-Method: events/subscribe`の要求が、handlerへ届かずに終わった時（SDKのparams検証・認証・入口の拒否）は`request_rejected`。
+ */
+export type McpSubscribeOutcome =
+  | 'ok'
+  | 'invalid_request'
+  | 'unknown_event'
+  | 'cursor_unsupported'
+  | 'destination_change_pending'
+  | 'grant_inactive'
+  | 'conflict'
+  | `callback_endpoint.${CallbackEndpointReason}`
+  | 'context_unavailable'
+  | 'request_rejected'
+  | 'other';
+
+/** entryの任意の通知（第2引数）。onSubscribeは`events/subscribe`の1回につき最大1回呼び、例外は無視して応答を変えない。 */
+export interface RequestScopedMcpEntryAudit {
+  readonly onSubscribe?: ((outcome: McpSubscribeOutcome) => void) | undefined;
+}
+
 const CALLBACK_REASONS: readonly CallbackEndpointReason[] = [
   'connection_refused',
   'timeout',
@@ -82,6 +105,24 @@ const CALLBACK_REASONS: readonly CallbackEndpointReason[] = [
   'http_5xx',
   'challenge_failed',
 ];
+
+/** portの失敗のkindのうち、そのまま固定の分類にするもの（callback_endpointはreasonつきで別に写す）。 */
+const SUBSCRIBE_FAILURE_KINDS = ['invalid_request', 'unknown_event', 'cursor_unsupported', 'destination_change_pending', 'grant_inactive', 'conflict'] as const;
+
+function isSubscribeFailureKind(kind: unknown): kind is (typeof SUBSCRIBE_FAILURE_KINDS)[number] {
+  return (SUBSCRIBE_FAILURE_KINDS as readonly unknown[]).includes(kind);
+}
+
+function isCallbackReason(reason: unknown): reason is CallbackEndpointReason {
+  return (CALLBACK_REASONS as readonly unknown[]).includes(reason);
+}
+
+/** portの失敗のkind・reasonを、固定の分類へ写す（toProtocolErrorの写し方と同じ。未知は`other`）。 */
+function subscribeOutcomeOf(kind: unknown, reason: unknown): McpSubscribeOutcome {
+  if (isSubscribeFailureKind(kind)) return kind;
+  if (kind === 'callback_endpoint' && isCallbackReason(reason)) return `callback_endpoint.${reason}`;
+  return 'other';
+}
 
 /** 期限・中止・closeで要求が採用できなくなった印（verifierからverifyBearerTokenの外へ運ぶだけ）。 */
 const UNAVAILABLE: unique symbol = Symbol('mcp_request_unavailable');
@@ -105,6 +146,14 @@ interface RequestState {
   authInfo: AuthInfo | undefined;
   /** SDK（toNodeHandler）へ渡した後か。以後の中止は応答を書かずに接続を終える。 */
   sdkStarted: boolean;
+  /** この要求の購読の通知（要求ごとに1つ）。 */
+  readonly subscribeGate: SubscribeGate;
+}
+
+/** 1つのHTTP要求の購読の通知の状態。handlerが始まったか、通知を出したか（最大1回）。 */
+interface SubscribeGate {
+  handlerStarted: boolean;
+  notified: boolean;
 }
 
 function fail(): never {
@@ -287,8 +336,10 @@ function publicMetadata(
  * MCP入口を組み立てる。McpEntry（protectedResourceMetadata・metadataPath・handle・close）を返す。
  * 全ての検査・捕捉はここで1回だけ行い、以後は入力objectを読み直さない。不正はMcpRequestEntryConfigError。
  */
-export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOptions): McpEntry {
+export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOptions, audit?: RequestScopedMcpEntryAudit): McpEntry {
   const fields = dataFields(options, REQUIRED, OPTIONAL);
+  const auditFields = audit === undefined ? new Map<string, unknown>() : dataFields(audit, [], ['onSubscribe']);
+  const onSubscribeFn = auditFields.has('onSubscribe') ? plainFunction(auditFields.get('onSubscribe')) : undefined;
   const issuer = urlString(fields.get('issuer'));
   const resource = urlString(fields.get('resource'));
   const clockNow = methodOf(fields.get('clock'), 'now');
@@ -303,6 +354,18 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
   const report = (category: McpRequestErrorCategory): void => {
     try {
       onErrorFn(category);
+    } catch {
+      // 通知の失敗で要求の扱いを変えない。
+    }
+  };
+
+  /** 要求ごとのgateで、最初の1回だけ通知する。 */
+  const notifySubscribe = (gate: SubscribeGate, outcome: McpSubscribeOutcome): void => {
+    if (gate.notified) return;
+    gate.notified = true;
+    if (onSubscribeFn === undefined) return;
+    try {
+      onSubscribeFn(outcome);
     } catch {
       // 通知の失敗で要求の扱いを変えない。
     }
@@ -352,8 +415,11 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
     return state;
   };
 
-  /** portの失敗を、固定のProtocolErrorへ写す。それ以外（未知の例外・不正な分類）は固定InternalError。 */
-  const toProtocolError = (error: unknown): ProtocolError => {
+  /**
+   * portの失敗を、固定のProtocolErrorへ写す。それ以外（未知の例外・不正な分類）は固定InternalError。
+   * classifiedがあれば、写した固定の分類を書く（未知はそのまま）。
+   */
+  const toProtocolError = (error: unknown, classified?: { outcome: McpSubscribeOutcome }): ProtocolError => {
     let kind: unknown;
     let reason: unknown;
     try {
@@ -367,6 +433,7 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
     } catch {
       kind = undefined;
     }
+    if (classified) classified.outcome = subscribeOutcomeOf(kind, reason);
     switch (kind) {
       case 'invalid_request':
         return new ProtocolError(ProtocolErrorCode.InvalidParams, 'Invalid subscription request');
@@ -394,16 +461,25 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
     return internalError();
   };
 
-  /** portを呼び、元operationの中止までで待つ。await後・SDKへ戻す前にも元operationを再検査する。 */
-  const callPort = async <T>(state: RequestState, call: () => T | PromiseLike<T>): Promise<T> => {
+  /**
+   * portを呼び、元operationの中止までで待つ。await後・SDKへ戻す前にも元operationを再検査する。
+   * classifiedがあれば、失敗の固定の分類を書く（期限・中止・closeは`context_unavailable`）。
+   */
+  const callPort = async <T>(state: RequestState, call: () => T | PromiseLike<T>, classified?: { outcome: McpSubscribeOutcome }): Promise<T> => {
     let result: T | typeof ABORTED;
     try {
       result = await untilAborted(invoke(call), state.operation.signal);
     } catch (error) {
-      if (!alive(state)) throw contextUnavailable();
-      throw toProtocolError(error);
+      if (!alive(state)) {
+        if (classified) classified.outcome = 'context_unavailable';
+        throw contextUnavailable();
+      }
+      throw toProtocolError(error, classified);
     }
-    if (result === ABORTED || !alive(state)) throw contextUnavailable();
+    if (result === ABORTED || !alive(state)) {
+      if (classified) classified.outcome = 'context_unavailable';
+      throw contextUnavailable();
+    }
     return result;
   };
 
@@ -429,31 +505,47 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
 
       server.setRequestHandler('events/subscribe', { params: EventsSubscribeParams }, (params, ctx) =>
         (async () => {
-          const state = stateOf(ctx);
-          const auth = Object.freeze({ ...state.auth! });
-          const input: SubscribeInput = Object.freeze({
-            name: params.name,
-            url: params.delivery.url,
-            secret: params.delivery.secret,
-            ttlMs: params.ttlMs,
-            cursor: params.cursor,
-          });
-          const outcome: unknown = await callPort(state, () => subscribe(auth, input, state.operation));
-          // portの結果はsubscribeResultの形（id文字列・refreshBefore文字列/null）の時だけ写す。
-          let id: unknown;
-          let refreshBefore: unknown;
+          // この1回の結果の固定の分類。最後に1回だけ、この要求のgateで通知する（stateOfの失敗はcontext）。
+          // 要求のstateが引けない時はここでは出さず、入口が`request_rejected`として出す。
+          const authInfo = ctx.http?.authInfo;
+          const gate = authInfo === undefined ? undefined : states.get(authInfo)?.subscribeGate;
+          if (gate !== undefined) gate.handlerStarted = true;
+          const classified: { outcome: McpSubscribeOutcome } = { outcome: 'context_unavailable' };
           try {
-            ({ id, refreshBefore } = outcome as { id?: unknown; refreshBefore?: unknown });
-          } catch {
-            id = undefined;
+            const state = stateOf(ctx);
+            classified.outcome = 'other';
+            const auth = Object.freeze({ ...state.auth! });
+            const input: SubscribeInput = Object.freeze({
+              name: params.name,
+              url: params.delivery.url,
+              secret: params.delivery.secret,
+              ttlMs: params.ttlMs,
+              cursor: params.cursor,
+            });
+            const outcome: unknown = await callPort(state, () => subscribe(auth, input, state.operation), classified);
+            // portの結果はsubscribeResultの形（id文字列・refreshBefore文字列/null）の時だけ写す。
+            let id: unknown;
+            let refreshBefore: unknown;
+            try {
+              ({ id, refreshBefore } = outcome as { id?: unknown; refreshBefore?: unknown });
+            } catch {
+              id = undefined;
+            }
+            const refresh = refreshBefore === null ? null : typeof refreshBefore === 'string' ? refreshBefore : undefined;
+            if (typeof id !== 'string' || refresh === undefined) {
+              report('port');
+              throw internalError();
+            }
+            if (!alive(state)) {
+              classified.outcome = 'context_unavailable';
+              throw contextUnavailable();
+            }
+            const result = subscribeResult(id, refresh);
+            classified.outcome = 'ok';
+            return result;
+          } finally {
+            if (gate !== undefined) notifySubscribe(gate, classified.outcome);
           }
-          const refresh = refreshBefore === null ? null : typeof refreshBefore === 'string' ? refreshBefore : undefined;
-          if (typeof id !== 'string' || refresh === undefined) {
-            report('port');
-            throw internalError();
-          }
-          if (!alive(state)) throw contextUnavailable();
-          return subscribeResult(id, refresh);
         })(),
       );
 
@@ -523,7 +615,21 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
     res.end(payload);
   };
 
+  /**
+   * 1要求を扱う。`Mcp-Method`のheaderが固定の`events/subscribe`で、handlerが始まらないまま終わった時だけ、
+   * `request_rejected`を1回通知する（本文・応答は読まない。別のmethod・headerなしは通知しない）。
+   */
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const subscribeRequest = req.headers['mcp-method'] === 'events/subscribe';
+    const gate: SubscribeGate = { handlerStarted: false, notified: false };
+    try {
+      await serveRequest(req, res, gate);
+    } finally {
+      if (subscribeRequest && !gate.handlerStarted) notifySubscribe(gate, 'request_rejected');
+    }
+  }
+
+  async function serveRequest(req: IncomingMessage, res: ServerResponse, subscribeGate: SubscribeGate): Promise<void> {
     // 最初のawaitより前に、closed・clock・既に切れた接続を見る。
     if (closed) return refuse(req, res);
     let receivedAt: unknown;
@@ -542,7 +648,7 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
     const deadlineAt = Math.floor(receivedAt) + budgetMs;
     const controller = new AbortController();
     const operation: McpRequestOperation = Object.freeze({ deadlineAt, signal: controller.signal });
-    const state: RequestState = { operation, controller, auth: undefined, authInfo: undefined, sdkStarted: false };
+    const state: RequestState = { operation, controller, auth: undefined, authInfo: undefined, sdkStarted: false, subscribeGate };
     active.add(state);
 
     const abort = (): void => controller.abort();
