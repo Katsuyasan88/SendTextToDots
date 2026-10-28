@@ -23,6 +23,7 @@ import type { VerifiedIdentity } from '../identity/firebase.js';
 import { accessDocRef, accessVerdictOfSnapshot, AccessUnavailableError, grantGenerationOfSnapshot } from '../access/firestore.js';
 import { accessVerdictOf, ACCESS_UNAVAILABLE, grantGenerationOf, grantUseVerdict, ownerIdentityHash, type AccessVerdict } from '../access/policy.js';
 import { ownerReceiverGeneration, receiverResetWrites, receiverSettingsPresent, receiverSnapshotMaterial, RECEIVER_GENERATION_FIELD, ReceiverResetUnavailableError } from '../storage/firestore/receiver-reset.js';
+import type { KmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
 
 export const CONNECT_STORAGE_ROOT = 'sttdConnect';
 
@@ -136,7 +137,13 @@ export interface ConnectStorageDeps {
   /**
    * 受信先設定（同じFirestoreの購読保存、sttdAuth/{t268}/subscriptions/{ownerId}）の参照。無い構成では、受信先設定の削除の確認を出さない。
    */
-  readonly receiverSubscriptions?: ((ownerId: string) => DocumentReference) | undefined;
+  readonly receiverSubscriptions?: ReceiverSubscriptions | undefined;
+}
+
+/** 受信先設定の参照と、その形を検査する既存の購読policy（productionの配線から渡す）。 */
+export interface ReceiverSubscriptions {
+  readonly refFor: (ownerId: string) => DocumentReference;
+  readonly policy: KmsSubscriptionPolicy;
 }
 
 export type BindOutcome = 'ok' | 'rejected' | 'other_owner';
@@ -155,10 +162,17 @@ export interface ConsentRecord {
   readonly receiverReset?: boolean;
 }
 
-/** 受信先設定の削除の確認（表示用の不透明token）。 */
-export interface ReceiverResetOffer {
+/**
+ * Appleのlogin後の同意画面のsnapshot（表示用の不透明token）。設定が無くても出し、同意の消費のtransactionで表示時と同じかを確かめる。
+ * presentは受信先設定がある（削除の確認が要る）こと。
+ */
+export interface ReceiverSnapshot {
   readonly token: string;
+  readonly present: boolean;
 }
+
+/** 同意の消費の結果。changedは表示の後の変化（消費・削除0）、confirm_requiredは確認が要るのに未確認（消費・削除0）。 */
+export type CheckedConsent = ConsentRecord | 'denied' | 'changed' | 'confirm_required' | undefined;
 
 /** login（owner解決）の結果。deniedは利用不許可（ownerを作らない）、inactiveは既存ownerの失効・無活動。許可の一時障害はAccessUnavailableError。 */
 export type OwnerAdmission =
@@ -726,21 +740,22 @@ export class ConnectStorage {
   }
 
   /**
-   * 受信先設定の削除の確認を出すか（読取りだけ）。interactionがlogin済み・期限内・Appleのloginで、ownerの購読文書に受信先設定がある時だけ、
-   * interaction・CSRF・owner・購読文書の版・取消世代・受信reset世代へ束縛した不透明tokenを返す。それ以外はnull。
+   * Appleのlogin後の同意画面のsnapshot（読取りだけ）。interactionがlogin済み・期限内・Appleのloginで、ownerが現在active（失効・無活動でない）の時だけ、
+   * interaction・CSRF・owner・購読文書の版と設定の有無・取消世代・受信reset世代へ束縛した不透明tokenを返す（設定が無くても出す）。それ以外はnull。
    */
-  async receiverResetOffer(uid: string): Promise<ReceiverResetOffer | null> {
-    const refFor = this.#d.receiverSubscriptions;
-    if (refFor === undefined) return null;
+  async receiverSnapshot(uid: string): Promise<ReceiverSnapshot | null> {
+    const receiver = this.#d.receiverSubscriptions;
+    if (receiver === undefined) return null;
     const data = (await this.#interactionRef(uid).get()).data() as Record<string, unknown> | undefined;
     if (data === undefined || data.state !== 'authenticated' || data.loginMethod !== 'apple' || typeof data.ownerId !== 'string' || typeof data.csrfHash !== 'string') return null;
-    if (typeof data.expiresAt !== 'number' || this.#d.clock.now() >= data.expiresAt) return null;
     const ownerId = data.ownerId;
     const owner = (await this.#ownerRef(ownerId).get()).data();
-    const subscription = await refFor(ownerId).get();
+    const subscription = await receiver.refFor(ownerId).get();
+    const at = this.#d.clock.now();
+    if (typeof data.expiresAt !== 'number' || at >= data.expiresAt || !this.#activeOwner(owner, at)) return null;
     try {
-      if (owner === undefined || !receiverSettingsPresent(subscription, ownerId)) return null;
-      return { token: this.#hash('receiver-reset', receiverSnapshotMaterial({ interactionUid: uid, csrfHash: data.csrfHash, ownerId, subscription, ownerData: owner })) };
+      const present = receiverSettingsPresent(subscription, ownerId, receiver.policy);
+      return { token: this.#hash('receiver-reset', receiverSnapshotMaterial({ interactionUid: uid, csrfHash: data.csrfHash, ownerId, subscription, present, ownerData: owner })), present };
     } catch (error) {
       if (error instanceof ReceiverResetUnavailableError) throw new AccessUnavailableError();
       throw error;
@@ -748,48 +763,73 @@ export class ConnectStorage {
   }
 
   /**
-   * 本人が明示確認した受信先設定一式の削除と同意の消費を、1つのtransactionで行う。
-   * 照合: interaction（login済み・期限・CSRF・owner・世代）・Appleのlogin・利用許可の現在の世代・購読文書の受信先設定と、表示したtokenの一致。
-   * 書込み: interactionの消費、owner文書の取消世代と受信reset世代の各+1、購読文書の空の状態。
-   * 'not_applicable'はAppleでない・機能なしで、削除へ進まない（通常の同意を使う）。'changed'は設定の変化・tokenの不一致で、消費・削除0。
+   * 同意の消費（本人の明示操作）を1つのtransactionで行う。破壊的な書込みを含み得るので、SDKの自動再試行はしない（maxAttempts 1）。
+   * 全ての読取りの後に、その時の時刻で照合する: interaction（login済み・期限・CSRF・owner・世代）・ownerが現在active・利用許可の現在の世代。
+   * Appleのloginでは、表示したsnapshotのtokenが現在の購読文書の版・設定の有無・取消世代・受信reset世代と同じことも要求する（違えば'changed'で、
+   * 消費・削除0）。受信先設定があるのに確認が無ければ'confirm_required'（消費・削除0）。確認がある時だけ、消費と同時に
+   * owner文書の取消世代と受信reset世代を各+1し、購読文書を空の状態にする。コード・login方法の無いinteractionは、通常の同意（削除0）。
    */
-  async consumeInteractionWithReceiverReset(uid: string, csrf: string, token: string): Promise<ConsentRecord | 'denied' | 'changed' | 'not_applicable' | undefined> {
-    const refFor = this.#d.receiverSubscriptions;
-    if (refFor === undefined) return 'not_applicable';
+  async consumeInteractionChecked(uid: string, csrf: string, token: string, confirm: boolean): Promise<CheckedConsent> {
+    const receiver = this.#d.receiverSubscriptions;
     const ref = this.#interactionRef(uid);
-    const now = this.#d.clock.now();
-    return this.#d.db.runTransaction(async (tx): Promise<ConsentRecord | 'denied' | 'changed' | 'not_applicable' | undefined> => {
-      const data = (await tx.get(ref)).data() as Record<string, unknown> | undefined;
-      const ownerId = data !== undefined && typeof data.ownerId === 'string' ? data.ownerId : null;
-      const ownerRef = ownerId === null ? null : this.#ownerRef(ownerId);
-      const owner = ownerRef === null ? undefined : (await tx.get(ownerRef)).data();
-      const subscriptionRef = ownerId === null ? null : refFor(ownerId);
-      const subscription = subscriptionRef === null ? null : await tx.get(subscriptionRef);
-      const access = await this.#accessForOwner(tx, owner);
-      if (data === undefined || data.state !== 'authenticated' || typeof data.expiresAt !== 'number' || now >= data.expiresAt) return undefined;
-      if (!this.#csrfMatches(data, csrf) || ownerId === null || typeof data.authTimeSec !== 'number' || typeof data.accessGeneration !== 'string') return undefined;
-      if (data.loginMethod !== 'apple') return 'not_applicable';
-      if (access.kind === 'unavailable') throw new AccessUnavailableError();
-      if (access.kind === 'denied' || access.generation !== data.accessGeneration) {
-        tx.update(ref, { state: 'done', csrfHash: null });
-        return 'denied';
-      }
-      if (owner === undefined || subscription === null || subscriptionRef === null || ownerRef === null || typeof data.csrfHash !== 'string') return undefined;
-      let writes: ReturnType<typeof receiverResetWrites>;
-      try {
-        if (!receiverSettingsPresent(subscription, ownerId)) return 'changed';
-        const expected = this.#hash('receiver-reset', receiverSnapshotMaterial({ interactionUid: uid, csrfHash: data.csrfHash, ownerId, subscription, ownerData: owner }));
+    return this.#d.db.runTransaction(
+      async (tx): Promise<CheckedConsent> => {
+        const data = (await tx.get(ref)).data() as Record<string, unknown> | undefined;
+        const ownerId = data !== undefined && typeof data.ownerId === 'string' ? data.ownerId : null;
+        const ownerRef = ownerId === null ? null : this.#ownerRef(ownerId);
+        const owner = ownerRef === null ? undefined : (await tx.get(ownerRef)).data();
+        const apple = data?.loginMethod === 'apple' && receiver !== undefined;
+        const subscriptionRef = apple && ownerId !== null ? receiver.refFor(ownerId) : null;
+        const subscription = subscriptionRef === null ? null : await tx.get(subscriptionRef);
+        const access = await this.#accessForOwner(tx, owner);
+        // 時刻は全ての読取りの後に読む（期限・無活動の判定を古い時刻で通さない）。
+        const at = this.#d.clock.now();
+        if (data === undefined || data.state !== 'authenticated' || typeof data.expiresAt !== 'number' || at >= data.expiresAt) return undefined;
+        if (!this.#csrfMatches(data, csrf) || ownerId === null || ownerRef === null || typeof data.authTimeSec !== 'number') return undefined;
+        if (typeof data.accessGeneration !== 'string') return undefined;
+        if (!this.#activeOwner(owner, at)) return undefined;
+        if (access.kind === 'unavailable') throw new AccessUnavailableError();
+        if (access.kind === 'denied' || access.generation !== data.accessGeneration) {
+          tx.update(ref, { state: 'done', csrfHash: null });
+          return 'denied';
+        }
+        const consent = { ownerId, authTimeSec: data.authTimeSec, accessGeneration: data.accessGeneration };
+        if (!apple || subscription === null || subscriptionRef === null) {
+          const receiverGeneration = receiverGenerationOrUnavailable(owner);
+          tx.update(ref, { state: 'done', csrfHash: null });
+          return { ...consent, ...(receiverGeneration > 0 ? { receiverGeneration } : {}) };
+        }
+        if (typeof data.csrfHash !== 'string') return undefined;
+        let present: boolean;
+        let expected: string;
+        try {
+          present = receiverSettingsPresent(subscription, ownerId, receiver.policy);
+          expected = this.#hash('receiver-reset', receiverSnapshotMaterial({ interactionUid: uid, csrfHash: data.csrfHash, ownerId, subscription, present, ownerData: owner }));
+        } catch (error) {
+          if (error instanceof ReceiverResetUnavailableError) throw new AccessUnavailableError();
+          throw error;
+        }
         if (typeof token !== 'string' || token.length === 0 || !hashesEqual(expected, token)) return 'changed';
-        writes = receiverResetWrites(ownerId, owner);
-      } catch (error) {
-        if (error instanceof ReceiverResetUnavailableError) throw new AccessUnavailableError();
-        throw error;
-      }
-      tx.update(ref, { state: 'done', csrfHash: null });
-      tx.update(ownerRef, writes.ownerUpdate);
-      tx.set(subscriptionRef, writes.subscriptionDoc);
-      return { ownerId, authTimeSec: data.authTimeSec, accessGeneration: data.accessGeneration, receiverGeneration: writes.receiverGeneration, receiverReset: true };
-    });
+        if (present && !confirm) return 'confirm_required';
+        if (!present) {
+          const receiverGeneration = receiverGenerationOrUnavailable(owner);
+          tx.update(ref, { state: 'done', csrfHash: null });
+          return { ...consent, ...(receiverGeneration > 0 ? { receiverGeneration } : {}) };
+        }
+        let writes: ReturnType<typeof receiverResetWrites>;
+        try {
+          writes = receiverResetWrites(ownerId, owner);
+        } catch (error) {
+          if (error instanceof ReceiverResetUnavailableError) throw new AccessUnavailableError();
+          throw error;
+        }
+        tx.update(ref, { state: 'done', csrfHash: null });
+        tx.update(ownerRef, writes.ownerUpdate);
+        tx.set(subscriptionRef, writes.subscriptionDoc);
+        return { ...consent, receiverGeneration: writes.receiverGeneration, receiverReset: true };
+      },
+      { maxAttempts: 1 },
+    );
   }
 
   /** 拒否の操作。CSRFが一致する時だけ閉じる。 */

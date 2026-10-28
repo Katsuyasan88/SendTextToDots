@@ -137,9 +137,13 @@ export function renderInteractionLogin(
   );
 }
 
-/** 同意画面での受信先設定の削除の確認（Appleのlogin・既存の受信先設定がある時だけ）。tokenはserverが作った不透明値。 */
+/**
+ * Appleのlogin後の同意画面のsnapshot（tokenはserverが作った不透明値で、常に隠し項目として送る）。confirmは受信先設定がある時で、
+ * その時だけ削除の明示と確認欄を出す。
+ */
 export interface ReceiverResetView {
   readonly token: string;
+  readonly confirm: boolean;
   /** 前の送信が、未確認・設定の変化で何も削除しなかった時の案内。 */
   readonly required?: boolean;
 }
@@ -159,13 +163,18 @@ export function renderInteractionConsent(
   const lang = languageOf(language);
   const t = (key: MessageKey) => escapeHtml(text(lang, key));
   const action = `/interaction/${escapeHtml(uid)}`;
+  const confirm = receiver !== null && receiver.confirm;
   const reset =
     receiver === null
       ? ''
-      : `${receiver.required === true ? `<p role="status">${t('interaction.receiverReset.required')}</p>\n` : ''}<p role="alert">${t('interaction.receiverReset.notice')}</p>
-<input type="hidden" name="receiverToken" value="${escapeHtml(receiver.token)}">
+      : `${receiver.required === true ? `<p role="status">${t('interaction.receiverReset.required')}</p>\n` : ''}<input type="hidden" name="receiverToken" value="${escapeHtml(receiver.token)}">
+${
+  confirm
+    ? `<p role="alert">${t('interaction.receiverReset.notice')}</p>
 <p><input type="checkbox" id="sttd-receiver-reset" name="receiverReset" value="1" required> <label for="sttd-receiver-reset">${t('interaction.receiverReset.confirm')}</label></p>
-`;
+`
+    : ''
+}`;
   return shell(
     web,
     'interaction-consent',
@@ -174,7 +183,7 @@ export function renderInteractionConsent(
     `<p>${escapeHtml(clientLabel)}${t('interaction.consentQuestion')}</p>
 <form method="post" action="${action}/consent">
 <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-${reset}<button type="submit">${t(receiver === null ? 'interaction.allow' : 'interaction.receiverReset.allow')}</button>
+${reset}<button type="submit">${t(confirm ? 'interaction.receiverReset.allow' : 'interaction.allow')}</button>
 </form>
 <form method="post" action="${action}/deny">
 <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
@@ -197,9 +206,9 @@ export function renderInteractionAccessDenied(web: FirebaseWebConfig, uid: strin
  * 受信先設定の削除は確定したが、その後の接続（Grant・metadata・redirect）が完了しなかった（incomplete）か、結果を確認できない（unknown）時の固定案内。
  * 削除済みであることを隠さない。操作・owner・UID・Grant・CSRFを含めない。
  */
-export function renderReceiverResetOutcome(web: FirebaseWebConfig, uid: string, outcome: 'incomplete' | 'unknown', language: Language = DEFAULT_LANGUAGE): string {
+export function renderReceiverResetOutcome(web: FirebaseWebConfig, uid: string, outcome: 'incomplete' | 'unknown' | 'reset_unknown', language: Language = DEFAULT_LANGUAGE): string {
   const lang = languageOf(language);
-  const key: MessageKey = outcome === 'incomplete' ? 'interaction.receiverReset.incomplete' : 'interaction.receiverReset.unknown';
+  const key: MessageKey = outcome === 'incomplete' ? 'interaction.receiverReset.incomplete' : outcome === 'unknown' ? 'interaction.receiverReset.unknown' : 'interaction.receiverReset.resetUnknown';
   return shell(web, 'interaction-receiver-reset', lang, `/interaction/${escapeHtml(uid)}`, `<p role="alert">${escapeHtml(text(lang, key))}</p>`, {});
 }
 

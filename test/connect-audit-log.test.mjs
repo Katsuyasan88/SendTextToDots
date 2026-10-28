@@ -45,6 +45,20 @@ test('unknown events are dropped, unknown categories become other, and no other 
   assert.ok(!lines.join('\n').match(/synthetic|example\.invalid|"uid"|"grantId"|"token"|"url"|"error"|"route"|"status"/));
 });
 
+test('receiver reset events pass with fixed categories only; unknown categories become other and no other field is written', () => {
+  const { s, lines } = sink(iso(T0 + 60_000));
+  s({ event: 'interaction.receiver_reset', category: 'anything', ownerId: 'synthetic-owner' });
+  for (const category of ['incomplete', 'unknown', 'reset_unknown', 'synthetic error text']) s({ event: 'interaction.receiver_reset_incomplete', category, grantId: 'synthetic-grant' });
+  assert.deepEqual(lines.map((l) => JSON.parse(l)), [
+    { event: 'interaction.receiver_reset' },
+    { event: 'interaction.receiver_reset_incomplete', category: 'incomplete' },
+    { event: 'interaction.receiver_reset_incomplete', category: 'unknown' },
+    { event: 'interaction.receiver_reset_incomplete', category: 'reset_unknown' },
+    { event: 'interaction.receiver_reset_incomplete', category: 'other' },
+  ]);
+  assert.ok(!lines.join('\n').match(/synthetic|"ownerId"|"grantId"/));
+});
+
 test('nothing is written after the end time, and the cap is 64 events per process', () => {
   const clock = { t: T0 };
   const { s, lines } = sink(iso(T0 + 60_000), clock);

@@ -18,6 +18,8 @@ const DIAGNOSTIC_EVENTS: ReadonlyMap<string, readonly string[]> = new Map([
   ['interaction.access_denied', []],
   ['interaction.denied', []],
   ['web.disconnected', []],
+  ['interaction.receiver_reset', []],
+  ['interaction.receiver_reset_incomplete', ['incomplete', 'unknown', 'reset_unknown']],
   ['oauth.server_error', ['authorization_code', 'refresh_token']],
   ['oauth.request_error', ['authorization_code', 'refresh_token']],
   ['oauth.grant_revoked', ['Grant', 'AccessToken', 'AuthorizationCode', 'RefreshToken']],
