@@ -128,3 +128,11 @@ Read the [security policy and reporting channel status](SECURITY.md) and [techni
 ## Developer 6-digit code (optional, off by default)
 
 In the operator mode of a console you deploy yourself, you can connect with a 6-digit code instead of Apple. A code works once within 10 minutes of issue, and the same number is not issued again for at least 24 hours. Each code creates a new account, and the number of texts sent after connecting is not limited. See [Local console](docs/LOCAL_CONSOLE_EN.md), [Configuration](docs/CONFIGURATION_EN.md), and [Security](docs/SECURITY_EN.md).
+
+To connect with a code, first enable the feature and start the console in operator mode using the [configuration and startup instructions](docs/LOCAL_CONSOLE_EN.md#connecting-with-a-developer-6-digit-code-operator-mode). The normal `npm run console` does not issue codes.
+
+1. In console step 1, select **Sign in with a code** and press **Continue**. Step 2 opens and displays the issued code.
+2. Follow the plugin-addition instructions in step 2 to add SendTextToDots as a custom MCP server. Enter the 6-digit code in the plugin connection screen within 10 minutes, then complete consent.
+3. Return to the console and press **Check connection**. Continue with steps 3 and 4 to start and check receiving before sending.
+
+Code entry is limited in 10-minute windows: at most **5 attempts per sign-in interaction** and **5 per source**. After **5 failed attempts across the deployment's code-login namespace**, further attempts, including correct codes, are refused until that shared window resets. This can temporarily prevent other users of the same deployment from connecting. These are code-entry limits; ordinary API sending limits still apply after connecting. See [Security](docs/SECURITY_EN.md#developer-6-digit-code).
