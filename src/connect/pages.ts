@@ -85,6 +85,7 @@ export const CODE_TEXT = Object.freeze({
     limited: 'Too many attempts. Wait a while, then generate a new code in the console.',
     failed: 'The connection could not be completed. Generate a new code in the console.',
     busy: 'Connecting…',
+    continueSaved: 'Continue with the saved code sign-in',
   }),
   ja: Object.freeze({
     heading: 'コードで接続',
@@ -95,6 +96,7 @@ export const CODE_TEXT = Object.freeze({
     limited: '試行が多すぎます。しばらく待ってから、コンソールで新しいコードを発行してください。',
     failed: '接続を完了できませんでした。コンソールで新しいコードを発行してください。',
     busy: '接続しています…',
+    continueSaved: '保存済みのコード認証で続ける',
   }),
 });
 
@@ -118,6 +120,7 @@ export function renderInteractionLogin(
 <label for="sttd-code-input">${c('label')}</label>
 <input id="sttd-code-input" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" minlength="6" required${codeEnabled ? '' : ' disabled'}>
 <button type="button" id="sttd-code-submit"${codeEnabled ? '' : ' disabled'}>${c('submit')}</button>
+<button type="button" id="sttd-continue-code" hidden${codeEnabled ? '' : ' disabled'}>${c('continueSaved')}</button>
 </section>`;
   return shell(
     web,
@@ -167,9 +170,11 @@ export function renderInteractionAccessDenied(web: FirebaseWebConfig, uid: strin
 }
 
 /**
- * interaction画面のscript（login画面だけが操作を持つ。consent画面はnative formで、scriptは何もしない）。SDKの復元を待ち、復元済みsessionが
- * あればそのtokenを使ってpopupを開かない（本人の「続ける」操作だけで同じinteractionへ進む）。popupは未ログインか、本人の明示のaccount切替
- * （signOut後）の時だけ。復元済みsessionのtoken更新に失敗した時は、自動でpopupを開かず、ログインの操作へ戻す。
+ * interaction画面のscript（login画面だけが操作を持つ。consent画面はnative formで、scriptは何もしない）。SDKの復元を待ち、復元済みsessionの
+ * 種類（Apple・開発者コード・不明）を区別する。Appleの「続ける」はAppleの時だけで、本人の操作でそのtokenを送る（popupを開かない）。
+ * コードの認証は、コードの機能がonの時だけ別の明示操作（保存済みのコード認証で続ける）として残す。不明・匿名はAppleとして復元しない。
+ * popupは本人がAppleを選んだ時だけで、保存済みがApple以外なら先にsignOutする。tokenは取得の前後で選んだuserが変わっていない時だけ送り、
+ * 認証の操作は同時に1つだけ。失敗した時は自動でpopupを開かず、ログインの操作へ戻す（保存済みのコードのtokenで代替しない）。
  * Apple providerへscopeを足さない（氏名・メールを要求しない）。ID tokenはbodyだけで送り、URLへ入れない。
  * 文言はbodyのdata-sttd-language（サーバーが選んだ言語）で、埋め込んだ固定辞書から引く。接続状態の表示・解除はこの画面に無い（送信画面の役割）。
  */
@@ -195,29 +200,82 @@ function show(id, visible) {
   if (node) node.hidden = !visible;
 }
 
+const codeOn = body.dataset.sttdCode === 'on';
+const AUTH_BUTTONS = ['sttd-continue', 'sttd-apple-login', 'sttd-switch-account', 'sttd-code-submit', 'sttd-continue-code'];
+
 function signedOut(message) {
   if (message) say(message);
   show('sttd-continue', false);
   show('sttd-switch-account', false);
+  show('sttd-continue-code', false);
   show('sttd-apple-login', true);
 }
 
-function run(task, failure) {
-  return task().catch(() => signedOut(failure));
+// 保存済みの認証の種類（Apple・開発者コード・不明）。UID・メール等は表示・記録しない。コードのUIDは接続server側で固定の接頭辞を持つ。
+function savedKind(user) {
+  if (!user) return 'none';
+  if (user.isAnonymous) return 'unknown';
+  if (typeof user.uid === 'string' && user.uid.startsWith('sttdc_')) return 'code';
+  const providers = Array.isArray(user.providerData) ? user.providerData.map((entry) => (entry ? entry.providerId : undefined)) : [];
+  return providers.includes('apple.com') ? 'apple' : 'unknown';
 }
 
-async function popupIdToken() {
+// 認証の操作は同時に1つだけ（二重クリック・別の方式との競合でloginを複数送らない）。実行中は全ての認証ボタンを止める。
+let busy = false;
+function setBusy(value) {
+  busy = value;
+  for (const id of AUTH_BUTTONS) {
+    const node = el(id);
+    if (!node) continue;
+    const codeButton = id === 'sttd-code-submit' || id === 'sttd-continue-code';
+    node.disabled = value || (codeButton && !codeOn);
+  }
+}
+function exclusive(task, failure) {
+  return async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await task();
+    } catch {
+      signedOut(failure);
+    } finally {
+      setBusy(false);
+    }
+  };
+}
+
+// 選んだuserのtoken。取得の前後でcurrentUserとUIDが変わっていたら（切替・logout・復元中の変更）使わない。
+async function tokenOf(user) {
+  if (!user || auth.currentUser !== user) throw new Error('user_changed');
+  const uid = user.uid;
+  const token = await user.getIdToken();
+  if (auth.currentUser !== user || user.uid !== uid) throw new Error('user_changed');
+  return token;
+}
+
+// Appleでのログイン: 保存済みの認証がApple以外なら先にsignOutし、apple.comのpopupだけを開く。結果がAppleでなければ使わない
+// （失敗したAppleの代わりに保存済みのコード認証のtokenを送らない）。
+async function appleIdToken() {
+  await auth.authStateReady();
+  if (auth.currentUser) await signOut(auth);
   const result = await signInWithPopup(auth, new OAuthProvider('apple.com'));
-  return result.user.getIdToken();
+  if (savedKind(result.user) !== 'apple') throw new Error('not_apple');
+  return tokenOf(result.user);
 }
 
-async function switchedIdToken() {
-  await signOut(auth);
-  return popupIdToken();
+// 保存済みのAppleで続ける（Appleの時だけ）。
+async function restoredAppleIdToken() {
+  const user = auth.currentUser;
+  if (savedKind(user) !== 'apple') throw new Error('not_apple');
+  return tokenOf(user);
 }
 
-function restoredIdToken() {
-  return auth.currentUser.getIdToken();
+// 保存済みのコード認証で続ける（コードの機能がonで、保存済みがコードの時だけ。新しいコードは発行しない）。
+async function restoredCodeIdToken() {
+  const user = auth.currentUser;
+  if (!codeOn || savedKind(user) !== 'code') throw new Error('not_code');
+  return tokenOf(user);
 }
 
 async function interactionLogin(idToken) {
@@ -243,14 +301,12 @@ async function accessRefused(response) {
 }
 
 // 開発者向けコード: 本人の明示操作だけで送る（自動送信・pollなし）。成功時の同origin応答のcustom tokenでFirebase SDKにログインし、
-// 既存の/loginへID tokenを送る（同意・購読は通常どおり）。tokenを表示・保存・URLへ入れない。二重クリックはボタンを止めて防ぐ。
+// 既存の/loginへID tokenを送る（同意・購読は通常どおり）。tokenを表示・保存・URLへ入れない。他の認証操作とは排他。
 const C = (key) => (Object.hasOwn(CODE_TEXT[lang], key) ? CODE_TEXT[lang][key] : '');
 async function codeLogin() {
   const input = el('sttd-code-input');
-  const button = el('sttd-code-submit');
   const code = input.value.trim();
   if (!/^[0-9]{6}$/.test(code)) return say(C('rejected'));
-  button.disabled = true;
   say(C('busy'));
   try {
     const response = await fetch('/interaction/' + encodeURIComponent(body.dataset.sttdInteraction) + '/code', {
@@ -265,25 +321,34 @@ async function codeLogin() {
     if (parsed === null || typeof parsed !== 'object' || typeof parsed.customToken !== 'string') return say(C('failed'));
     if (auth.currentUser) await signOut(auth);
     const credential = await signInWithCustomToken(auth, parsed.customToken);
-    await interactionLogin(await credential.user.getIdToken());
+    await interactionLogin(await tokenOf(credential.user));
   } catch {
     say(C('failed'));
-  } finally {
-    button.disabled = false;
   }
 }
 
 async function start() {
   if (view !== 'interaction-login') return;
-  if (body.dataset.sttdCode === 'on') el('sttd-code-submit').onclick = () => codeLogin();
-  el('sttd-apple-login').onclick = () => run(async () => interactionLogin(await popupIdToken()), T('common.loginFailed'));
-  el('sttd-switch-account').onclick = () => run(async () => interactionLogin(await switchedIdToken()), T('common.loginFailed'));
+  setBusy(false);
+  if (codeOn) {
+    el('sttd-code-submit').onclick = exclusive(() => codeLogin(), C('failed'));
+    el('sttd-continue-code').onclick = exclusive(async () => interactionLogin(await restoredCodeIdToken()), C('failed'));
+  }
+  el('sttd-apple-login').onclick = exclusive(async () => interactionLogin(await appleIdToken()), T('common.loginFailed'));
+  el('sttd-switch-account').onclick = exclusive(async () => interactionLogin(await appleIdToken()), T('common.loginFailed'));
+  el('sttd-continue').onclick = exclusive(async () => interactionLogin(await restoredAppleIdToken()), T('common.loginRefresh'));
   await auth.authStateReady();
-  if (!auth.currentUser) return signedOut();
-  show('sttd-switch-account', true);
-  show('sttd-continue', true);
-  el('sttd-continue').onclick = () => run(async () => interactionLogin(await restoredIdToken()), T('common.loginRefresh'));
+  const kind = savedKind(auth.currentUser);
+  if (kind === 'none') return signedOut();
+  if (kind === 'apple') {
+    show('sttd-apple-login', false);
+    show('sttd-continue', true);
+    show('sttd-switch-account', true);
+    return;
+  }
+  // Apple以外の保存済みの認証は、Appleとして続ける表示にしない。コードの機能がonでコードの認証なら、別の明示操作として残す。
+  signedOut(kind === 'code' && codeOn ? '' : T('interaction.savedNotApple'));
+  if (kind === 'code' && codeOn) show('sttd-continue-code', true);
 }
-
 await start().catch(() => signedOut(T('common.loginUnknown')));
 `;

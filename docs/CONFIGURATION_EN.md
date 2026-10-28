@@ -85,6 +85,12 @@ Secret values are not written in the configuration file.
 
 Before SDK creation, startup is refused if an environment variable that could redirect credentials, destinations, TLS or logging exists (for example `GOOGLE_APPLICATION_CREDENTIALS`, `FIRESTORE_EMULATOR_HOST`, `HTTPS_PROXY`, `NODE_TLS_REJECT_UNAUTHORIZED`, `NODE_EXTRA_CA_CERTS`); the values are not read. `NODE_OPTIONS` is allowed only for the API service as a single `--max-old-space-size=<128 to 960>` (with 0 to 8 surrounding spaces); the MCP service rejects its presence. The list is in `src/google-runtime/development.ts`.
 
+## Time-limited diagnostic logging for the connection server (off by default)
+
+Only the MCP service (connection server) reads the environment variable `STTD_CONNECT_DIAGNOSTICS_UNTIL`. Its value is an end time (RFC 3339 in UTC, for example `2026-01-01T00:20:00Z`) and it takes effect only when it is later than the start time and no more than 30 minutes ahead. A missing, malformed, past, or more-than-30-minutes value is ignored (nothing is written), and startup and authentication behave the same.
+
+While enabled, only these fixed events are written to standard output as one-line JSON (just `event` and a fixed `category`): `interaction.login`, `interaction.consented`, `interaction.access_denied`, `interaction.denied`, `web.disconnected`, `oauth.server_error` / `oauth.request_error` (category is the token request's `authorization_code`, `refresh_token`, or `other`), and `oauth.grant_revoked` (only after a stored revocation succeeds; category is `Grant`, `AccessToken`, `AuthorizationCode`, `RefreshToken`, or `other`). No UID, owner, Grant, code, token, cookie, body, URL, query, IP address, User-Agent, error text, stack, or hash is written. Nothing is written after the end time or after 64 events in one process. A write failure does not change authentication, revocation, or responses. Use it temporarily for investigation and remove the value afterwards.
+
 ## Initial origins and checks at deployment
 
 Fix `api.publicOrigin` and `connect.publicOrigin` before the build. In the order of [INSTALL_EN.md](INSTALL_EN.md), either choose the deterministic Cloud Run URL from the service name, numeric project number and region, or choose your own domain with TLS/routing prepared first. The same origin is used for the MCP issuer, CORS, the Firebase authorized domain and the `/mcp` registration in Dots. After deployment, verify that the chosen URL is usable instead of rewriting it from an alias URL shown in the Console.

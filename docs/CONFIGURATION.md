@@ -85,6 +85,12 @@ node scripts/manage-access.mjs revoke --project <projectId> --database <database
 
 SDKの生成前に、資格・宛先・TLS・ログを別経路へ変え得る環境変数（例 `GOOGLE_APPLICATION_CREDENTIALS`、`FIRESTORE_EMULATOR_HOST`、`HTTPS_PROXY`、`NODE_TLS_REJECT_UNAUTHORIZED`、`NODE_EXTRA_CA_CERTS` 等）が存在すると起動を拒否します（値は読みません）。`NODE_OPTIONS` はAPI serviceだけ `--max-old-space-size=<128〜960>` 1つ（前後の空白0〜8個）を許し、MCP serviceでは存在自体を拒否します。一覧は `src/google-runtime/development.ts`。
 
+## 接続serverの期限付き診断ログ（既定off）
+
+MCP service（接続server）だけが、環境変数 `STTD_CONNECT_DIAGNOSTICS_UNTIL` を読みます。値は終了時刻（RFC 3339のUTC、例 `2026-01-01T00:20:00Z`）で、起動時刻より未来かつ30分以内の時だけ有効です。未設定・不正な形・過去・30分を超える値は無効（何も出さない）で、起動や認証の動作は変わりません。
+
+有効な間は、次の固定のeventだけを1行のJSON（`event`と、決まった値の`category`だけ）で標準出力へ書きます: `interaction.login`・`interaction.consented`・`interaction.access_denied`・`interaction.denied`・`web.disconnected`・`oauth.server_error`／`oauth.request_error`（categoryはtoken要求の`authorization_code`・`refresh_token`・`other`）・`oauth.grant_revoked`（保存の取消が成功した後だけ。categoryは`Grant`・`AccessToken`・`AuthorizationCode`・`RefreshToken`・`other`）。UID・owner・Grant・code・token・cookie・本文・URL・query・IPアドレス・User-Agent・エラー本文・stack・hashは出しません。終了時刻を過ぎた後と、1 processで64件を書いた後は何も出しません。書き出しに失敗しても、認証・取消・応答は変わりません。調査のために一時的に使い、終わったら値を外してください。
+
 ## 初回originと配置時の確認
 
 `api.publicOrigin`と`connect.publicOrigin`はbuild前に確定させます。[INSTALL.md](INSTALL.md)の順序で、service名・数値project number・regionから決定的なCloud Run URLを選ぶか、先にTLS/routingを用意した独自domainを選んでください。MCP issuer、CORS、Firebase authorized domain、Dotsへの`/mcp`登録で同じoriginを使います。配置後にConsoleの別名URLだけを見て書き換えず、選んだURLの利用可否を照合します。

@@ -230,7 +230,8 @@ test('L7 OAuth access refusal: the login script shows the not-permitted message 
       location: { reload: () => reloads.push(1) },
       fetch: async (url, init) => (fetches.push({ url, init }), response),
       initializeApp: () => ({}),
-      getAuth: () => ({ currentUser: { getIdToken: async () => 'synthetic-id-token' }, authStateReady: async () => {} }),
+      // 保存済みのApple session（Appleの「続ける」はApple providerの時だけ）。
+      getAuth: () => ({ currentUser: { uid: 'synthetic-apple-uid', isAnonymous: false, providerData: [{ providerId: 'apple.com' }], getIdToken: async () => 'synthetic-id-token' }, authStateReady: async () => {} }),
       OAuthProvider: class {},
       signInWithPopup: async () => {
         throw new Error('no popup in this test');

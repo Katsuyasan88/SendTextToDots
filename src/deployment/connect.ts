@@ -2,6 +2,7 @@
 // （systemClock）・専有のstartup operationで実startOwnedDevelopmentConnectServerを1回だけ起動する。PORTと設定のweb.apiKeyEnvが指す環境変数
 // を1回だけ捕捉する（PORTは正規の十進1024〜65535、web keyは非空string。値はlog・Gitへ出さない）。別host・origin・project・SA・key・
 // namespace・資格をenv・argvで上書きする口は無い（実SDKのCloud環境・資格・proxy等のgateはまま）。
+// 例外として、期限付きの診断ログの終了時刻（STTD_CONNECT_DIAGNOSTICS_UNTIL、既定off・最長30分）だけを読む。
 //   - importされた時はSDK・listen・signal登録0。Nodeからこのfileをdirect mainとして起動した時だけrunDevelopmentConnectを呼ぶ（argvの解決と
 //     import.meta.urlの比較。query付きのimportはauto-start 0）。
 //   - 同じprocessの二重runは同じ起動Promise・close所有へまとめ、失敗後の再初期化は0。ready後の戻り値はfrozen {close}だけ。
@@ -20,6 +21,7 @@ import {
   startOwnedDevelopmentConnectServer,
   type OwnedDevelopmentConnectServer,
 } from '../google-runtime/connect-development.js';
+import { CONNECT_DIAGNOSTICS_ENV, createDiagnosticLogSink } from '../http/log.js';
 import { systemClock } from '../policy.js';
 import { loadDeploymentConfig, type DeploymentConfig } from '../config/validate.js';
 
@@ -157,6 +159,14 @@ async function start(): Promise<DevelopmentConnectHandle> {
   const bindPort = Number(portText);
   if (bindPort < 1024 || bindPort > 65535) throw new DevelopmentConnectEntryError('development_connect_config_invalid');
   if (typeof apiKey !== 'string' || apiKey === '') throw new DevelopmentConnectEntryError('development_connect_config_invalid');
+  // 期限付きの診断ログ（既定off。未設定・不正・過去・30分超は無効で、起動・認証には影響しない）。
+  const log = createDiagnosticLogSink({
+    until: process.env[CONNECT_DIAGNOSTICS_ENV],
+    now: () => systemClock.now(),
+    write: (line) => {
+      process.stdout.write(`${line}\n`);
+    },
+  });
   const controller = new AbortController();
   startup = controller;
   registerSignals();
@@ -177,6 +187,7 @@ async function start(): Promise<DevelopmentConnectHandle> {
       web: { apiKey, authDomain: M.web.authDomain, projectId: M.web.projectId },
       clock: systemClock,
       operation: { deadlineAt: startedAt + START_BUDGET_MS, signal: controller.signal },
+      ...(log !== undefined ? { log } : {}),
     });
   } catch (error) {
     if (!closing) unregisterSignals();

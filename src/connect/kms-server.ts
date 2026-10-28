@@ -98,6 +98,33 @@ const IDENTITY_FAILURES: ReadonlySet<string> = new Set(['invalid', 'expired', 'r
 const ACCOUNT_REFUSALS: ReadonlySet<string> = new Set(['disabled', 'revoked', 'deleted']);
 const CIMD_TARGETS: ReadonlySet<string> = new Set(['client_metadata', 'jwks', 'other']);
 const CIMD_OUTCOMES: ReadonlySet<string> = new Set(['fetched', 'reused', 'refused']);
+/** 診断ログで区別するtoken要求のgrant_type（固定）。他は`other`。 */
+const GRANT_TYPE_CATEGORIES: ReadonlySet<string> = new Set(['authorization_code', 'refresh_token']);
+/** 診断ログで区別する、取消のadapterのmodel（固定）。他は`other`。 */
+const REVOKE_MODELS: ReadonlySet<string> = new Set(['Grant', 'AccessToken', 'AuthorizationCode', 'RefreshToken']);
+
+/** Providerの要求contextから、token要求のgrant_typeの固定分類だけを取り出す（読めない・他の値は`other`。例外を外へ出さない）。 */
+export function grantTypeCategory(ctx: unknown): string {
+  try {
+    const value = (ctx as { oidc?: { params?: { grant_type?: unknown } } } | undefined)?.oidc?.params?.grant_type;
+    return typeof value === 'string' && GRANT_TYPE_CATEGORIES.has(value) ? value : 'other';
+  } catch {
+    return 'other';
+  }
+}
+
+/**
+ * adapterの取消（revokeByGrantId）を実行し、**成功した後だけ**固定の`oauth.grant_revoked`（modelの固定分類だけ）を記録する。
+ * 失敗はそのまま呼出し元へ返し、記録しない。記録の失敗は取消の結果を変えない。取消の挙動そのもの（何を消すか）は変えない。
+ */
+export async function auditedRevoke(model: string, revoke: () => Promise<void>, log: (entry: { readonly event: string; readonly category?: string }) => void): Promise<void> {
+  await revoke();
+  try {
+    log({ event: 'oauth.grant_revoked', category: REVOKE_MODELS.has(model) ? model : 'other' });
+  } catch {
+    // 記録の失敗で取消の結果を変えない。
+  }
+}
 
 const REQUIRED = ['bindPort', 'db', 'namespace', 'kms', 'secrets', 'identity', 'web', 'clientEgress', 'verificationSender', 'clock', 'publicOrigin'] as const;
 const OPTIONAL = ['log', 'startupOperation', 'developerCode'] as const;
@@ -815,7 +842,7 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         findByUid: (uid) => guarded(() => inner.findByUid(uid)),
         consume: (id) => guarded(() => inner.consume(id)),
         destroy: (id) => guarded(() => inner.destroy(id)),
-        revokeByGrantId: (grantId) => guarded(() => inner.revokeByGrantId(grantId)),
+        revokeByGrantId: (grantId) => auditedRevoke(model, () => guarded(() => inner.revokeByGrantId(grantId)), log),
       };
     };
     const assertionReplay = Object.freeze({
@@ -893,9 +920,10 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       isOwnerActive: isAccountUsable,
     });
     // 元例外のname・messageは記録しない。Koaの既定のerror出力（stack）も、この固定のlistenerで置き換える。
-    provider.on('server_error', () => log({ event: 'oauth.server_error' }));
+    // categoryはtoken要求のgrant_typeの固定分類だけ（他の値・error本文は出さない）。
+    provider.on('server_error', (ctx: unknown) => log({ event: 'oauth.server_error', category: grantTypeCategory(ctx) }));
     // Providerの型はKoa由来の'error'のoverloadを持たないため、EventEmitterとして登録する（listenerがあればKoaは既定の出力を足さない）。
-    (provider as unknown as NodeJS.EventEmitter).on('error', () => log({ event: 'oauth.request_error' }));
+    (provider as unknown as NodeJS.EventEmitter).on('error', (_error: unknown, ctx: unknown) => log({ event: 'oauth.request_error', category: grantTypeCategory(ctx) }));
 
     const resolver = createRequestScopedOAuthOwnerResolver({ provider, connect: storage, context, resource });
     const runtime = createKmsSubscriptionRegistrationRuntime({
