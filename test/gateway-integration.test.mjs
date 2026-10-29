@@ -50,7 +50,7 @@ let connectGateway;
 const sent = [];
 
 before(async () => {
-  rt = await startConnectHttpRuntime({ strict: true, transportAuthority: CONNECT_BACKEND_HOST, clientJwks: [CLIENT_JWK] });
+  rt = await startConnectHttpRuntime({ strict: true, transportAuthority: CONNECT_BACKEND_HOST, clientJwks: [CLIENT_JWK], echoChallenge: true });
   countListener();
   const config = configFor(rt.issuer);
   const iam = iamFetcher();
@@ -466,8 +466,9 @@ function tokenRequest(fields) {
 function mcpCall(accessToken, id, method, params = {}) {
   return viaGateway().request('POST', '/mcp', {
     cookies: false,
-    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'MCP-Protocol-Version': '2026-07-28' },
-    body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'MCP-Protocol-Version': '2026-07-28', 'Mcp-Method': method },
+    // 2026-07-28版の要求ごとのenvelope（test/mcp-subscribe-audit.test.mjsと同じ最小の値）。
+    body: JSON.stringify({ jsonrpc: '2.0', id, method, params: { ...params, _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {} } } }),
   });
 }
 
@@ -490,17 +491,33 @@ test('MCP: gateway経由で元の公開URLのcode交換（PKCE・private_key_jwt
   assert.equal(refreshed.status, 200, refreshed.body);
   const rotated = JSON.parse(refreshed.body);
   assert.ok(rotated.access_token);
-  // 認証済みMCP: initializeとtools/listが元resourceのBearerで成功する。
-  const init = await mcpCall(rotated.access_token, 1, 'initialize', { protocolVersion: '2026-07-28', capabilities: {}, clientInfo: { name: 'synthetic', version: '1.0.0' } });
-  assert.equal(init.status, 200, init.body);
-  assert.match(init.body, /"protocolVersion"/);
+  // 認証済みMCP: serverが支持する版（MCP-Protocol-Version header・旧initialize手順なし）のtools/listが元resourceのBearerで成功する。
   const tools = await mcpCall(rotated.access_token, 2, 'tools/list');
   assert.equal(tools.status, 200, tools.body);
   assert.match(tools.body, /"tools"/);
-  // Grantのsourceを停止すると、同じrefresh系列・access tokenは使えない。
+  // 購読保存: 実registration runtime/storeが合成callback challengeを確認して保存する（実HTTP 0）。
+  const subscribe = (token, id) =>
+    mcpCall(token, id, 'events/subscribe', { name: 'text.submitted', arguments: {}, delivery: { mode: 'webhook', url: `https://hooks.sttd-gateway.example/${randomBytes(6).toString('hex')}`, secret: `whsec_${randomBytes(32).toString('base64')}` } });
+  const subscriptions = () => [...rt.docs.keys()].filter((path) => path.startsWith(`sttdAuth/${rt.SUB_NS}/subscriptions/`));
+  const challengesBefore = rt.challenges.length;
+  const saved = await subscribe(rotated.access_token, 3);
+  assert.equal(saved.status, 200, saved.body);
+  assert.match(saved.body, /"result"/);
+  assert.doesNotMatch(saved.body, /"error"/);
+  assert.equal(rt.challenges.length, challengesBefore + 1);
+  assert.equal(subscriptions().length, 1, 'subscription saved in the real store');
+  const savedState = JSON.stringify(rt.docs.get(subscriptions()[0]).data);
+  const refusedMcp = (res) => res.status !== 200 || !/"result"/.test(res.body);
+  // Grantのsourceを停止すると、同じrefresh系列・access tokenは使えず、購読保存も拒否される。
   rt.write(`${rt.root}/sources/${person.record.sourceId}`, { ...person.record, state: 'disabled', updatedAt: person.record.updatedAt + 1 });
-  const afterStop = await mcpCall(rotated.access_token, 3, 'tools/list');
-  assert.notEqual(afterStop.status, 200);
+  const afterStop = await mcpCall(rotated.access_token, 4, 'tools/list');
+  assert.ok(refusedMcp(afterStop), `${afterStop.status}`);
+  assert.ok(refusedMcp(await subscribe(rotated.access_token, 5)));
+  // 再有効化でも世代が違えば旧Grantは使えない。
+  rt.write(`${rt.root}/sources/${person.record.sourceId}`, { ...person.record, generation: newSourceGeneration(), updatedAt: person.record.updatedAt + 2 });
+  assert.ok(refusedMcp(await mcpCall(rotated.access_token, 6, 'tools/list')));
+  assert.ok(refusedMcp(await subscribe(rotated.access_token, 7)));
+  assert.equal(JSON.stringify(rt.docs.get(subscriptions()[0]).data), savedState, 'refused subscribe does not change the store');
   const refreshAfterStop = await tokenRequest({ grant_type: 'refresh_token', refresh_token: rotated.refresh_token ?? tokens.refresh_token, resource: resourceFor(rt.issuer) });
   assert.notEqual(refreshAfterStop.status, 200);
   // 同じcodeの再利用は拒否（Providerの単回利用。Providerは再利用で系列も失効させるため最後に確認）。

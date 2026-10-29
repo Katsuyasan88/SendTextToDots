@@ -183,7 +183,7 @@ export function createResolverRuntime({ strict = true } = {}) {
  * 本番のlisten境界（0.0.0.0/明示port）だけを試験内で局所interceptして127.0.0.1/port 0へ結び、起動後すぐrestoreする（製品codeは不変）。
  * 要求はNode HTTP clientで、元のhttps Host（設定のauthority）・Origin・cookieを付けて127.0.0.1へ送る。redirectは追わない。
  */
-export async function startConnectHttpRuntime({ strict = true, transportAuthority, clientJwks = [] } = {}) {
+export async function startConnectHttpRuntime({ strict = true, transportAuthority, clientJwks = [], echoChallenge = false } = {}) {
   const net = await import('node:net');
   const http = await import('node:http');
   const { startDevelopmentKmsConnectServer } = await import('../../dist/connect/kms-server.js');
@@ -318,6 +318,7 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
     jwks_uri: CHATGPT_CIMD_CANDIDATE.jwksUri,
   };
   const egressCalls = [];
+  const challenges = [];
   const clientEgress = {
     getJson: async (url) => {
       egressCalls.push(url);
@@ -356,7 +357,11 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
       identity,
       web: { apiKey: 'synthetic-web-key', authDomain: `${projectId}.firebaseapp.com`, projectId },
       clientEgress,
-      verificationSender: async () => ({ status: 500, body: '' }),
+      // 合成のcallback challenge（echoChallengeの時だけ受信先の正しい応答を返す。実HTTP 0）。
+      verificationSender: async (request) => {
+        challenges.push(request.url);
+        return echoChallenge ? { status: 200, body: JSON.stringify({ challenge: JSON.parse(request.body).challenge }) } : { status: 500, body: '' };
+      },
       clock,
       publicOrigin: issuer,
       ...(transportAuthority !== undefined ? { transportAuthority } : {}),
@@ -454,6 +459,7 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
     sources,
     policy,
     egressCalls,
+    challenges,
     root,
     browser,
     enrollPerson,

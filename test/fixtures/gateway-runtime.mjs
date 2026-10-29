@@ -4,9 +4,10 @@
 //   - listen: 所有の127.0.0.1/ephemeral listenerだけ（各runの上限LISTENER_LIMIT。closeAllで必ず閉じる）。
 //   - isolatedDist: build済みdistの.jsだけを所有の一時directoryへ写し、配置設定moduleだけを合成のgateway-v1配置へ置き換える。
 
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
+import Module from 'node:module';
 import net from 'node:net';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -159,4 +160,124 @@ export function isolatedDist(config) {
     url: (name, query = '') => `${pathToFileURL(join(root, 'dist', ...name.split('/'))).href}${query}`,
     cleanup: () => rmSync(root, { recursive: true, force: true, maxRetries: 3 }),
   };
+}
+
+/**
+ * 実Google SDK factory（google-runtime/development.js）の公開SDK境界だけを合成に置き換える（test/api-entry.test.mjsのSDK代替と同じ
+ * 形: google-gax Compute・Firestore・KMS・Secret Manager・firebase-admin/app・auth）。実moduleを先に読み込んだ後に呼ぶこと。
+ * developmentのcreateRequireが読むrequire cacheだけを差し替え、restoreで必ず戻す。通信・資格・実SDK呼出し0。
+ */
+export function installGoogleSdkSubstitutes({ resolveFrom, secretVersions, docs }) {
+  const { createRequire } = Module;
+  const requireFrom = createRequire(resolveFrom);
+  const events = [];
+  const clone = (value) => (value === undefined ? undefined : structuredClone(value));
+  const gaxPromise = (produce) => {
+    const promise = produce();
+    Object.defineProperty(promise, 'cancel', { value: () => {}, writable: true, configurable: true, enumerable: false });
+    return promise;
+  };
+  class FakeCompute {
+    constructor() {
+      this.credentials = {};
+    }
+    async getAccessToken() {
+      throw new Error('no token in this unit');
+    }
+  }
+  class FakeGoogleAuth {}
+  const snapshotOf = (ref, entry) => ({ ref, id: ref.id, exists: entry !== undefined, data: () => clone(entry) });
+  const docRef = (db, path) => ({ firestore: db, path, id: path.slice(path.lastIndexOf('/') + 1), collection: (name) => collRef(db, `${path}/${name}`), get: async () => snapshotOf(docRef(db, path), docs.get(path)) });
+  const collRef = (db, path) => ({ firestore: db, path, doc: (id) => docRef(db, `${path}/${id}`) });
+  class FakeFirestore {
+    constructor(settings) {
+      this.settings = settings;
+      events.push('sdk.firestore');
+    }
+    collection(name) {
+      return collRef(this, name);
+    }
+    runTransaction() {
+      throw new Error('transactions are not used in this unit');
+    }
+    terminate() {
+      events.push('sdk.terminate');
+      return Promise.resolve();
+    }
+  }
+  const gapic = (kind, subs, innerApiCalls) =>
+    class {
+      constructor(opts) {
+        const client = { opts };
+        for (const [property, stubProperty] of subs) client[property] = { [stubProperty]: undefined };
+        client.initialize = () => {
+          client.innerApiCalls = innerApiCalls();
+          return Promise.resolve({ close: () => {} });
+        };
+        client.close = () => {
+          events.push(`sdk.${kind}.close`);
+          return Promise.resolve();
+        };
+        return client;
+      }
+    };
+  const payloads = { identifierKey: randomBytes(32), commandDigestKey: randomBytes(32), cookieKeys: randomBytes(32), jwks: randomBytes(32) };
+  const purposeOf = (name) => Object.keys(secretVersions).find((purpose) => secretVersions[purpose] === name);
+  const FakeKms = gapic('kms', [['iamClient', 'iamPolicyStub'], ['locationsClient', 'locationsStub'], ['operationsClient', 'operationsStub']], () => ({
+    encrypt: () => gaxPromise(() => Promise.reject(new Error('unused'))),
+    decrypt: () => gaxPromise(() => Promise.reject(new Error('unused'))),
+  }));
+  const reads = [];
+  const FakeSecrets = gapic('secrets', [['locationsClient', 'locationsStub']], () => ({
+    accessSecretVersion: (request) => {
+      const purpose = purposeOf(request.name);
+      reads.push(purpose);
+      const data = Buffer.from(payloads[purpose] ?? Buffer.alloc(0));
+      return gaxPromise(() => Promise.resolve([{ name: request.name, payload: { data, dataCrc32c: crc32cOf(data) } }, undefined, undefined]));
+    },
+  }));
+  const fakeAuth = {
+    async verifyIdToken() {
+      throw Object.assign(new Error('invalid'), { code: 'auth/invalid-id-token' });
+    },
+    async getUser() {
+      throw new Error('getUser is not used in this unit');
+    },
+  };
+  const fakeAdminApp = {
+    initializeApp: (options, name) => (events.push('sdk.initializeApp'), { name, options }),
+    deleteApp: () => (events.push('sdk.deleteApp'), Promise.resolve()),
+  };
+  const before = new Map();
+  const install = (name, exports) => {
+    const filename = requireFrom.resolve(name);
+    before.set(filename, Module._cache[filename]);
+    const fake = new Module(filename);
+    fake.filename = filename;
+    fake.loaded = true;
+    fake.exports = exports;
+    Module._cache[filename] = fake;
+  };
+  install('google-gax', { googleAuthLibrary: { Compute: FakeCompute }, GoogleAuth: FakeGoogleAuth });
+  install('@google-cloud/firestore', { Firestore: FakeFirestore });
+  install('@google-cloud/kms', { KeyManagementServiceClient: FakeKms });
+  install('@google-cloud/secret-manager', { SecretManagerServiceClient: FakeSecrets });
+  install('firebase-admin/app', fakeAdminApp);
+  install('firebase-admin/auth', { getAuth: () => fakeAuth });
+  return {
+    events,
+    reads,
+    restore: () => {
+      for (const [filename, previous] of before) {
+        if (previous === undefined) delete Module._cache[filename];
+        else Module._cache[filename] = previous;
+      }
+    },
+  };
+}
+
+/** CRC32C（Secret Managerの応答検査用。protection/kms-sealing.jsと同じ多項式）。 */
+let crc32cOf = () => 0;
+export function useCrc32c(fn) {
+  crc32cOf = fn;
 }

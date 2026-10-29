@@ -1,9 +1,10 @@
 // gatewayのGoogle IAM ID token（固定backendのaudienceだけ）。実行環境の既定主体の短期tokenを、Google公式のmetadata identity
 // endpoint（`http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity`・`Metadata-Flavor: Google`）
 // へのNode標準HTTPの一回の要求で取得する。宛先・主体・資格をenv/HTTPから差し替える口は無く、key file・別資格・匿名へのfallback 0。
-//   - 取得は単一化（同時に1つだけ。期限切れ前の共有tokenはRAMだけで保持し、永続化・ログ0）。1回の取得は短い上限（既定5秒）で
-//     signal/timer/socket/listenerを清掃して必ず終わり、redirect追跡・再送0。各呼出しの待機は呼出し側の元期限・中止まで（共有の取得は
-//     呼出し側の期限を延長しない）。closeは進行中の取得を中止し、後着のtokenをcacheへ採用しない。
+//   - 取得は単一化（同時に1つだけ。期限切れ前の共有tokenはRAMだけで保持し、永続化・ログ0）。1回の取得の上限は短い既定5秒と開始者の
+//     元期限の早い方で、signal/timer/socket/listenerを清掃して必ず終わり、redirect追跡・再送0。後から加わる待機者は上限を延長しない。
+//     待機者が全て中止・期限切れになった取得は、その時点で物理的に中止する。cacheへの採用は、元期限・中止を再確認した生きた待機者だけが
+//     行う（中止・期限切れ・close後の後着tokenは採用しない）。closeは進行中の取得を中止する。
 //   - 応答はstatus 200・`Metadata-Flavor: Google`・有限byte（8KiB）・JWTの形・固定audience・期限だけを確かめる（署名による利用許可は
 //     backend側のCloud Run IAMの責務で、ここでは認可票として扱わない）。業務SDKはimportしない。
 
@@ -68,16 +69,16 @@ export function createIdTokenSource(options: IdTokenSourceOptions): IdTokenSourc
   const fetchLimitMs = options.fetchLimitMs ?? 5_000;
   const refreshMarginMs = options.refreshMarginMs ?? 60_000;
   let cached: Cached | undefined;
-  let inflight: { readonly promise: Promise<Cached | null>; readonly controller: AbortController } | undefined;
+  let inflight: { readonly promise: Promise<Cached | null>; readonly controller: AbortController; waiters: number } | undefined;
   let closed = false;
   let started = 0;
 
-  /** 1回だけの取得（上限で中止し、settleしたら共有を外す）。 */
-  const start = (): Promise<Cached | null> => {
+  /** 1回だけの取得（min(取得上限, 開始者の元期限)で中止し、settleしたら共有を外す）。cacheへは入れない。 */
+  const start = (deadlineAt: number): NonNullable<typeof inflight> => {
     started += 1;
     const startedAt = clock.now();
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), fetchLimitMs);
+    const timer = setTimeout(() => controller.abort(), Math.max(0, Math.min(fetchLimitMs, deadlineAt - startedAt)));
     // 上限・closeでの中止は、portがsignalに応じない場合も、この取得をその時点で失敗として終える（共有を残さない）。
     const stopped = new Promise<never>((_resolve, reject) => {
       controller.signal.addEventListener('abort', () => reject(new GatewayIdTokenError('aborted')), { once: true });
@@ -98,16 +99,15 @@ export function createIdTokenSource(options: IdTokenSourceOptions): IdTokenSourc
       )
       .then((value) => {
         clearTimeout(timer);
-        // 中止・close後の後着は採用しない。
-        if (value === null || closed || controller.signal.aborted) return null;
-        cached = value;
-        return value;
+        // 中止・close後の後着は結果にしない。
+        return value === null || closed || controller.signal.aborted ? null : value;
       })
       .finally(() => {
         if (inflight?.promise === promise) inflight = undefined;
       });
-    inflight = { promise, controller };
-    return promise;
+    const flight = { promise, controller, waiters: 0 };
+    inflight = flight;
+    return flight;
   };
 
   return {
@@ -117,7 +117,8 @@ export function createIdTokenSource(options: IdTokenSourceOptions): IdTokenSourc
       if (!(now < deadlineAt)) throw new GatewayIdTokenError('timed_out');
       if (cached !== undefined && now < cached.expiresAt - refreshMarginMs) return cached.token;
       cached = undefined;
-      const pending = inflight?.promise ?? start();
+      const flight = inflight ?? start(deadlineAt);
+      flight.waiters += 1;
       let timer: NodeJS.Timeout | undefined;
       let onAbort: (() => void) | undefined;
       const stop = new Promise<'timed_out' | 'aborted'>((resolve) => {
@@ -126,16 +127,21 @@ export function createIdTokenSource(options: IdTokenSourceOptions): IdTokenSourc
         signal.addEventListener('abort', onAbort, { once: true });
       });
       try {
-        const result = await Promise.race([pending, stop]);
+        const result = await Promise.race([flight.promise, stop]);
         if (result === 'timed_out' || result === 'aborted') throw new GatewayIdTokenError(result);
         // 呼出し側が中止・期限切れの後に届いたtokenは使わない。
         if (signal.aborted) throw new GatewayIdTokenError('aborted');
         if (!(clock.now() < deadlineAt)) throw new GatewayIdTokenError('timed_out');
         if (result === null || closed || !(clock.now() < result.expiresAt)) throw new GatewayIdTokenError('unavailable');
+        // 元期限・中止を再確認した生きた待機者だけがcacheへ採用する。
+        cached = result;
         return result.token;
       } finally {
         clearTimeout(timer);
         if (onAbort !== undefined) signal.removeEventListener('abort', onAbort);
+        flight.waiters -= 1;
+        // 待機者が全ていなくなった未完の取得は物理的に中止する（後着は採用しない）。
+        if (flight.waiters === 0 && inflight === flight) flight.controller.abort();
       }
     },
     close(): void {

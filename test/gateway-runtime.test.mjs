@@ -19,7 +19,7 @@ import { createGatewayRuntime, GatewayRuntimeError } from '../dist/gateway/runti
 import { RUNTIME_REFUSED_ENV } from '../dist/policy.js';
 import { ARTIFACTS, buildArtifacts, buildGatewayArtifacts, GATEWAY_FORBIDDEN_PACKAGES, parseTarGz, parseZip, readServerInputs } from '../scripts/package-artifacts.mjs';
 import { DEPLOYMENT_CONFIG as SYNTHETIC } from './fixtures/synthetic-deployment.mjs';
-import { closeAll, countListener, iamFetcher, isolatedDist, listen, listenerCount, request, syntheticIdToken, topologyConfig } from './fixtures/gateway-runtime.mjs';
+import { closeAll, countListener, iamFetcher, installGoogleSdkSubstitutes, isolatedDist, listen, listenerCount, request, syntheticIdToken, topologyConfig, useCrc32c } from './fixtures/gateway-runtime.mjs';
 
 const GATEWAY_CONFIG = topologyConfig();
 /** 既存SDK gateと同じidentity条件を満たす合成のCloud実行環境（role別）。 */
@@ -255,6 +255,95 @@ test('route別上限: 元handlerの上限をContent-Length・stream・Functions 
   assert.equal(iam.calls.count, 0);
   assert.equal(forwarded.length, 0);
   handler.close();
+});
+
+test('IAM寿命: 単独callerの期限・中止で所有取得をabortしmetadata socketを閉じる。後着は採用せず、次要求は新しく1回だけ取得', async () => {
+  const AUD = GATEWAY_CONFIG.topology.api.backendOrigin;
+  const seen = { requests: 0, closed: 0 };
+  let mode = 'hang';
+  let staleToken;
+  const { port } = await listen((req, res) => {
+    seen.requests += 1;
+    res.on('close', () => {
+      if (!res.writableFinished) seen.closed += 1;
+    });
+    const token = syntheticIdToken(AUD, Math.floor(Date.now() / 1000) + 3600);
+    if (mode === 'late') {
+      staleToken = syntheticIdToken(AUD, Math.floor(Date.now() / 1000) + 7200);
+      setTimeout(() => !res.destroyed && res.writeHead(200, { 'Metadata-Flavor': 'Google' }).end(staleToken), 120);
+    }
+    if (mode === 'ok') res.writeHead(200, { 'Metadata-Flavor': 'Google' }).end(token);
+  });
+  const fetcher = metadataIdTokenFetcher((options, onResponse) => http.request({ ...options, host: '127.0.0.1', port }, onResponse));
+  const source = createIdTokenSource({ audience: AUD, fetcher, clock: { now: () => Date.now() }, fetchLimitMs: 5_000 });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 60));
+  // 呼出し側の元期限（40ms）: 取得上限5秒を待たずに所有取得を中止し、socketを閉じる。
+  await assert.rejects(source.get(Date.now() + 40, new AbortController().signal), (error) => error.code === 'timed_out');
+  await settle();
+  assert.deepEqual([seen.requests, seen.closed, source.stats.inflight], [1, 1, false]);
+  // 呼出し側の中止: 同じく所有取得を中止する（closeは使わない）。
+  const controller = new AbortController();
+  const aborted = source.get(Date.now() + 5_000, controller.signal);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  controller.abort();
+  await assert.rejects(aborted, (error) => error.code === 'aborted');
+  await settle();
+  assert.deepEqual([seen.requests, seen.closed, source.stats.inflight], [2, 2, false]);
+  // 期限で打ち切った後に届くはずの後着（stale）はcacheへ入らず、次要求は新しい1回の取得の新tokenを使う。
+  mode = 'late';
+  await assert.rejects(source.get(Date.now() + 40, new AbortController().signal), (error) => error.code === 'timed_out');
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  mode = 'ok';
+  const fresh = await source.get(Date.now() + 5_000, new AbortController().signal);
+  assert.notEqual(fresh, staleToken);
+  assert.equal(seen.requests, 4, 'one request per get, no retry');
+  assert.equal(source.stats.started, 4);
+  // 生きた待機者の共有: 2つ目の待機者は取得を増やさず、1つ目が中止しても残る待機者の取得は続く。
+  const shared = createIdTokenSource({ audience: AUD, fetcher, clock: { now: () => Date.now() } });
+  const first = new AbortController();
+  const p1 = shared.get(Date.now() + 5_000, first.signal);
+  const p2 = shared.get(Date.now() + 5_000, new AbortController().signal);
+  first.abort();
+  await assert.rejects(p1, (error) => error.code === 'aborted');
+  assert.equal(await p2, await shared.get(Date.now() + 5_000, new AbortController().signal));
+  assert.equal(seen.requests, 5);
+});
+
+test('backend API entry: 実owned bootstrap・実Google SDK factoryを公開SDK境界の合成で正規起動し、adapter経由の要求とcloseまで', async () => {
+  const config = validateDeploymentConfig(GATEWAY_CONFIG);
+  const { kmsMarkerDocument, createKmsSubscriptionPolicy } = await import(copy.url('storage/firestore/kms-subscription-format.js'));
+  const { crc32c } = await import(copy.url('protection/kms-sealing.js'));
+  useCrc32c(crc32c);
+  const docs = new Map([[`sttdAuth/${config.kms.namespace}/config/kms-subscription`, kmsMarkerDocument(createKmsSubscriptionPolicy({ ...config.kms, readVersions: [...config.kms.readVersions] }))]]);
+  // test/api-entry.test.mjsと同じ順: 実moduleを先に読み込み（実SDKへ束縛）→ SDK factoryが読み込み時にrequireする公開SDK境界だけを
+  // 代替 → bootstrap/entryを読み込む。
+  for (const name of ['connect/firestore.js', 'connect/kms-port.js', 'connect/kms-server.js', 'connect/google-kms-server.js', 'delivery/kms-functions.js', 'delivery/kms-store.js', 'egress/product.js', 'keys/google-secret-reader.js', 'oauth/request-auth-runtime.js', 'protection/google-kms-transport.js', 'identity/firebase.js']) {
+    await import(copy.url(name));
+  }
+  const sdk = installGoogleSdkSubstitutes({ resolveFrom: copy.url('google-runtime/development.js'), secretVersions: config.secretVersions, docs });
+  const entry = await import(copy.url('deployment/backend-api.js', '?ok'));
+  const backendName = config.topology.api.backendServiceName;
+  try {
+    await guarded({ PORT: '18085', K_SERVICE: backendName, K_REVISION: `${backendName}-00001-abc`, K_CONFIGURATION: backendName }, async (counts) => {
+      const handle = await entry.runBackendApi();
+      assert.equal(counts.listened.length, 1);
+      const port = counts.listened[0].address().port;
+      const transportHost = new URL(config.topology.api.backendOrigin).host;
+      // 公開Host（gatewayを通らない直行）はadapterで400。
+      assert.equal((await request(port, { method: 'POST', path: '/v2/commands', headers: { Host: new URL(config.api.publicOrigin).host }, body: '{}' })).status, 400);
+      // gateway形（transport Host・絶対期限）の未認証要求は、実handlerの既存401。
+      const res = await request(port, { method: 'POST', path: '/v2/commands', headers: { Host: transportHost, 'X-STTD-Gateway-Deadline': String(Date.now() + 10_000), 'Content-Type': 'application/json' }, body: '{}' });
+      assert.equal(res.status, 401, res.body);
+      assert.deepEqual(sdk.reads.sort(), ['commandDigestKey', 'identifierKey']);
+      assert.ok(sdk.events.includes('sdk.firestore') && sdk.events.includes('sdk.initializeApp'));
+      await handle.close();
+      for (const event of ['sdk.terminate', 'sdk.kms.close', 'sdk.secrets.close', 'sdk.deleteApp']) assert.ok(sdk.events.includes(event), event);
+      assert.equal(counts.listened[0].listening, false);
+      assert.equal(counts.external, 0);
+    });
+  } finally {
+    sdk.restore();
+  }
 });
 
 test('MCP gateway entry: 実runで待受し、未知route・Host偽装は転送前に拒否。K_SERVICE不一致は起動拒否（listen 0）', async () => {
