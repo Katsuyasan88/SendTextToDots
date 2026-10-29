@@ -95,9 +95,11 @@ test('正規中継: method・生target・本文bytes・利用者header（多値�
   assert.equal(iam.length, 1);
   assert.notEqual(iam[0], 'Bearer forged');
   assert.match(iam[0], /^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
-  const budget = all('x-sttd-gateway-budget-ms');
-  assert.equal(budget.length, 1);
-  assert.ok(Number(budget[0]) >= 1 && Number(budget[0]) <= 20_000);
+  // 外部の残時間/期限headerは除去し、gateway受付の絶対期限（受付+20秒以内のUNIX ms）だけを1件付ける。
+  assert.deepEqual(all('x-sttd-gateway-budget-ms'), []);
+  const deadline = all('x-sttd-gateway-deadline');
+  assert.equal(deadline.length, 1);
+  assert.ok(Number(deadline[0]) > Date.now() && Number(deadline[0]) <= Date.now() + 20_000);
   // 固定audienceだけ・tokenは共有（2回目は再取得しない）。
   assert.deepEqual(gw.iam.calls.audiences, [BACKEND.api]);
   assert.equal((await request(gw.port, { method: 'GET', path: '/v2/encryption-key', headers: { Authorization: 'Bearer user-token' } })).status, 200);
@@ -146,11 +148,11 @@ test('応答: status・複数Set-Cookie・WWW-Authenticate・Location・CORSを�
 
 test('応答headerにbackendのauthorityが出たら返さずに固定502', async () => {
   const backend = await echoBackend((req, res) => {
-    res.writeHead(302, { Location: `${BACKEND.api}/v2/commands/x` });
+    res.writeHead(302, { Location: `${BACKEND.api}/v2/commands/0b0c2f9e-1d2a-4c3b-9a8f-7e6d5c4b3a21` });
     res.end();
   });
   const gw = await gatewayFor(backend.port);
-  const res = await request(gw.port, { method: 'GET', path: '/v2/commands/x' });
+  const res = await request(gw.port, { method: 'GET', path: '/v2/commands/0b0c2f9e-1d2a-4c3b-9a8f-7e6d5c4b3a21' });
   assert.equal(res.status, 502);
   assert.equal(res.headers.location, undefined);
   assert.ok(!res.body.includes(BACKEND_HOST));
@@ -213,9 +215,10 @@ test('IAM: 取得失敗・上限超過・期限切れ・別audienceは固定503�
   const hanging = await gatewayFor(backend.port, { fetcher: () => new Promise(() => undefined), fetchLimitMs: 50 });
   const slow = await request(hanging.port, { path: '/v2/encryption-key' });
   assert.equal(slow.status, 503);
-  // 打ち切った取得がsettleしていない間は新しい取得を重ねない。
+  // 上限で打ち切った取得はその時点で終わる（共有を残さない）。次の要求は1回だけ新しく取得し、自動再送はしない。
+  assert.equal(hanging.handler.stats.active, 0);
   assert.equal((await request(hanging.port, { path: '/v2/encryption-key' })).status, 503);
-  assert.equal(hanging.iam.calls.count, 1);
+  assert.equal(hanging.iam.calls.count, 2);
   const expired = await gatewayFor(backend.port, { fetcher: async (audience) => syntheticIdToken(audience, Math.floor(Date.now() / 1000) - 10) });
   assert.equal((await request(expired.port, { path: '/v2/encryption-key' })).status, 503);
   const other = await gatewayFor(backend.port, { fetcher: async () => syntheticIdToken(BACKEND.connect, Math.floor(Date.now() / 1000) + 3600) });

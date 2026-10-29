@@ -763,8 +763,8 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
   let developerCodeStore: DeveloperCodeExchangeDeps['store'] | null = null;
   /** 設定のauthority（`<DNS-host>`）。 */
   const authority = new URL(config.publicOrigin).host;
-  /** gateway-v1のbackendで要求ごとに受けた残時間（direct配置では空）。 */
-  const backendBudgets = new WeakMap<IncomingMessage, number>();
+  /** gateway-v1のbackendで要求ごとに受けた絶対期限（direct配置では空）。 */
+  const backendDeadlines = new WeakMap<IncomingMessage, number>();
 
   /** 共通の時計（captured now）。全構成へ同じobjectを渡す。 */
   const clock: Clock = Object.freeze({ now: () => config.now() as number });
@@ -1575,8 +1575,8 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       }
       // 元20秒のoperationは受付時に1回だけ作る。切断・未完了の応答close・server closeで中止する（正常に書き終えた後のcloseは中止にしない）。
       const controller = new AbortController();
-      // gateway-v1のbackendは、gatewayの残時間（元20秒以下）だけを使う。
-      const operation: McpRequestOperation = Object.freeze({ deadlineAt: receivedAt + (backendBudgets.get(req) ?? REQUEST_BUDGET_MS), signal: controller.signal });
+      // gateway-v1のbackendは、gatewayの絶対期限と受付+20秒の短い方（中継遅延で延長しない）。
+      const operation: McpRequestOperation = Object.freeze({ deadlineAt: Math.min(receivedAt + REQUEST_BUDGET_MS, backendDeadlines.get(req) ?? Number.MAX_SAFE_INTEGER), signal: controller.signal });
       active.add(controller);
       const abort = (): void => controller.abort();
       const onResponseClose = (): void => {
@@ -1641,9 +1641,10 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         const transportAuthority = config.transportAuthority;
         if (transportAuthority === undefined) admitted = admitRequest(req, authority);
         else {
-          const budget = admitBackendRequest(req, { transportAuthority, logicalAuthority: authority });
-          if (budget !== null) backendBudgets.set(req, budget);
-          admitted = budget !== null && admitRequest(req, authority);
+          const now = safeNow();
+          const deadlineAt = now === null ? null : admitBackendRequest(req, { transportAuthority, logicalAuthority: authority }, now);
+          if (deadlineAt !== null) backendDeadlines.set(req, deadlineAt);
+          admitted = deadlineAt !== null && admitRequest(req, authority);
         }
       } catch {
         admitted = false;

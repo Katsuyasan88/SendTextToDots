@@ -8,7 +8,7 @@
 // 合成DB・合成KMS・合成本人・合成IAMだけ。実Cloud IAMの効力・実SDK通信・外部network・Dots・配送 0（Cloud IAMはT091相当の実配置で確認）。
 
 import assert from 'node:assert/strict';
-import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto';
 import http from 'node:http';
 import { after, before, test } from 'node:test';
 
@@ -22,6 +22,7 @@ import { CHATGPT_CIMD_CANDIDATE } from '../dist/oauth/cimd.js';
 import { resourceFor } from '../dist/oauth/provider.js';
 import { newSourceGeneration, newSourceId } from '../dist/source/admin.js';
 import { signSourceRequest } from '../dist/source/proof.js';
+import { createAppCheckVerifier } from '../dist/source/app-check.js';
 import { closeAll, countListener, iamFetcher, listen, listenerCount, request, topologyConfig, topologyOf } from './fixtures/gateway-runtime.mjs';
 import { createDeliveryRuntime, startConnectHttpRuntime } from './fixtures/source-runtime.mjs';
 
@@ -40,19 +41,23 @@ function configFor(connectOrigin) {
   return { ...validated, api: { ...validated.api, publicOrigin: API_PUBLIC }, connect: { ...validated.connect, publicOrigin: connectOrigin } };
 }
 
+/** 固定CIMD候補clientの合成鍵（private_key_jwt。jwks_uriの合成応答だけに置く）。 */
+const CLIENT_KEY = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+const CLIENT_JWK = { ...CLIENT_KEY.publicKey.export({ format: 'jwk' }), kid: 'synthetic-client', alg: 'ES256', use: 'sig' };
+
 let rt;
 let connectGateway;
 const sent = [];
 
 before(async () => {
-  rt = await startConnectHttpRuntime({ strict: true, transportAuthority: CONNECT_BACKEND_HOST });
+  rt = await startConnectHttpRuntime({ strict: true, transportAuthority: CONNECT_BACKEND_HOST, clientJwks: [CLIENT_JWK] });
   countListener();
   const config = configFor(rt.issuer);
   const iam = iamFetcher();
   const handler = createGatewayRuntime({
     role: 'connect',
     config,
-    env: { K_SERVICE: config.connect.serviceName },
+    env: { K_SERVICE: config.connect.serviceName, K_REVISION: 'sendtexttodots-connect-00001-abc', K_CONFIGURATION: 'sendtexttodots-connect' },
     clock: { now: () => Date.now() },
     fetcher: iam.fetcher,
     transport: (options, onResponse) => {
@@ -128,7 +133,7 @@ test('API: 公開audienceへの正規source署名がgateway→実adapter→実ha
   const gateway = createGatewayRuntime({
     role: 'api',
     config,
-    env: { K_SERVICE: 'sendtexttodotsapi' },
+    env: { K_SERVICE: 'sendtexttodotsapi', K_REVISION: 'sendtexttodotsapi-00001-abc', K_CONFIGURATION: 'sendtexttodotsapi' },
     clock: { now: () => Date.now() },
     fetcher: iam.fetcher,
     transport: (options, onResponse) => http.request(options, onResponse),
@@ -233,7 +238,7 @@ async function startFlow() {
   const uid = /\/interaction\/([A-Za-z0-9_-]+)$/.exec(location.pathname)?.[1];
   assert.ok(uid);
   assert.ok(Array.isArray(res.headers['set-cookie']) && res.headers['set-cookie'].length >= 2, 'multiple Set-Cookie are kept');
-  return { b, uid };
+  return { b, uid, verifier };
 }
 
 async function login(flow, person) {
@@ -242,6 +247,13 @@ async function login(flow, person) {
   assert.ok(!page.body.includes(CONNECT_BACKEND_HOST));
   const csrf = /data-sttd-csrf="([^"]+)"/.exec(page.body)?.[1];
   assert.ok(csrf);
+  // 実画面が読むscriptも元の公開URLのgateway経由で200（兄弟pathは404）。
+  const src = /<script[^>]*\ssrc="([^"]+)"/.exec(page.body)?.[1];
+  assert.ok(src, 'interaction page references its script');
+  const script = await flow.b.request('GET', new URL(src, rt.issuer).pathname);
+  assert.equal(script.status, 200);
+  assert.match(script.headers['content-type'], /javascript/);
+  assert.equal((await flow.b.request('GET', '/interaction/app.css')).status, 404);
   const res = await flow.b.request('POST', `/interaction/${flow.uid}/login`, {
     headers: { 'Content-Type': 'application/json', Origin: rt.issuer },
     body: JSON.stringify({ csrf, idToken: person.idToken }),
@@ -348,4 +360,149 @@ test('MCP: 承認なし・停止sourceではGrantを作らない。MCP 401のWWW
   // 公開Hostでbackendへ直行するとadapterで固定400（transport authority不一致）。
   const direct = await rt.browser().request('GET', '/.well-known/oauth-protected-resource/mcp', { cookies: false });
   assert.equal(direct.status, 400);
+});
+
+// ---------- R1: App Check・code交換・refresh・認証済みMCP ----------
+
+test('API App Check: gateway経由で実backend gateが要求ごとにconsume1回、再利用・停止・障害は送出0、gatewayはconsume0', async () => {
+  const PN = '123456789012';
+  const APP_ID = `1:${PN}:ios:0123abcd`;
+  const consumed = new Set();
+  const port0 = { calls: 0, down: false };
+  const appCheckPort = {
+    async verifyToken(token, options) {
+      port0.calls += 1;
+      assert.deepEqual(options, { consume: true });
+      if (port0.down) throw new Error('synthetic app check down');
+      const already = consumed.has(token);
+      consumed.add(token);
+      return { appId: APP_ID, token: { iss: `https://firebaseappcheck.googleapis.com/${PN}`, aud: [`projects/${PN}`], sub: APP_ID }, alreadyConsumed: already };
+    },
+  };
+  const w = createDeliveryRuntime({ audience: API_PUBLIC, appCheck: createAppCheckVerifier({ appCheck: appCheckPort, projectNumber: PN, projectId: PID }) });
+  const owner = w.enroll();
+  const uid = 'uid-gateway-appcheck';
+  const appSource = { schemaVersion: 1, sourceId: newSourceId(), kind: 'app', state: 'active', generation: newSourceGeneration(), operations: ['send'], appId: APP_ID, createdAt: w.clock.t, updatedAt: w.clock.t };
+  assert.equal(await w.sources.create(appSource), 'created');
+  // 購読Grantは別の（接続承認した）sourceへ結ぶ。
+  const grantSource = {
+    schemaVersion: 1,
+    sourceId: newSourceId(),
+    kind: 'developer',
+    state: 'active',
+    generation: newSourceGeneration(),
+    operations: ['connect'],
+    publicKey: generateKeyPairSync('ed25519').publicKey.export({ format: 'jwk' }).x,
+    identityHash: connectIdentityHash(w.hasher, w.NS, { projectId: PID, uid }),
+    expiresAt: null,
+    createdAt: w.clock.t,
+    updatedAt: w.clock.t,
+  };
+  assert.equal(await w.sources.create(grantSource), 'created');
+  w.bindGrant(owner.grantId, grantSource);
+  const identity = { projectId: PID, verifyIdToken: async () => ({ projectId: PID, uid, authTimeSec: 1 }), accountStatus: async () => 'active' };
+  const backend = createApiBackendServe({ transportAuthority: API_BACKEND_HOST, logicalAuthority: new URL(API_PUBLIC).host, clock: w.clock, cors: applyConsoleCors });
+  const handler = createIngressOperationDeliveryRequestHandler({ identity, findOwner: async () => owner.ownerId, service: w.service, clock: w.clock, lifetime: new AbortController().signal, ingress: backend.ingress, sources: w.gate });
+  const { port: backendPort } = await listen((req, res) => void backend.serve(req, res, (rq, rs) => handler(rq, rs)));
+  const gateway = createGatewayRuntime({
+    role: 'api',
+    config: configFor('https://connect.sttd-http.example.com'),
+    env: { K_SERVICE: 'sendtexttodotsapi', K_REVISION: 'sendtexttodotsapi-00001-abc', K_CONFIGURATION: 'sendtexttodotsapi' },
+    clock: { now: () => Date.now() },
+    fetcher: iamFetcher().fetcher,
+    transport: (options, onResponse) => http.request(options, onResponse),
+    connectTo: { host: '127.0.0.1', port: backendPort },
+  });
+  const { port } = await listen((req, res) => void gateway.handle(req, res));
+  const send = (token) => {
+    const commandId = randomUUID();
+    const iso = (ms) => new Date(ms).toISOString();
+    const body = JSON.stringify({ schemaVersion: 2, commandId, text: 'synthetic', createdAt: iso(w.clock.t), expiresAt: iso(w.clock.t + 60_000) });
+    return request(port, {
+      method: 'POST',
+      path: '/v2/commands',
+      headers: { Authorization: 'Bearer token.user.a', 'Content-Type': 'application/json', 'Idempotency-Key': commandId, 'X-STTD-Source': appSource.sourceId, 'X-Firebase-AppCheck': token },
+      body,
+    });
+  };
+  const ok = await send('aaa.bbb.ccc');
+  assert.equal(ok.status, 200, ok.body);
+  assert.equal(JSON.parse(ok.body).state, 'delivered');
+  assert.equal(port0.calls, 1, 'consumed exactly once per request, only in the backend');
+  assert.equal(w.sent.length, 1);
+  // 同じtokenの再利用は消費済みで403、送出0。
+  assert.equal((await send('aaa.bbb.ccc')).status, 403);
+  assert.equal(port0.calls, 2);
+  // App Checkの障害は503（開発者方式へ降格しない）、送出0。
+  port0.down = true;
+  assert.equal((await send('ddd.eee.fff')).status, 503);
+  port0.down = false;
+  // 要求sourceの停止は、正規の新tokenでも送出0。
+  w.clock.t += 1_000;
+  w.docs.set(`sttdConnect/${w.NS}/sources/${appSource.sourceId}`, { ...appSource, state: 'disabled', updatedAt: appSource.updatedAt + 1 });
+  const stopped = await send('ggg.hhh.iii');
+  assert.notEqual(stopped.status === 200 ? JSON.parse(stopped.body).state : 'refused', 'delivered');
+  assert.equal(w.sent.length, 1);
+});
+
+/** 固定CIMD候補clientのprivate_key_jwt（ES256・Node crypto）。 */
+function clientAssertion() {
+  const part = (value) => Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+  const iat = Math.floor(Date.now() / 1000);
+  const input = `${part({ alg: 'ES256', kid: CLIENT_JWK.kid, typ: 'JWT' })}.${part({ iss: CHATGPT_CIMD_CANDIDATE.clientId, sub: CHATGPT_CIMD_CANDIDATE.clientId, aud: `${rt.issuer}/oauth/token`, jti: randomUUID(), iat, exp: iat + 60 })}`;
+  return `${input}.${sign('sha256', Buffer.from(input), { key: CLIENT_KEY.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url')}`;
+}
+
+function tokenRequest(fields) {
+  const body = new URLSearchParams({
+    ...fields,
+    client_id: CHATGPT_CIMD_CANDIDATE.clientId,
+    client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
+    client_assertion: clientAssertion(),
+  }).toString();
+  return viaGateway().request('POST', '/oauth/token', { cookies: false, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+}
+
+function mcpCall(accessToken, id, method, params = {}) {
+  return viaGateway().request('POST', '/mcp', {
+    cookies: false,
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'MCP-Protocol-Version': '2026-07-28' },
+    body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+  });
+}
+
+test('MCP: gateway経由で元の公開URLのcode交換（PKCE・private_key_jwt）→refresh→認証済みMCP、source停止後のrefreshは拒否', async () => {
+  const person = await rt.enrollPerson('uid-gateway-token');
+  const flow = await startFlow();
+  await login(flow, person);
+  assert.equal((await approval('POST', flow.uid, person, { body: APPROVE })).status, 200);
+  const done = await consent(flow, await consentPage(flow));
+  assert.ok([302, 303].includes(done.status));
+  const resumed = await flow.b.request('GET', new URL(done.headers.location, rt.issuer).pathname);
+  const code = new URL(resumed.headers.location).searchParams.get('code');
+  assert.ok(code);
+  const exchanged = await tokenRequest({ grant_type: 'authorization_code', code, redirect_uri: CHATGPT_CIMD_CANDIDATE.redirectUri, code_verifier: flow.verifier, resource: resourceFor(rt.issuer) });
+  assert.equal(exchanged.status, 200, exchanged.body);
+  const tokens = JSON.parse(exchanged.body);
+  assert.ok(tokens.access_token && tokens.refresh_token);
+  assert.ok(!exchanged.body.includes(CONNECT_BACKEND_HOST));
+  const refreshed = await tokenRequest({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token, resource: resourceFor(rt.issuer) });
+  assert.equal(refreshed.status, 200, refreshed.body);
+  const rotated = JSON.parse(refreshed.body);
+  assert.ok(rotated.access_token);
+  // 認証済みMCP: initializeとtools/listが元resourceのBearerで成功する。
+  const init = await mcpCall(rotated.access_token, 1, 'initialize', { protocolVersion: '2026-07-28', capabilities: {}, clientInfo: { name: 'synthetic', version: '1.0.0' } });
+  assert.equal(init.status, 200, init.body);
+  assert.match(init.body, /"protocolVersion"/);
+  const tools = await mcpCall(rotated.access_token, 2, 'tools/list');
+  assert.equal(tools.status, 200, tools.body);
+  assert.match(tools.body, /"tools"/);
+  // Grantのsourceを停止すると、同じrefresh系列・access tokenは使えない。
+  rt.write(`${rt.root}/sources/${person.record.sourceId}`, { ...person.record, state: 'disabled', updatedAt: person.record.updatedAt + 1 });
+  const afterStop = await mcpCall(rotated.access_token, 3, 'tools/list');
+  assert.notEqual(afterStop.status, 200);
+  const refreshAfterStop = await tokenRequest({ grant_type: 'refresh_token', refresh_token: rotated.refresh_token ?? tokens.refresh_token, resource: resourceFor(rt.issuer) });
+  assert.notEqual(refreshAfterStop.status, 200);
+  // 同じcodeの再利用は拒否（Providerの単回利用。Providerは再利用で系列も失効させるため最後に確認）。
+  assert.notEqual((await tokenRequest({ grant_type: 'authorization_code', code, redirect_uri: CHATGPT_CIMD_CANDIDATE.redirectUri, code_verifier: flow.verifier, resource: resourceFor(rt.issuer) })).status, 200);
 });

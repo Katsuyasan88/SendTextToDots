@@ -2,17 +2,18 @@
 // backend（transport authority＝IAM audienceの正式service URL）・gatewayの実行主体・入口の量の上限を返す。省略は従来のdirect配置
 // （gatewayもbackendも使わない）。不正な値はdirect/匿名へ降格せず設定errorにする。
 //   - route表は既存handlerの公開routeだけ（prefixだけで任意pathを通さない）。pathはwireの生bytesのまま照合し、decode・正規化しない。
-//   - gatewayが付ける内部headerは2つだけ（IAMのX-Serverless-Authorizationと残時間）。外部から来た同名は常に除去して作り直す。
+//   - gatewayが付ける内部headerは2つだけ（IAMのX-Serverless-Authorizationと絶対期限）。外部から来た同名は常に除去して作り直す。
 // このmoduleはpureで、SDK・資格・env・network 0。
 
 import { isDevelopmentPublicOrigin } from '../http/origin.js';
 import { dataFields } from '../protection/google-sdk-call.js';
+import { MAX_BODY_BYTES, MAX_COMMAND_BODY_BYTES, MAX_MCP_BODY_BYTES } from '../policy.js';
 
 export const GATEWAY_TOPOLOGY_MODE = 'gateway-v1';
 /** 元の要求予算（gateway受付から共有し、backendで延長しない）。 */
 export const GATEWAY_REQUEST_BUDGET_MS = 20_000;
-/** gateway→backendの残時間（ミリ秒の正規十進）。外部入力は除去する。 */
-export const GATEWAY_BUDGET_HEADER = 'x-sttd-gateway-budget-ms';
+/** gateway受付で確定した絶対期限（UNIX ms・正規十進）。外部入力は除去して作り直す。backendは自身の最大20秒と短い方を使う。 */
+export const GATEWAY_DEADLINE_HEADER = 'x-sttd-gateway-deadline';
 /** Cloud Run service間認証のheader（利用者のAuthorizationとは別）。外部入力は除去する。 */
 export const SERVERLESS_AUTHORIZATION_HEADER = 'x-serverless-authorization';
 
@@ -125,34 +126,60 @@ export function parseGatewayTopology(raw: unknown, context: GatewayTopologyConte
   }
 }
 
-// ---------- route表（既存handlerの公開routeだけ） ----------
+// ---------- route表（既存handler・pinned Providerの実routeと同じpath/method・route別の本文上限） ----------
+// 照合元: delivery/api.ts（COMMAND_PATH・method・本文上限）とdeployment/console-cors.ts（preflightはcommand routeだけ）、
+// connect/kms-server.ts（interaction/承認/接続照会・切断/MCP/metadata）、connect/pages.ts（INTERACTION_SCRIPT_PATH）、
+// oauth/provider.ts（OAUTH_ROUTES・無効のuserinfo/registration/introspection/PAR/device/rpInitiatedLogout・enableHttpPostMethods既定false）と
+// oidc-provider 9.12.2の登録（authorization GET・resume・token・jwks・revocation・end_session/confirm・2つのdiscovery）。
+// 本文上限は元実装の値（http/body.tsの既定4096・承認64・送信/取消MAX_COMMAND_BODY_BYTES・暗号ENCRYPTED_WIRE_MAX_BYTES・再発行
+// REISSUE_BODY_MAX_BYTES・MCP MAX_MCP_BODY_BYTES・Providerのselective_body 56KiB）で、本文の無いrouteは0。拡大しない。
 
 interface Route {
   readonly path: string | RegExp;
-  readonly methods: readonly string[];
+  /** method → そのrouteの本文上限（byte）。 */
+  readonly methods: Readonly<Record<string, number>>;
 }
 
+const UUID = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
 const ID = '[A-Za-z0-9_-]{1,128}';
+/** http/body.tsの既定上限（login・consent・deny・codeのJSON/form）。 */
+const FORM_MAX = MAX_BODY_BYTES;
+/** source/http.tsの承認本文上限。 */
+const APPROVAL_MAX = 64;
+/** oidc-provider 9.12.2のselective_body上限。 */
+const PROVIDER_MAX = 56 * 1024;
+/** delivery/api.tsのENCRYPTED_WIRE_MAX_BYTES・encryption/api.tsのREISSUE_BODY_MAX_BYTES（業務moduleをimportしない写し。試験で一致を確認）。 */
+export const ENCRYPTED_WIRE_MAX = 12_288;
+export const REISSUE_MAX = 1024;
 
-/** 送信API（delivery/api.ts・console-cors.ts）の公開route。CORS preflightを含む。 */
+/** 送信API（delivery/api.ts・console-cors.ts）の公開route。 */
 const API_ROUTES: readonly Route[] = Object.freeze([
-  { path: '/v2/commands', methods: ['POST', 'OPTIONS'] },
-  { path: new RegExp(`^/v2/commands/${ID}(?:/cancel)?$`), methods: ['GET', 'POST', 'DELETE', 'OPTIONS'] },
-  { path: '/v2/encryption-key', methods: ['GET', 'OPTIONS'] },
-  { path: '/v2/encryption-key/reissue', methods: ['POST', 'OPTIONS'] },
-  { path: '/v2/encrypted-commands', methods: ['POST', 'OPTIONS'] },
+  { path: '/v2/commands', methods: { POST: MAX_COMMAND_BODY_BYTES, OPTIONS: 0 } },
+  { path: new RegExp(`^/v2/commands/${UUID}$`), methods: { GET: 0, OPTIONS: 0 } },
+  { path: new RegExp(`^/v2/commands/${UUID}/cancel$`), methods: { POST: MAX_COMMAND_BODY_BYTES, OPTIONS: 0 } },
+  { path: '/v2/encryption-key', methods: { GET: 0 } },
+  { path: '/v2/encryption-key/reissue', methods: { POST: REISSUE_MAX } },
+  { path: '/v2/encrypted-commands', methods: { POST: ENCRYPTED_WIRE_MAX } },
 ]);
 
-/** MCP接続（connect/kms-server.ts）の公開route: discovery・OAuth・interaction・許可元承認・MCP・接続照会/切断・既存script。 */
+/** MCP接続（connect/kms-server.ts・oauth/provider.ts・pinned Provider）の公開route。 */
 const CONNECT_ROUTES: readonly Route[] = Object.freeze([
-  { path: '/mcp', methods: ['GET', 'POST', 'DELETE', 'OPTIONS'] },
-  { path: /^\/\.well-known\/(?:oauth-authorization-server|openid-configuration|oauth-protected-resource)(?:\/mcp)?$/, methods: ['GET', 'OPTIONS'] },
-  { path: new RegExp(`^/oauth/(?:authorize|token|jwks|revoke|introspect|userinfo|me|reg|session/end|session/end/confirm|backchannel|device/auth)(?:/${ID})?$`), methods: ['GET', 'POST', 'OPTIONS'] },
-  { path: new RegExp(`^/interaction/${ID}(?:/[a-z][a-z-]{0,31})?$`), methods: ['GET', 'POST'] },
-  { path: new RegExp(`^/v1/source/approvals/${ID}$`), methods: ['GET', 'POST'] },
-  { path: '/v1/web/connection', methods: ['GET', 'OPTIONS'] },
-  { path: '/v1/web/disconnect', methods: ['POST', 'OPTIONS'] },
-  { path: /^\/(?:static|assets)\/[A-Za-z0-9_-]{1,64}(?:\.[A-Za-z0-9_-]{1,16}){0,2}\.(?:js|css|svg|png|ico)$/, methods: ['GET'] },
+  { path: '/interaction/app.js', methods: { GET: 0 } },
+  { path: new RegExp(`^/interaction/${ID}$`), methods: { GET: 0 } },
+  { path: new RegExp(`^/interaction/${ID}/(?:login|consent|deny|code)$`), methods: { POST: FORM_MAX } },
+  { path: new RegExp(`^/v1/source/approvals/${ID}$`), methods: { GET: 0, POST: APPROVAL_MAX } },
+  { path: '/v1/web/connection', methods: { GET: 0 } },
+  { path: '/v1/web/disconnect', methods: { POST: 0 } },
+  { path: '/mcp', methods: { POST: MAX_MCP_BODY_BYTES, GET: 0, DELETE: 0 } },
+  { path: '/.well-known/oauth-protected-resource/mcp', methods: { GET: 0 } },
+  { path: '/.well-known/oauth-authorization-server', methods: { GET: 0, OPTIONS: 0 } },
+  { path: '/.well-known/openid-configuration', methods: { GET: 0, OPTIONS: 0 } },
+  { path: '/oauth/authorize', methods: { GET: 0 } },
+  { path: new RegExp(`^/oauth/authorize/${ID}$`), methods: { GET: 0 } },
+  { path: '/oauth/token', methods: { POST: PROVIDER_MAX, OPTIONS: 0 } },
+  { path: '/oauth/revoke', methods: { POST: PROVIDER_MAX, OPTIONS: 0 } },
+  { path: '/oauth/jwks', methods: { GET: 0, OPTIONS: 0 } },
+  { path: '/oauth/session/end/confirm', methods: { POST: PROVIDER_MAX } },
 ]);
 
 const ROUTES: Readonly<Record<GatewayRole, readonly Route[]>> = { api: API_ROUTES, connect: CONNECT_ROUTES };
@@ -160,14 +187,19 @@ const ROUTES: Readonly<Record<GatewayRole, readonly Route[]>> = { api: API_ROUTE
 /** origin-formのrequest-target（`/`始まり・可視ASCIIだけ・`//`始まり/`#`なし）。 */
 const ORIGIN_FORM = /^\/(?!\/)[\x21-\x22\x24-\x7e]*$/;
 
-export type RouteMatch = 'allowed' | 'not_found' | 'method_not_allowed' | 'invalid_target';
+export type RouteMatch =
+  | { readonly kind: 'allowed'; readonly maxBodyBytes: number }
+  | { readonly kind: 'not_found' }
+  | { readonly kind: 'method_not_allowed' }
+  | { readonly kind: 'invalid_target' };
 
-/** request-targetを生bytesのまま分け、role表と照合する（decode・正規化0）。 */
-export function matchGatewayRoute(role: GatewayRole, method: string, target: string): RouteMatch {
-  if (typeof target !== 'string' || target.length > 4096 || !ORIGIN_FORM.test(target)) return 'invalid_target';
+/** request-targetを生bytesのまま分け、role表と照合する（decode・正規化0）。本文上限はmin(配置上限, route上限)。 */
+export function matchGatewayRoute(role: GatewayRole, method: string, target: string, deploymentMaxBodyBytes: number = Number.MAX_SAFE_INTEGER): RouteMatch {
+  if (typeof target !== 'string' || target.length > 4096 || !ORIGIN_FORM.test(target)) return { kind: 'invalid_target' };
   const query = target.indexOf('?');
   const path = query === -1 ? target : target.slice(0, query);
   const route = ROUTES[role].find((item) => (typeof item.path === 'string' ? item.path === path : item.path.test(path)));
-  if (route === undefined) return 'not_found';
-  return route.methods.includes(method) ? 'allowed' : 'method_not_allowed';
+  if (route === undefined) return { kind: 'not_found' };
+  if (!Object.hasOwn(route.methods, method)) return { kind: 'method_not_allowed' };
+  return { kind: 'allowed', maxBodyBytes: Math.min(deploymentMaxBodyBytes, route.methods[method] ?? 0) };
 }

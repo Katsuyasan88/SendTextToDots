@@ -183,7 +183,7 @@ export function createResolverRuntime({ strict = true } = {}) {
  * 本番のlisten境界（0.0.0.0/明示port）だけを試験内で局所interceptして127.0.0.1/port 0へ結び、起動後すぐrestoreする（製品codeは不変）。
  * 要求はNode HTTP clientで、元のhttps Host（設定のauthority）・Origin・cookieを付けて127.0.0.1へ送る。redirectは追わない。
  */
-export async function startConnectHttpRuntime({ strict = true, transportAuthority } = {}) {
+export async function startConnectHttpRuntime({ strict = true, transportAuthority, clientJwks = [] } = {}) {
   const net = await import('node:net');
   const http = await import('node:http');
   const { startDevelopmentKmsConnectServer } = await import('../../dist/connect/kms-server.js');
@@ -322,7 +322,7 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
     getJson: async (url) => {
       egressCalls.push(url);
       if (url === CHATGPT_CIMD_CANDIDATE.clientId) return { status: 200, headers: {}, body: JSON.stringify(cimdDocument) };
-      if (url === CHATGPT_CIMD_CANDIDATE.jwksUri) return { status: 200, headers: {}, body: JSON.stringify({ keys: [] }) };
+      if (url === CHATGPT_CIMD_CANDIDATE.jwksUri) return { status: 200, headers: {}, body: JSON.stringify({ keys: clientJwks }) };
       throw new Error('synthetic egress: forbidden');
     },
   };
@@ -569,7 +569,7 @@ export async function createSubscriptionRuntime() {
  * （SourceStoreを結んだもの）のgrantSourceDocRef/grantSourceRecordRef/grantSourceDecisionを使う。API要求のsourceは実SourceGateの
  * dispatchCheckを実serviceのpostへ渡す。callbackの送出は合成sendへ記録するだけ（実egress・Dots 0）。txごとの読取り・書込みを記録する。
  */
-export function createDeliveryRuntime({ audience = 'https://api.sttd-source.invalid' } = {}) {
+export function createDeliveryRuntime({ audience = 'https://api.sttd-source.invalid', appCheck } = {}) {
   const BASE = Date.now();
   const clock = { t: BASE, now() { return this.t; } };
   const docs = new Map();
@@ -662,7 +662,15 @@ export function createDeliveryRuntime({ audience = 'https://api.sttd-source.inva
     lifetime: new AbortController().signal,
     hooks: {},
   });
-  const gate = createSourceGate({ policy: { mode: 'strict-v1', methods: ['developer-key-v1'] }, store: sources, hasher, namespace: NS, audience, clock });
+  const gate = createSourceGate({
+    policy: { mode: 'strict-v1', methods: appCheck === undefined ? ['developer-key-v1'] : ['developer-key-v1', 'app-check-v1'] },
+    store: sources,
+    hasher,
+    namespace: NS,
+    audience,
+    clock,
+    ...(appCheck !== undefined ? { appCheck } : {}),
+  });
   /** 有効な購読のある本人（購読はgrantIdのGrantに束縛）。 */
   const enroll = () => {
     const ownerId = randomUUID();

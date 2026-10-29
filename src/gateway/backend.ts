@@ -2,8 +2,9 @@
 // ここでは実証しない）、route・本人・許可元の検査より前に次だけを行う:
 //   - Hostが設定のtransport authority（backendの正式service URL）とちょうど1件で一致すること。不成立は固定400で、DB・本人確認・KMS・
 //     Providerを呼ばない。
-//   - gatewayが付けた残時間（正規十進1〜20000ミリ秒・ちょうど1件）を読み、元20秒を延長しない受付期限に使う。欠落・不正は拒否する。
-//   - Hostを固定のlogical public authorityへ置き換え、内部header（X-Serverless-Authorization・残時間）を除去してから既存handlerへ渡す。
+//   - gatewayが付けた絶対期限（UNIX msの正規十進・ちょうど1件）を読み、backend受付から最大20秒と短い方を期限に使う（中継遅延で
+//     延長しない）。欠落・重複・不正・過去は拒否する。
+//   - Hostを固定のlogical public authorityへ置き換え、内部header（X-Serverless-Authorization・期限）を除去してから既存handlerへ渡す。
 //     X-Serverless-AuthorizationはCloud Runがcontainerへ渡す前に署名を除くため、認可票として再検証・信頼しない。
 //     外部から来た「元URL」「許可済み」「UID」等の値は根拠にしない（本人/source/Grantは既存handlerが一回だけ検査する）。
 
@@ -11,9 +12,9 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { DeliveryHttpIngress } from '../delivery/api.js';
-import { GATEWAY_BUDGET_HEADER, GATEWAY_REQUEST_BUDGET_MS, SERVERLESS_AUTHORIZATION_HEADER, type GatewayClock } from './contract.js';
+import { GATEWAY_DEADLINE_HEADER, GATEWAY_REQUEST_BUDGET_MS, SERVERLESS_AUTHORIZATION_HEADER, type GatewayClock } from './contract.js';
 
-const BUDGET = /^[1-9][0-9]{0,4}$/;
+const DEADLINE = /^[1-9][0-9]{0,15}$/;
 
 export interface BackendAuthorities {
   /** 設定のbackend authority（物理transport Host）。 */
@@ -23,10 +24,10 @@ export interface BackendAuthorities {
 }
 
 /**
- * transport authorityを検査してlogical authorityへ結び、残時間（ミリ秒）を返す。不成立はnull（呼出し側が固定400）。
- * 成立した時だけheaders・rawHeadersの両方を書き換える。
+ * transport authorityを検査してlogical authorityへ結び、この要求の絶対期限（min(gatewayの期限, now+20秒)）を返す。不成立・過去は
+ * null（呼出し側が固定400）。成立した時だけheaders・rawHeadersの両方を書き換える。
  */
-export function admitBackendRequest(req: IncomingMessage, authorities: BackendAuthorities): number | null {
+export function admitBackendRequest(req: IncomingMessage, authorities: BackendAuthorities, now: number): number | null {
   const raw = req.rawHeaders;
   let hosts = 0;
   let budgets = 0;
@@ -37,27 +38,28 @@ export function admitBackendRequest(req: IncomingMessage, authorities: BackendAu
     if (name === 'host') {
       hosts += 1;
       if (value !== authorities.transportAuthority) return null;
-    } else if (name === GATEWAY_BUDGET_HEADER) {
+    } else if (name === GATEWAY_DEADLINE_HEADER) {
       budgets += 1;
-      if (!BUDGET.test(value)) return null;
+      if (!DEADLINE.test(value)) return null;
       budget = Number(value);
     }
   }
   if (hosts !== 1 || req.headers.host !== authorities.transportAuthority) return null;
-  if (budgets !== 1 || budget > GATEWAY_REQUEST_BUDGET_MS) return null;
+  if (budgets !== 1 || !Number.isSafeInteger(budget) || !Number.isSafeInteger(now) || !(now < budget)) return null;
+  const deadlineAt = Math.min(budget, now + GATEWAY_REQUEST_BUDGET_MS);
   const kept: string[] = [];
   for (let index = 0; index + 1 < raw.length; index += 2) {
     const name = raw[index] ?? '';
     const lower = name.toLowerCase();
-    if (lower === GATEWAY_BUDGET_HEADER || lower === SERVERLESS_AUTHORIZATION_HEADER) continue;
+    if (lower === GATEWAY_DEADLINE_HEADER || lower === SERVERLESS_AUTHORIZATION_HEADER) continue;
     kept.push(name, lower === 'host' ? authorities.logicalAuthority : (raw[index + 1] ?? ''));
   }
   raw.length = 0;
   raw.push(...kept);
-  delete req.headers[GATEWAY_BUDGET_HEADER];
+  delete req.headers[GATEWAY_DEADLINE_HEADER];
   delete req.headers[SERVERLESS_AUTHORIZATION_HEADER];
   req.headers.host = authorities.logicalAuthority;
-  return budget;
+  return deadlineAt;
 }
 
 const INVALID_BODY = Buffer.from('{"error":{"code":"invalid_request"}}', 'utf8');
@@ -85,7 +87,7 @@ export interface ApiBackendServe {
   close(): void;
 }
 
-/** API backendの要求処理（Run上のnode:http）。期限はbackend受付からgatewayの残時間だけ（元20秒を延長しない）。 */
+/** API backendの要求処理（Run上のnode:http）。期限はgatewayの絶対期限とbackend受付+20秒の短い方（元20秒を延長しない）。 */
 export function createApiBackendServe(options: ApiBackendServeOptions): ApiBackendServe {
   const store = new AsyncLocalStorage<{ readonly ingress: DeliveryHttpIngress }>();
   const active = new Set<AbortController>();
@@ -98,19 +100,18 @@ export function createApiBackendServe(options: ApiBackendServeOptions): ApiBacke
   return Object.freeze({
     ingress,
     async serve(req: IncomingMessage, res: ServerResponse, run: (req: IncomingMessage, res: ServerResponse, ingress: DeliveryHttpIngress) => Promise<void>): Promise<void> {
-      let budget: number | null;
+      const receivedAt = options.clock.now();
+      let deadlineAt: number | null;
       try {
-        budget = admitBackendRequest(req, options);
+        deadlineAt = admitBackendRequest(req, options, receivedAt);
       } catch {
-        budget = null;
+        deadlineAt = null;
       }
-      if (budget === null) {
+      if (deadlineAt === null) {
         refuse(res, 400);
         return;
       }
       if (options.cors(req, res)) return;
-      const receivedAt = options.clock.now();
-      const deadlineAt = receivedAt + budget;
       const controller = new AbortController();
       const current: DeliveryHttpIngress = Object.freeze({ receivedAt, deadlineAt, signal: controller.signal });
       const abort = (): void => controller.abort();
@@ -120,9 +121,9 @@ export function createApiBackendServe(options: ApiBackendServeOptions): ApiBacke
       active.add(controller);
       req.once('aborted', abort);
       res.once('close', onResponseClose);
-      const timer = setTimeout(abort, budget);
+      const timer = setTimeout(abort, Math.max(0, deadlineAt - options.clock.now()));
       try {
-        if (closing) {
+        if (closing || !(options.clock.now() < deadlineAt)) {
           refuse(res, 503);
           return;
         }

@@ -1,6 +1,7 @@
 // gateway-v1の役割別起動口・組立て・包装の合成回帰。
 //   - 組立て（createGatewayRuntime）: topologyなし・K_SERVICE不一致・資格/metadata/proxyの差替え名は、IAM取得・転送の前に固定error。
-//     IAM取得の失敗は固定503でfallback 0。pinned google-gaxがgoogleAuthLibrary.Compute#fetchIdTokenを公開していること（呼出し0）。
+//     IAM取得の失敗は固定503でfallback 0。metadata identity取得（合成transport）の固定GET1回・検査・上限・中止・close・共有。
+//   - 期限: 受付の絶対期限を共有し中継遅延で延長しない。route別本文上限（Content-Length・stream・rawBody）は転送前。
 //   - 実entry（build済みdistの.jsを所有一時directoryへ写し、配置設定だけ合成のgateway-v1にしたcopy）: MCP gatewayの待受と転送前拒否、
 //     API gatewayのexport名・実行主体と転送前拒否・環境不一致の503、backend 2つの設定不正/環境不一致での起動拒否（listen 0）、
 //     gateway-v1配置でのdirect entry（API・MCP）の拒否。外部への接続・fetchは拒否して数え、0であることを確かめる。
@@ -8,16 +9,24 @@
 // 実Cloud・IAM・資格・SDK通信・外部network 0。env・listen・connect・fetchの差替えはfinallyで必ず戻す。
 
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import net from 'node:net';
 import { after, test } from 'node:test';
 
 import { validateDeploymentConfig } from '../dist/config/validate.js';
+import { createIdTokenSource, METADATA_IDENTITY_HOST, METADATA_IDENTITY_PATH, metadataIdTokenFetcher } from '../dist/gateway/google-iam.js';
 import { createGatewayRuntime, GatewayRuntimeError } from '../dist/gateway/runtime.js';
+import { RUNTIME_REFUSED_ENV } from '../dist/policy.js';
 import { ARTIFACTS, buildArtifacts, buildGatewayArtifacts, GATEWAY_FORBIDDEN_PACKAGES, parseTarGz, parseZip, readServerInputs } from '../scripts/package-artifacts.mjs';
 import { DEPLOYMENT_CONFIG as SYNTHETIC } from './fixtures/synthetic-deployment.mjs';
-import { closeAll, countListener, iamFetcher, isolatedDist, listen, listenerCount, request, topologyConfig } from './fixtures/gateway-runtime.mjs';
+import { closeAll, countListener, iamFetcher, isolatedDist, listen, listenerCount, request, syntheticIdToken, topologyConfig } from './fixtures/gateway-runtime.mjs';
 
 const GATEWAY_CONFIG = topologyConfig();
+/** 既存SDK gateと同じidentity条件を満たす合成のCloud実行環境（role別）。 */
+const GATEWAY_ENV = Object.freeze({
+  api: { K_SERVICE: GATEWAY_CONFIG.api.serviceName, K_REVISION: 'sendtexttodotsapi-00001-abc', K_CONFIGURATION: 'sendtexttodotsapi' },
+  connect: { K_SERVICE: GATEWAY_CONFIG.connect.serviceName, K_REVISION: 'sendtexttodots-connect-00001-abc', K_CONFIGURATION: 'sendtexttodots-connect' },
+});
 const copy = isolatedDist(GATEWAY_CONFIG);
 
 after(async () => {
@@ -30,9 +39,9 @@ after(async () => {
 async function guarded(env, fn) {
   const saved = new Map();
   // 試験hostの資格/proxy/TLS系の環境変数はgateの対象なので、この呼出しの間だけ外す（finallyで戻す）。
-  const refused = ['GOOGLE_APPLICATION_CREDENTIALS', 'GOOGLE_CLOUD_UNIVERSE_DOMAIN', 'GCE_METADATA_HOST', 'GCE_METADATA_IP', 'GCE_METADATA_ROOT', 'METADATA_SERVER_DETECTION', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'NODE_EXTRA_CA_CERTS', 'NODE_TLS_REJECT_UNAUTHORIZED', 'SSL_CERT_FILE', 'SSL_CERT_DIR'];
+  env = { K_REVISION: 'synthetic-00001-abc', K_CONFIGURATION: 'synthetic', GOOGLE_CLOUD_PROJECT: undefined, GCLOUD_PROJECT: undefined, ...env };
   for (const name of Object.keys(process.env)) {
-    if (!refused.includes(name.toUpperCase()) || name in env) continue;
+    if (!RUNTIME_REFUSED_ENV.has(name.toUpperCase()) || name in env) continue;
     saved.set(name, process.env[name]);
     delete process.env[name];
   }
@@ -79,13 +88,21 @@ async function guarded(env, fn) {
 test('組立て: topologyなし・K_SERVICE不一致・差替え名はIAM取得の前に固定error、IAM失敗は503でfallback 0', async () => {
   const config = validateDeploymentConfig(GATEWAY_CONFIG);
   const iam = iamFetcher();
-  const make = (overrides) => createGatewayRuntime({ role: 'connect', config, env: { K_SERVICE: config.connect.serviceName }, clock: { now: () => Date.now() }, fetcher: iam.fetcher, ...overrides });
+  const make = (overrides) => createGatewayRuntime({ role: 'connect', config, env: GATEWAY_ENV.connect, clock: { now: () => Date.now() }, fetcher: iam.fetcher, ...overrides });
   const rejected = (fn, code) => assert.throws(fn, (error) => error instanceof GatewayRuntimeError && error.code === code);
   rejected(() => make({ config: validateDeploymentConfig(structuredClone(SYNTHETIC)) }), 'gateway_config_invalid');
-  rejected(() => make({ env: { K_SERVICE: config.topology.connect.backendServiceName } }), 'gateway_environment_rejected');
+  rejected(() => make({ env: { ...GATEWAY_ENV.connect, K_SERVICE: config.topology.connect.backendServiceName } }), 'gateway_environment_rejected');
+  rejected(() => make({ env: { ...GATEWAY_ENV.connect, K_REVISION: undefined } }), 'gateway_environment_rejected');
+  rejected(() => make({ env: { ...GATEWAY_ENV.connect, K_CONFIGURATION: 'Bad_Name' } }), 'gateway_environment_rejected');
+  rejected(() => make({ env: { ...GATEWAY_ENV.connect, GOOGLE_CLOUD_PROJECT: 'other-project' } }), 'gateway_environment_rejected');
+  // NODE_OPTIONSはMCPでは拒否、APIだけ既存と同じbounded memory hintを許す（他flag・大小文字違いは拒否）。
+  rejected(() => make({ env: { ...GATEWAY_ENV.connect, NODE_OPTIONS: '--max-old-space-size=512' } }), 'gateway_environment_rejected');
+  make({ role: 'api', env: { ...GATEWAY_ENV.api, NODE_OPTIONS: '--max-old-space-size=512' } }).close();
+  rejected(() => make({ role: 'api', env: { ...GATEWAY_ENV.api, NODE_OPTIONS: '--require=/tmp/x.js' } }), 'gateway_environment_rejected');
+  rejected(() => make({ role: 'api', env: { ...GATEWAY_ENV.api, node_options: '--max-old-space-size=512' } }), 'gateway_environment_rejected');
   rejected(() => make({ role: 'api' }), 'gateway_environment_rejected');
-  for (const name of ['GOOGLE_APPLICATION_CREDENTIALS', 'gce_metadata_host', 'https_proxy', 'NODE_EXTRA_CA_CERTS', 'METADATA_SERVER_DETECTION']) {
-    rejected(() => make({ env: { K_SERVICE: config.connect.serviceName, [name]: 'x' } }), 'gateway_environment_rejected');
+  for (const name of ['GOOGLE_APPLICATION_CREDENTIALS', 'gce_metadata_host', 'https_proxy', 'NODE_EXTRA_CA_CERTS', 'METADATA_SERVER_DETECTION', 'GRPC_TRACE', 'NODE_DEBUG', 'GOOGLE_API_KEY', 'FIRESTORE_EMULATOR_HOST']) {
+    rejected(() => make({ env: { ...GATEWAY_ENV.connect, [name]: 'x' } }), 'gateway_environment_rejected');
   }
   assert.equal(iam.calls.count, 0);
   const failing = iamFetcher(async () => {
@@ -99,11 +116,145 @@ test('組立て: topologyなし・K_SERVICE不一致・差替え名はIAM取得�
   assert.equal(failing.calls.count, 1);
 });
 
-test('pinned google-gaxはgoogleAuthLibrary.Compute#fetchIdTokenを公開する（呼出し・通信0）', async () => {
-  const gax = await import('google-gax');
-  const library = gax.googleAuthLibrary ?? gax.default.googleAuthLibrary;
-  assert.equal(typeof library.Compute, 'function');
-  assert.equal(typeof library.Compute.prototype.fetchIdToken, 'function');
+test('metadata ID token: 公式identity endpointへ固定GET1回、検査・上限・中止・close・共有・再送0（合成transport）', async () => {
+  const AUD = GATEWAY_CONFIG.topology.connect.backendOrigin;
+  const seen = [];
+  let mode = 'ok';
+  const { port } = await listen((req, res) => {
+    seen.push({ url: req.url, flavor: req.headers['metadata-flavor'], host: req.headers.host });
+    if (mode === 'hang') return;
+    if (mode === 'status') return void res.writeHead(500, { 'Metadata-Flavor': 'Google' }).end('x');
+    if (mode === 'flavor') return void res.writeHead(200).end(syntheticIdToken(AUD, Math.floor(Date.now() / 1000) + 3600));
+    if (mode === 'big') return void res.writeHead(200, { 'Metadata-Flavor': 'Google' }).end('a'.repeat(9000));
+    if (mode === 'late') return void setTimeout(() => res.writeHead(200, { 'Metadata-Flavor': 'Google' }).end(syntheticIdToken(AUD, Math.floor(Date.now() / 1000) + 3600)), 150);
+    res.writeHead(200, { 'Metadata-Flavor': 'Google', 'Content-Type': 'text/html' });
+    res.end(syntheticIdToken(AUD, Math.floor(Date.now() / 1000) + 3600));
+  });
+  const requested = [];
+  const transport = (options, onResponse) => {
+    requested.push({ host: options.host, port: options.port, path: options.path, headers: options.headers, agent: options.agent });
+    return http.request({ ...options, host: '127.0.0.1', port }, onResponse);
+  };
+  const fetcher = metadataIdTokenFetcher(transport);
+  const clock = { now: () => Date.now() };
+  const live = () => new AbortController().signal;
+  const source = createIdTokenSource({ audience: AUD, fetcher, clock });
+  // 複数の呼出しは1回の取得を共有し、2回目以降はRAMのtoken。
+  const [a, b] = await Promise.all([source.get(Date.now() + 5000, live()), source.get(Date.now() + 5000, live())]);
+  assert.equal(a, b);
+  assert.equal(await source.get(Date.now() + 5000, live()), a);
+  assert.equal(seen.length, 1);
+  assert.deepEqual(requested[0], { host: METADATA_IDENTITY_HOST, port: 80, path: `${METADATA_IDENTITY_PATH}?audience=${encodeURIComponent(AUD)}`, headers: { 'Metadata-Flavor': 'Google' }, agent: false });
+  assert.equal(seen[0].flavor, 'Google');
+  // status・Metadata-Flavor・本文上限の不一致はunavailable、再送0。
+  for (const bad of ['status', 'flavor', 'big']) {
+    mode = bad;
+    const fresh = createIdTokenSource({ audience: AUD, fetcher, clock });
+    const before = seen.length;
+    await assert.rejects(fresh.get(Date.now() + 5000, live()), (error) => error.code === 'unavailable');
+    assert.equal(seen.length, before + 1, `${bad}: one request, no retry`);
+  }
+  // 取得上限: 応答しないmetadataは上限で中止し、socketを閉じる。
+  mode = 'hang';
+  const limited = createIdTokenSource({ audience: AUD, fetcher, clock, fetchLimitMs: 60 });
+  await assert.rejects(limited.get(Date.now() + 5000, live()), (error) => error.code === 'unavailable');
+  assert.equal(limited.stats.inflight, false);
+  // 呼出し側の期限・中止は共有の取得を延長しない。
+  const short = createIdTokenSource({ audience: AUD, fetcher, clock, fetchLimitMs: 5000 });
+  await assert.rejects(short.get(Date.now() + 40, live()), (error) => error.code === 'timed_out');
+  const controller = new AbortController();
+  const pending = short.get(Date.now() + 5000, controller.signal);
+  controller.abort();
+  await assert.rejects(pending, (error) => error.code === 'aborted');
+  short.close();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(short.stats.inflight, false);
+  // closeの後に届いたtokenは採用しない。
+  mode = 'late';
+  const closing = createIdTokenSource({ audience: AUD, fetcher, clock });
+  const late = closing.get(Date.now() + 5000, live());
+  closing.close();
+  await assert.rejects(late, (error) => error.code === 'aborted' || error.code === 'unavailable');
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await assert.rejects(closing.get(Date.now() + 5000, live()), (error) => error.code === 'aborted');
+});
+
+test('期限: gateway受付の絶対期限を共有し、中継の遅延で延長しない。期限後のtoken成功・切断後のIAM成功では転送0', async () => {
+  const config = validateDeploymentConfig(GATEWAY_CONFIG);
+  let now = 1_900_000_000_000;
+  const clock = { now: () => now };
+  let release;
+  const iam = iamFetcher(() => new Promise((resolve) => (release = () => resolve(syntheticIdToken(config.topology.api.backendOrigin, Math.floor(now / 1000) + 3600)))));
+  const forwarded = [];
+  const handler = createGatewayRuntime({
+    role: 'api',
+    config,
+    env: GATEWAY_ENV.api,
+    clock,
+    fetcher: iam.fetcher,
+    transport: (options) => {
+      forwarded.push(options.headers);
+      throw new Error('synthetic transport: not connected');
+    },
+  });
+  const { port } = await listen((req, res) => void handler.handle(req, res));
+  // IAM待機の間に時計が進んでも、転送する期限は受付+20秒のまま。
+  const first = request(port, { path: '/v2/encryption-key' });
+  while (iam.calls.count === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+  const receivedAt = now;
+  now += 7_000;
+  release();
+  await first;
+  assert.equal(forwarded.length, 1);
+  const headers = forwarded[0];
+  assert.equal(headers[headers.findIndex((value) => String(value).toLowerCase() === 'x-sttd-gateway-deadline') + 1], String(receivedAt + 20_000));
+  // tokenが期限の後に届いた要求は転送しない（cacheを捨てて新しい取得にする）。
+  handler.close();
+  release = undefined;
+  const second = createGatewayRuntime({ role: 'api', config, env: GATEWAY_ENV.api, clock, fetcher: iamFetcher(() => new Promise((resolve) => (release = () => resolve(syntheticIdToken(config.topology.api.backendOrigin, Math.floor(now / 1000) + 3600))))).fetcher, transport: (options) => (forwarded.push(options.headers), assert.fail('no forward after deadline')) });
+  const { port: port2 } = await listen((req, res) => void second.handle(req, res));
+  const expired = request(port2, { path: '/v2/encryption-key' });
+  while (release === undefined) await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  now += 25_000;
+  release();
+  assert.equal((await expired).status, 503);
+  assert.equal(forwarded.length, 1);
+  second.close();
+});
+
+test('route別上限: 元handlerの上限をContent-Length・stream・Functions rawBodyの全てで転送前に適用（IAM・backend 0）', async () => {
+  const config = validateDeploymentConfig(GATEWAY_CONFIG);
+  const iam = iamFetcher();
+  const forwarded = [];
+  const handler = createGatewayRuntime({ role: 'connect', config, env: GATEWAY_ENV.connect, clock: { now: () => Date.now() }, fetcher: iam.fetcher, transport: (options) => (forwarded.push(options), assert.fail('no forward')) });
+  const host = new URL(config.connect.publicOrigin).host;
+  const { port } = await listen((req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      const raw = req.headers['x-test-raw'] === '1';
+      // Functionsの写し: frameworkが読んだrawBodyだけを渡す（Content-Lengthなし）。
+      if (raw) {
+        delete req.headers['content-length'];
+        for (let index = req.rawHeaders.length - 2; index >= 0; index -= 2) if (req.rawHeaders[index].toLowerCase() === 'content-length') req.rawHeaders.splice(index, 2);
+      }
+      void handler.handle(req, res, raw ? Buffer.concat(chunks) : undefined);
+    });
+  });
+  const over = [
+    { method: 'POST', path: '/v1/source/approvals/abc', body: 'x'.repeat(65) },
+    { method: 'GET', path: '/interaction/app.js', body: 'x' },
+    { method: 'POST', path: '/v1/web/disconnect', body: 'x' },
+    { method: 'POST', path: '/interaction/abc/login', body: 'x'.repeat(4097) },
+  ];
+  for (const item of over) {
+    assert.equal((await request(port, { ...item, headers: { Host: host } })).status, 413, `${item.method} ${item.path}`);
+    assert.equal((await request(port, { ...item, headers: { Host: host, 'X-Test-Raw': '1' } })).status, 413, `rawBody ${item.method} ${item.path}`);
+  }
+  assert.equal(iam.calls.count, 0);
+  assert.equal(forwarded.length, 0);
+  handler.close();
 });
 
 test('MCP gateway entry: 実runで待受し、未知route・Host偽装は転送前に拒否。K_SERVICE不一致は起動拒否（listen 0）', async () => {

@@ -1,7 +1,9 @@
 // gatewayのHTTP中継（role別の固定backendへ一回だけ）。入口で行うのは形式・量・期限の制限と転送だけで、DB・KMS・Secret・本人/source
 // 検証・App Checkの消費・配送は行わない（全てbackendの既存handlerで一回）。
-//   - 受付時刻から元20秒を1回だけ作り、本文待機・IAM token取得・転送・応答の全てで共有する。backendへは残時間だけを渡す。
-//   - 未知route/method・不正なrequest-target・Host/Content-Length/Transfer-Encodingの重複や曖昧な本文境界・圧縮本文・上限超過は、
+//   - 受付時刻から元20秒の絶対期限を1回だけ作り、本文待機・IAM token取得・転送・応答の全てで共有する。backendへは同じ絶対期限を
+//     渡し、backendは自身の受付+20秒と短い方を使う（中継遅延で延長しない）。
+//   - 未知route/method・不正なrequest-target・Host/Content-Length/Transfer-Encodingの重複や曖昧な本文境界・圧縮本文・route別上限
+//     （min(配置上限, 元handlerの上限)）の超過は、
 //     rate/slot・token取得・転送より前に固定の4xxで拒否する。rateはprocess内token bucket（429）、同時処理は固定slot（503・待機列0）。
 //   - 転送先は設定の固定origin（transport Host・TLS SNI・IAM audience）だけ。method・生のrequest-target（path/query）・本文bytes・
 //     利用者のAuthorization・Cookie・Origin・Idempotency-Key・source署名等のend-to-end headerは順序・多値のまま渡す。外部の
@@ -16,7 +18,6 @@ import { request as httpsRequest, type RequestOptions } from 'node:https';
 
 import {
   authorityOf,
-  GATEWAY_BUDGET_HEADER,
   GATEWAY_REQUEST_BUDGET_MS,
   matchGatewayRoute,
   SERVERLESS_AUTHORIZATION_HEADER,
@@ -187,7 +188,7 @@ function readBody(req: IncomingMessage, max: number, signal: AbortSignal): Promi
 }
 
 /** 転送する要求header（元の順序・多値を保ち、除去対象とConnectionが列挙する名前を外して内部headerを足す）。 */
-function forwardHeaders(req: IncomingMessage, backendAuthority: string, body: Buffer, token: string, remainingMs: number): string[] {
+function forwardHeaders(req: IncomingMessage, backendAuthority: string, body: Buffer, token: string, deadlineAt: number): string[] {
   const raw = req.rawHeaders;
   const listed = new Set<string>();
   for (let index = 0; index + 1 < raw.length; index += 2) {
@@ -203,7 +204,7 @@ function forwardHeaders(req: IncomingMessage, backendAuthority: string, body: Bu
   }
   const method = req.method ?? 'GET';
   if (body.length > 0 || !['GET', 'HEAD', 'OPTIONS', 'DELETE'].includes(method)) out.push('Content-Length', String(body.length));
-  out.push('X-Serverless-Authorization', `Bearer ${token}`, 'X-STTD-Gateway-Budget-Ms', String(remainingMs));
+  out.push('X-Serverless-Authorization', `Bearer ${token}`, 'X-STTD-Gateway-Deadline', String(deadlineAt));
   return out;
 }
 
@@ -268,17 +269,20 @@ export function createGatewayHandler(options: GatewayHandlerOptions): GatewayHan
     };
     req.once('aborted', abort);
     res.once('close', onResponseClose);
-    const timer = setTimeout(abort, GATEWAY_REQUEST_BUDGET_MS);
+    const timer = setTimeout(abort, Math.max(0, deadlineAt - clock.now()));
     let slot = false;
     let owned: Buffer | undefined;
     try {
       if (closing) throw new Refusal(503);
       const method = req.method ?? '';
-      const match = matchGatewayRoute(role, method, req.url ?? '');
-      if (match === 'invalid_target') throw new Refusal(400);
-      if (match === 'not_found') throw new Refusal(404);
-      if (match === 'method_not_allowed') throw new Refusal(405);
+      const match = matchGatewayRoute(role, method, req.url ?? '', limits.maxBodyBytes);
+      if (match.kind === 'invalid_target') throw new Refusal(400);
+      if (match.kind === 'not_found') throw new Refusal(404);
+      if (match.kind === 'method_not_allowed') throw new Refusal(405);
+      const maxBody = match.maxBodyBytes;
       checkFraming(req, options.publicAuthority);
+      const declared = req.headers['content-length'];
+      if (typeof declared === 'string' && Number(declared) > maxBody) throw new Refusal(413);
       if (!takeRate(receivedAt)) throw new Refusal(429);
       if (stats.active >= limits.maxConcurrent) throw new Refusal(503);
       slot = true;
@@ -286,17 +290,17 @@ export function createGatewayHandler(options: GatewayHandlerOptions): GatewayHan
       active.add(controller);
       let body: Buffer;
       if (Buffer.isBuffer(rawBody)) {
-        if (rawBody.length > limits.maxBodyBytes) throw new Refusal(413);
+        if (rawBody.length > maxBody) throw new Refusal(413);
         body = rawBody;
       } else {
-        body = owned = await readBody(req, limits.maxBodyBytes, controller.signal);
+        body = owned = await readBody(req, maxBody, controller.signal);
       }
       const token = await tokens.get(deadlineAt, controller.signal).catch(() => {
         throw new Refusal(503);
       });
       const now = clock.now();
       if (closing || controller.signal.aborted || !(now < deadlineAt)) throw new Refusal(503);
-      const headers = forwardHeaders(req, backendAuthority, body, token, Math.max(1, Math.floor(deadlineAt - now)));
+      const headers = forwardHeaders(req, backendAuthority, body, token, deadlineAt);
       stats.forwarded += 1;
       await forwardOnce(method, req.url ?? '/', headers, body, res, controller.signal);
       log('forwarded');

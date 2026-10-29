@@ -32,6 +32,7 @@ import type { SecretManagerServiceClient } from '@google-cloud/secret-manager';
 import type { App, Credential } from 'firebase-admin/app';
 
 import { loadDeploymentConfig, type DeploymentConfig } from '../config/validate.js';
+import { boundedMemoryHintAccepted, RUNTIME_REFUSED_ENV } from '../policy.js';
 import { createFirebaseAdminVerifier, type AdminAuthLike, type IdentityVerifier } from '../identity/firebase.js';
 import { captureClock, dataFields, isEpochMs, isRealSignal, methodOf, ownValue } from '../protection/google-sdk-call.js';
 
@@ -61,43 +62,8 @@ const ADMIN_APP_PREFIX = 'sendtexttodots-sdk-';
 /** Cloud Runのservice/revision/configuration名（小文字・数字・hyphen、英字始まり、63文字以内）。 */
 const CLOUD_RUN_NAME = /^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$/;
 
-/** 存在すれば（値を読まず）拒否する環境名（大文字で比較）。NO_PROXY・FIREBASE_CONFIGは含めない。 */
-const REFUSED_ENV = new Set([
-  'GOOGLE_APPLICATION_CREDENTIALS',
-  'GOOGLE_OAUTH_ACCESS_TOKEN',
-  'CLOUDSDK_AUTH_ACCESS_TOKEN',
-  'FIREBASE_TOKEN',
-  'GOOGLE_API_KEY',
-  'GOOGLE_CLOUD_QUOTA_PROJECT',
-  'GOOGLE_CLOUD_UNIVERSE_DOMAIN',
-  'GOOGLE_API_USE_MTLS_ENDPOINT',
-  'GOOGLE_API_USE_CLIENT_CERTIFICATE',
-  'GOOGLE_SDK_NODE_LOGGING',
-  'FIRESTORE_EMULATOR_HOST',
-  'FIREBASE_AUTH_EMULATOR_HOST',
-  'FIREBASE_DATABASE_EMULATOR_HOST',
-  'STORAGE_EMULATOR_HOST',
-  'FIRESTORE_PREFER_REST',
-  'FIRESTORE_ENABLE_TRACING',
-  'GCE_METADATA_HOST',
-  'GCE_METADATA_IP',
-  'METADATA_SERVER_DETECTION',
-  'DETECT_GCP_RETRIES',
-  'GRPC_TRACE',
-  'GRPC_VERBOSITY',
-  'GRPC_DEFAULT_SSL_ROOTS_FILE_PATH',
-  'NODE_OPTIONS',
-  'NODE_DEBUG',
-  'NODE_EXTRA_CA_CERTS',
-  'NODE_TLS_REJECT_UNAUTHORIZED',
-  'SSL_CERT_FILE',
-  'SSL_CERT_DIR',
-  'OPENSSL_CONF',
-  'HTTP_PROXY',
-  'HTTPS_PROXY',
-  'ALL_PROXY',
-  'GRPC_PROXY_EXP',
-]);
+/** 存在すれば（値を読まず）拒否する環境名（大文字で比較）。定義はSDK非依存の../policy.js（gatewayと共有）。 */
+const REFUSED_ENV = RUNTIME_REFUSED_ENV;
 
 export type DevelopmentGoogleSdkErrorCode =
   | 'invalid_config'
@@ -160,16 +126,8 @@ export interface DevelopmentGoogleSdk {
   close(): Promise<void>;
 }
 
-/**
- * bounded-memory-hint-v1の文法（正規名NODE_OPTIONSの文字列・40文字以下）。(1) ASCII spaceだけ0〜8個、又は(2) 前後それぞれASCII space 0〜8個＋
- * 単一の`--max-old-space-size=N`（Nは先頭ゼロなし3桁128〜960）。trim・shell parser・coerce・他flagは無い（文字列全体をそのまま照合する）。
- */
-const BOUNDED_MEMORY_HINT = /^ {0,8}(?:--max-old-space-size=(?:12[89]|1[3-9][0-9]|[2-8][0-9]{2}|9[0-5][0-9]|960) {0,8})?$/;
-const BOUNDED_MEMORY_HINT_MAX_LENGTH = 40;
-/** 正規名NODE_OPTIONSの値がbounded-memory-hint-v1の文法を満たすか（値は改変しない）。 */
-function apiNodeOptionsAccepted(value: string | undefined): boolean {
-  return typeof value === 'string' && value.length <= BOUNDED_MEMORY_HINT_MAX_LENGTH && BOUNDED_MEMORY_HINT.test(value);
-}
+/** 正規名NODE_OPTIONSの値がbounded-memory-hint-v1の文法を満たすか（定義は../policy.js）。 */
+const apiNodeOptionsAccepted = boundedMemoryHintAccepted;
 
 /** 環境gate分類の固定bit。 */
 const GATE_NODE_OPTIONS = 1;
