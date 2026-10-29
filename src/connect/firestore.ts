@@ -16,7 +16,7 @@ import { randomUUID } from 'node:crypto';
 import type { DocumentReference, DocumentSnapshot, Firestore, Timestamp, Transaction } from '@google-cloud/firestore';
 import { errors, type Adapter, type AdapterFactory, type AdapterPayload } from 'oidc-provider';
 
-import type { Clock } from '../policy.js';
+import { isConnectNamespace, type Clock } from '../policy.js';
 import { hashesEqual, newOpaqueValue, type SecretHasher } from '../secrets.js';
 import type { AssertionReplayStore } from '../stores.js';
 import type { VerifiedIdentity } from '../identity/firebase.js';
@@ -45,11 +45,10 @@ function receiverGenerationOrUnavailable(owner: unknown): number {
     throw new AccessUnavailableError();
   }
 }
-const NAMESPACE_PATTERN = /^t256_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+// 名前空間の判定はSDK非依存の../policy.jsに置く（配置設定の検証・gatewayがこのmoduleを読み込まないため）。
+export { isConnectNamespace };
 
-export function isConnectNamespace(value: unknown): value is string {
-  return typeof value === 'string' && NAMESPACE_PATTERN.test(value);
-}
+
 
 /** 値そのものが資格情報になるmodel。payloadからjti（平文の値）を外して保存する。 */
 const BEARER_MODELS: ReadonlySet<string> = new Set(['AccessToken', 'RefreshToken', 'AuthorizationCode']);

@@ -183,7 +183,7 @@ export function createResolverRuntime({ strict = true } = {}) {
  * 本番のlisten境界（0.0.0.0/明示port）だけを試験内で局所interceptして127.0.0.1/port 0へ結び、起動後すぐrestoreする（製品codeは不変）。
  * 要求はNode HTTP clientで、元のhttps Host（設定のauthority）・Origin・cookieを付けて127.0.0.1へ送る。redirectは追わない。
  */
-export async function startConnectHttpRuntime({ strict = true } = {}) {
+export async function startConnectHttpRuntime({ strict = true, transportAuthority } = {}) {
   const net = await import('node:net');
   const http = await import('node:http');
   const { startDevelopmentKmsConnectServer } = await import('../../dist/connect/kms-server.js');
@@ -359,6 +359,7 @@ export async function startConnectHttpRuntime({ strict = true } = {}) {
       verificationSender: async () => ({ status: 500, body: '' }),
       clock,
       publicOrigin: issuer,
+      ...(transportAuthority !== undefined ? { transportAuthority } : {}),
       ...(strict ? { sourceAuthorization: { policy: { mode: 'strict-v1', methods: ['developer-key-v1'] }, projectNumber: '123456789012' } } : {}),
     });
   } finally {
@@ -369,7 +370,7 @@ export async function startConnectHttpRuntime({ strict = true } = {}) {
   const root = `sttdConnect/${NS}`;
 
   /** 1つのbrowser（cookie jar）。元issuerのpathだけを127.0.0.1へ送る。 */
-  const browser = () => {
+  const browser = ({ via = port } = {}) => {
     const jar = new Map();
     const store = (setCookie) => {
       for (const line of setCookie ?? []) {
@@ -398,7 +399,7 @@ export async function startConnectHttpRuntime({ strict = true } = {}) {
           const path = `${url.pathname}${url.search}`;
           const cookie = cookies ? cookieFor(url.pathname) : '';
           const req = http.request(
-            { host: '127.0.0.1', port, method, path, headers: { Host: authority, ...(cookie ? { Cookie: cookie } : {}), ...headers, ...(body !== undefined ? { 'Content-Length': Buffer.byteLength(body) } : {}) } },
+            { host: '127.0.0.1', port: via, method, path, headers: { Host: authority, ...(cookie ? { Cookie: cookie } : {}), ...headers, ...(body !== undefined ? { 'Content-Length': Buffer.byteLength(body) } : {}) } },
             (res) => {
               const chunks = [];
               res.on('data', (chunk) => chunks.push(chunk));
@@ -441,6 +442,7 @@ export async function startConnectHttpRuntime({ strict = true } = {}) {
   return {
     issuer,
     authority,
+    port,
     NS,
     SUB_NS,
     db,
@@ -567,7 +569,7 @@ export async function createSubscriptionRuntime() {
  * （SourceStoreを結んだもの）のgrantSourceDocRef/grantSourceRecordRef/grantSourceDecisionを使う。API要求のsourceは実SourceGateの
  * dispatchCheckを実serviceのpostへ渡す。callbackの送出は合成sendへ記録するだけ（実egress・Dots 0）。txごとの読取り・書込みを記録する。
  */
-export function createDeliveryRuntime() {
+export function createDeliveryRuntime({ audience = 'https://api.sttd-source.invalid' } = {}) {
   const BASE = Date.now();
   const clock = { t: BASE, now() { return this.t; } };
   const docs = new Map();
@@ -660,7 +662,7 @@ export function createDeliveryRuntime() {
     lifetime: new AbortController().signal,
     hooks: {},
   });
-  const gate = createSourceGate({ policy: { mode: 'strict-v1', methods: ['developer-key-v1'] }, store: sources, hasher, namespace: NS, audience: 'https://api.sttd-source.invalid', clock });
+  const gate = createSourceGate({ policy: { mode: 'strict-v1', methods: ['developer-key-v1'] }, store: sources, hasher, namespace: NS, audience, clock });
   /** 有効な購読のある本人（購読はgrantIdのGrantに束縛）。 */
   const enroll = () => {
     const ownerId = randomUUID();
@@ -692,5 +694,5 @@ export function createDeliveryRuntime() {
       ? service.post(owner.ownerId, commandId, body, clock.t, operation)
       : service.post(owner.ownerId, commandId, body, clock.t, operation, gate.dispatchCheck(requestBinding, 'send'));
   };
-  return { db, docs, log, clock, NS, hasher, sources, storage, gate, sent, enroll, bindGrant, post };
+  return { db, docs, log, clock, NS, hasher, sources, storage, gate, service, sent, enroll, bindGrant, post };
 }

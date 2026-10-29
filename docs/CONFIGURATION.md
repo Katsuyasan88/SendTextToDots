@@ -149,3 +149,25 @@ helperは既定のADCで動き、custom tokenの署名はFirebase Adminの`servi
 - `status`／`disable`／`enable`／`delete`は`--source <src_…>`、変更は`--expect <statusの版>`が必要です。停止→有効化は新しい世代になり、停止前の承認・Grantは戻りません。削除は登録recordの物理削除で、App ID・公開鍵・本人のHMAC・日時を残しません。新しい登録のID・世代は管理CLIが暗号学的乱数で作り、廃止したIDを指定して再登録する操作はありません（旧Grant・承認は元のIDを指したまま不在として拒否され、新しい登録へ付け替えません）。承認recordはsource ID/世代と本人・client・resourceのHMAC・期限・単回状態を持ち、TTLの掃除候補は期限から24時間です。
 
 操作（`operations`）は`send`（平文/暗号文の送信）・`keys`（公開鍵の取得/再発行）・`connect`（接続承認）です。保存先は`sttdConnect/{connectNamespace}/sources`・`sourceReplay`・`sourceApprovals`で、replay・承認は鍵付きhashの文書IDと期限だけを持ちます。掃除にTTLを使う場合は`sourceReplay.deleteAfter`・`sourceApprovals.deleteAfter`（最後の期限から24時間）へ配置側で設定します（期限の判定にはTTLを使いません）。App Check方式は、送信APIのservice accountにApp Check tokenの消費（Firebase App Check API）の権限と追加の通信が要り、SDKのconsume機能はbetaです。各Forkの管理者が自分のproject/appでApp Checkを設定してください。
+
+## 既存URLを保つgateway配置（任意・gateway-v1）
+
+既定は従来のdirect配置です（`topology`を書かない、または`'direct'`）。この場合の起動口・成果物・挙動は変わりません。proxy配置は全Forkの必須条件ではありません。
+
+`topology`へ次の形を明示すると、既存のAPI Functions名/URLとMCP Cloud Run service名/公開originを入口（gateway）として残し、Invoker IAMを必須にした業務backend（Cloud Run）2つへ中継します。
+
+```ts
+topology: {
+  mode: 'gateway-v1',
+  api: { backendServiceName: 'your-api-backend', backendOrigin: 'https://<API backendの正式service URLのhost>', gatewayServiceAccount: 'your-api-gateway-sa@your-project-id.iam.gserviceaccount.com' },
+  connect: { backendServiceName: 'your-connect-backend', backendOrigin: 'https://<MCP backendの正式service URLのhost>', gatewayServiceAccount: 'your-connect-gateway-sa@your-project-id.iam.gserviceaccount.com' },
+  limits: { maxBodyBytes: 65536, maxConcurrent: 8, ratePerSecond: 20, burst: 40 },
+},
+```
+
+- 全fieldが必須です。欠落・未知の値・既存service名/公開origin/実行主体との重複・範囲外の上限は設定errorになり、direct配置や匿名転送へ切り替わりません。gateway-v1の時、従来のdirect用起動口（`dist/deployment/functions.js`・`dist/deployment/connect.js`）は業務SDKの前に起動を拒否します。
+- 役割と起動口: API入口`dist/deployment/gateway-api.js`（既存と同じexport名`sendtexttodotsapi`、実行主体は`api.gatewayServiceAccount`）、MCP入口`dist/deployment/gateway-connect.js`、API業務backend`dist/deployment/backend-api.js`、MCP業務backend`dist/deployment/backend-connect.js`。業務backendの実行主体は従来の`api.serviceAccount`/`connect.serviceAccount`です。`node scripts/package-artifacts.mjs package-gateway`で4成果物を`.tmp/`へ作ります（従来の`package`は変わりません）。
+- 入口が行うのは既存routeだけの許可、Host/本文境界の検査、本文上限、process内の回数/同時処理の制限（超過は429/503・待機列なし）、固定backendへの一回だけの転送です。DB・KMS・Secret・本人/許可元の検証・App Checkの消費・配送は業務backendが従来どおり一回だけ行います。形式を満たす不正要求は業務backendの認可処理まで届き得るため、その費用は残ります。
+- 利用者の`Authorization`、method・path・query・本文bytes、`Idempotency-Key`、許可元署名、Cookie/Origin/CSRF/PKCEはそのまま渡り、署名・issuer・resourceは公開originのままです。外部から来た`Forwarded`/`X-Forwarded-*`/`X-Serverless-Authorization`/内部headerは除去し、入口が作り直します。
+- 入口は実行環境の主体で固定backend用のGoogle ID tokenだけを取得し（key file不要）、RAMで期限まで共有します。取得失敗/期限切れは503で、別資格・匿名へは切り替えません。要求の20秒は入口の受付から共有し、backendで延長しません。redirectの追跡や自動再送はしません。
+- IAMによる保護の効力はCloud側の設定（backendのInvoker IAM必須・広いinvoker許可なし・入口主体の権限分離・旧revision/tag URLの閉鎖）で決まります。本リポジトリの試験は合成の拒否だけを確かめ、実IAMの効力を保証しません。上限値は小さく始め、各serviceのmax instance等と合わせて見直してください。process内の制限は全instance共通の上限ではありません。

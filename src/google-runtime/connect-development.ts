@@ -122,6 +122,8 @@ export interface OwnedDevelopmentConnectOptions {
   /** 呼出し元全体の起動期限と中断（延長しない）。 */
   readonly operation: { readonly deadlineAt: number; readonly signal: AbortSignal };
   readonly log?: LogSink | undefined;
+  /** gateway-v1のMCP backendだけ: 物理transport authority（省略は従来のdirect）。 */
+  readonly transportAuthority?: string | undefined;
 }
 
 export interface OwnedDevelopmentConnectServer {
@@ -137,6 +139,7 @@ interface Captured {
   readonly deployment: DeploymentConfig;
   readonly bindPort: number;
   readonly publicOrigin: string;
+  readonly transportAuthority: string | undefined;
   readonly connectNamespace: string;
   readonly expectedServiceName: string;
   readonly kms: Readonly<Record<(typeof KMS_KEYS)[number], unknown>>;
@@ -182,7 +185,7 @@ function capture(options: unknown): Captured {
   const DATABASE_ID = deployment.databaseId;
   let fields: Map<string, unknown>;
   try {
-    fields = dataFields(options, OPTION_KEYS, ['log']);
+    fields = dataFields(options, OPTION_KEYS, ['log', 'transportAuthority']);
   } catch {
     throw configInvalid();
   }
@@ -195,6 +198,12 @@ function capture(options: unknown): Captured {
   if (typeof bindPort !== 'number' || !Number.isSafeInteger(bindPort) || bindPort < 1024 || bindPort > 65535) throw configInvalid();
   const publicOrigin = fields.get('publicOrigin');
   if (!isDevelopmentPublicOrigin(publicOrigin)) throw configInvalid();
+  // gateway-v1のbackendは、配置設定のMCP backend名・backend originのhostと一致する時だけ（direct配置では指定不可）。
+  const transportAuthority = fields.get('transportAuthority');
+  const backend = deployment.topology?.connect;
+  if (transportAuthority !== undefined) {
+    if (backend === undefined || transportAuthority !== new URL(backend.backendOrigin).host || expectedServiceName !== backend.backendServiceName) throw configInvalid();
+  } else if (backend !== undefined) throw configInvalid();
   const connectNamespace = fields.get('connectNamespace');
   if (!isConnectNamespace(connectNamespace)) throw configInvalid();
   try {
@@ -235,6 +244,7 @@ function capture(options: unknown): Captured {
       deployment,
       bindPort,
       publicOrigin,
+      transportAuthority: transportAuthority as string | undefined,
       connectNamespace,
       expectedServiceName,
       kms,
@@ -350,6 +360,7 @@ export async function startOwnedDevelopmentConnectServer(options: OwnedDevelopme
           verificationSender: createEgressVerificationSender(egress),
           clock,
           publicOrigin: config.publicOrigin,
+          ...(config.transportAuthority !== undefined ? { transportAuthority: config.transportAuthority } : {}),
           ...(config.log !== undefined ? { log: config.log } : {}),
           // 開発者向けコード（配置設定でonの時だけ）。保存層は接続serverが読んだidentifierKeyから作り、同じSDKの共通verifierへ結ぶ。
           ...(config.deployment.developerLogin === DEVELOPER_LOGIN_MODE

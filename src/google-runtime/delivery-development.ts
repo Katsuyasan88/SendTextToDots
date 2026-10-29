@@ -250,7 +250,7 @@ function capture(options: unknown): Captured {
       throw configInvalid();
     }
     const expectedServiceName = fields.get('expectedServiceName');
-    if (typeof expectedServiceName !== 'string' || !CLOUD_RUN_NAME.test(expectedServiceName) || expectedServiceName !== API_SERVICE_NAME) throw configInvalid();
+    if (typeof expectedServiceName !== 'string' || !CLOUD_RUN_NAME.test(expectedServiceName) || expectedServiceName !== (deployment.topology?.api.backendServiceName ?? API_SERVICE_NAME)) throw configInvalid();
     const connectNamespace = fields.get('connectNamespace');
     if (!isConnectNamespace(connectNamespace)) throw configInvalid();
     const deliveryNamespace = fields.get('deliveryNamespace');

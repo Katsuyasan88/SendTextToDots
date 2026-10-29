@@ -4,7 +4,7 @@
 // loadDeploymentConfigは編集済みmoduleの値を1回だけ検証してmemoする（失敗もmemoし、取り直さない）。設定をHTTP・env・argvから選ぶ口は無い。
 // 呼出し側（google-runtime・deployment・connect）はSDK生成・秘密・DB・listen・外部HTTPの前にこれを呼ぶ。
 
-import { isConnectNamespace } from '../connect/firestore.js';
+import { isConnectNamespace } from '../policy.js';
 import { isKmsDeliveryNamespace } from '../delivery/kms-store.js';
 import { isDevelopmentPublicOrigin } from '../http/origin.js';
 import { KMS_REGION_PATTERN } from '../protection/kms-sealing.js';
@@ -12,6 +12,7 @@ import { arrayItems, dataFields } from '../protection/google-sdk-call.js';
 import { createKmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
 import { isEncryptionNamespace, PAYLOAD_ENCRYPTION_MODE } from '../encryption/contract.js';
 import { parseSourceAuthorization, type SourceAuthorizationConfig } from '../source/contract.js';
+import { parseGatewayTopology, type GatewayTopology } from '../gateway/contract.js';
 import { DEPLOYMENT_CONFIG } from './deployment.js';
 
 /** src/deployment/functions.tsのexport名（ESMの静的名）。設定のapi.functionName・api.serviceNameはこれと一致しなければならない。 */
@@ -116,6 +117,8 @@ export interface DeploymentConfig {
   readonly payloadEncryption: 'off' | PayloadEncryptionConfig;
   /** 許可元の認可（欠落は'compatible'）。strictは管理者が明示した方式だけ。 */
   readonly sourceAuthorization: SourceAuthorizationConfig;
+  /** 既存URLを保つgateway配置（欠落・'direct'は従来のdirect配置でこのkey自体が無い）。 */
+  readonly topology?: GatewayTopology;
 }
 
 export interface PayloadEncryptionConfig {
@@ -220,7 +223,7 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
   let top: Map<string, unknown>;
   try {
     // accessPolicyは配布placeholder（未設定）の判定を先に保つため存在だけ任意で読み、設定済みの時は下で必須にする。
-    top = dataFields(raw, TOP_KEYS, ['accessPolicy', 'developerLogin', 'payloadEncryption', 'sourceAuthorization']);
+    top = dataFields(raw, TOP_KEYS, ['accessPolicy', 'developerLogin', 'payloadEncryption', 'sourceAuthorization', 'topology']);
   } catch {
     throw invalid();
   }
@@ -303,6 +306,16 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
     const payloadEncryption = parsePayloadEncryption(top.has('payloadEncryption') ? top.get('payloadEncryption') : 'off', projectNumber, ids);
     // 省略は既存互換。strictは明示objectだけで、空・未知・重複の方式は設定error（互換へ降格しない）。
     const sourceAuthorization = parseSourceAuthorization(top.has('sourceAuthorization') ? top.get('sourceAuthorization') : 'compatible');
+    // 省略・'direct'は従来のdirect配置。gateway-v1は全fieldの明示だけで、不正はdirectへ降格しない。
+    const topology = parseGatewayTopology(top.get('topology'), {
+      apiServiceName: api.serviceName,
+      connectServiceName: connect.serviceName,
+      apiPublicOrigin: api.publicOrigin,
+      connectPublicOrigin: connect.publicOrigin,
+      apiServiceAccount: api.serviceAccount,
+      connectServiceAccount: connect.serviceAccount,
+      isServiceAccount: (value) => isServiceAccount(value, projectId),
+    });
 
     return deepFreeze({
       accessPolicy: ACCESS_POLICY,
@@ -328,6 +341,7 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
       web,
       payloadEncryption,
       sourceAuthorization: sourceAuthorization === 'compatible' ? sourceAuthorization : { mode: sourceAuthorization.mode, methods: [...sourceAuthorization.methods] },
+      ...(topology !== undefined ? { topology } : {}),
     });
   } catch {
     throw invalid();

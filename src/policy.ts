@@ -41,3 +41,10 @@ export interface Clock {
 }
 
 export const systemClock: Clock = { now: () => Date.now() };
+
+/** 接続保存の名前空間（`t256_<小文字UUID、版1〜8>`）。SDK非依存（配置設定の検証・gatewayからも使う）。 */
+const CONNECT_NAMESPACE_PATTERN = /^t256_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+export function isConnectNamespace(value: unknown): value is string {
+  return typeof value === 'string' && CONNECT_NAMESPACE_PATTERN.test(value);
+}

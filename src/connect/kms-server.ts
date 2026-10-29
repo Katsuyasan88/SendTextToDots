@@ -74,6 +74,7 @@ import { sourceApprovalId } from '../source/proof.js';
 import type { SourceConsentView } from './pages.js';
 import { AccessUnavailableError, ConnectStorage, isConnectNamespace, type SourceApprovalRequest } from './firestore.js';
 import { isLanguage, LANGUAGE_QUERY, languageCookie, selectLanguage, type Language } from './i18n.js';
+import { admitBackendRequest } from '../gateway/backend.js';
 import { createConnectKmsSealingPort } from './kms-port.js';
 import {
   INTERACTION_SCRIPT,
@@ -135,7 +136,7 @@ export async function auditedRevoke(model: string, revoke: () => Promise<void>, 
 }
 
 const REQUIRED = ['bindPort', 'db', 'namespace', 'kms', 'secrets', 'identity', 'web', 'clientEgress', 'verificationSender', 'clock', 'publicOrigin'] as const;
-const OPTIONAL = ['log', 'startupOperation', 'developerCode', 'sourceAuthorization'] as const;
+const OPTIONAL = ['log', 'startupOperation', 'developerCode', 'sourceAuthorization', 'transportAuthority'] as const;
 const DEVELOPER_CODE_KEYS = ['auth', 'databaseId'] as const;
 const DEVELOPER_CODE_OPTIONAL = ['store', 'bindLookup'] as const;
 
@@ -230,6 +231,8 @@ export interface KmsConnectServerOptions {
   readonly log?: LogSink | undefined;
   /** 正規形の`https://<小文字DNS-host>`だけ（port・path・query・fragment・userinfo・末尾slash・IP・localhostなし）。issuerになる。 */
   readonly publicOrigin: string;
+  /** gateway-v1のMCP backendだけ: 物理transport authority（backendの正式service URLのhost）。省略は従来のdirect。 */
+  readonly transportAuthority?: string | undefined;
   /**
    * 任意。呼出し元全体の起動operation（親）。startの元期限はmin(親deadlineAt, 開始+20秒)で、親の中断でも止まる（延長しない）。
    * 省略時は開始+20秒。親の期限・中断は起動の間だけ見て、成功後の要求は要求固有のoperationを使う。callerのsignalはabortしない。
@@ -370,6 +373,8 @@ function invoke<T>(call: () => T | PromiseLike<T>): Promise<T> {
 /** 起動の前に1回だけ捕捉した設定（以後は入力objectを読み直さない）。 */
 interface Captured {
   /** 検査済みのpublicOrigin。 */
+  /** gateway-v1のMCP backendだけの物理transport authority（direct配置はundefined）。 */
+  readonly transportAuthority: string | undefined;
   readonly publicOrigin: string;
   readonly bindPort: number;
   readonly db: Firestore;
@@ -435,6 +440,9 @@ function capture(options: unknown): Captured {
 
   const publicOrigin = fields.get('publicOrigin');
   if (!isDevelopmentPublicOrigin(publicOrigin)) configFail();
+  // gateway-v1のMCP backendだけ: 物理transport authority（公開authorityとは別の正規DNS host）。省略は従来のdirect。
+  const transportAuthority = fields.has('transportAuthority') ? fields.get('transportAuthority') : undefined;
+  if (transportAuthority !== undefined && (!isDevelopmentPublicOrigin(`https://${String(transportAuthority)}`) || transportAuthority === new URL(publicOrigin).host)) configFail();
 
   const bindPort = fields.get('bindPort');
   if (typeof bindPort !== 'number' || !Number.isSafeInteger(bindPort) || bindPort < 1024 || bindPort > 65535) configFail();
@@ -547,6 +555,7 @@ function capture(options: unknown): Captured {
 
   return Object.freeze({
     publicOrigin,
+    transportAuthority: transportAuthority as string | undefined,
     bindPort,
     db: db as Firestore,
     namespace,
@@ -754,6 +763,8 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
   let developerCodeStore: DeveloperCodeExchangeDeps['store'] | null = null;
   /** 設定のauthority（`<DNS-host>`）。 */
   const authority = new URL(config.publicOrigin).host;
+  /** gateway-v1のbackendで要求ごとに受けた残時間（direct配置では空）。 */
+  const backendBudgets = new WeakMap<IncomingMessage, number>();
 
   /** 共通の時計（captured now）。全構成へ同じobjectを渡す。 */
   const clock: Clock = Object.freeze({ now: () => config.now() as number });
@@ -1564,7 +1575,8 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       }
       // 元20秒のoperationは受付時に1回だけ作る。切断・未完了の応答close・server closeで中止する（正常に書き終えた後のcloseは中止にしない）。
       const controller = new AbortController();
-      const operation: McpRequestOperation = Object.freeze({ deadlineAt: receivedAt + REQUEST_BUDGET_MS, signal: controller.signal });
+      // gateway-v1のbackendは、gatewayの残時間（元20秒以下）だけを使う。
+      const operation: McpRequestOperation = Object.freeze({ deadlineAt: receivedAt + (backendBudgets.get(req) ?? REQUEST_BUDGET_MS), signal: controller.signal });
       active.add(controller);
       const abort = (): void => controller.abort();
       const onResponseClose = (): void => {
@@ -1625,7 +1637,14 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       // Providerへの新しい呼出し0。
       let admitted = false;
       try {
-        admitted = admitRequest(req, authority);
+        // gateway-v1のbackend: 設定のtransport authorityを検査してから公開authorityへ結ぶ（不成立は同じ固定400）。
+        const transportAuthority = config.transportAuthority;
+        if (transportAuthority === undefined) admitted = admitRequest(req, authority);
+        else {
+          const budget = admitBackendRequest(req, { transportAuthority, logicalAuthority: authority });
+          if (budget !== null) backendBudgets.set(req, budget);
+          admitted = budget !== null && admitRequest(req, authority);
+        }
       } catch {
         admitted = false;
       }

@@ -220,7 +220,7 @@ export function derivePackages(packageJson, packageLock) {
   derivedLock.packages[''].engines = { node: ARTIFACTS.node };
   return { license: original.license, dependencies: Object.keys(original.dependencies), api: json(pkg(ARTIFACTS.api.main)), mcp: json(pkg(ARTIFACTS.mcp.main)), lock: json(derivedLock) };
 }
-function dockerfile() {
+function dockerfile(main = ARTIFACTS.mcp.main) {
   return lines([
     `FROM ${ARTIFACTS.baseImage}`,
     'WORKDIR /app',
@@ -230,7 +230,7 @@ function dockerfile() {
     `COPY ${LEGAL_FILES.join(' ')} ./`,
     'ENV NODE_ENV=production',
     'USER node',
-    `CMD ${JSON.stringify(['node', ARTIFACTS.mcp.main])}`,
+    `CMD ${JSON.stringify(['node', main])}`,
   ]);
 }
 
@@ -477,6 +477,81 @@ export function buildArtifacts(inputs) {
   return { zip, tarGz, receipt };
 }
 
+// ---------- gateway-v1配置（既存URLの入口2＋IAM必須の業務backend2）の4成果物 ----------
+// 既存の2成果物（direct配置）とは別のreceipt/出力directoryに作る。入口2つの閉包は業務SDK（KMS・Secret Manager・Firebase Admin・
+// OAuth Provider・MCP SDK）と業務bootstrap（google-runtime・keys・接続/配送server）を含まないことを生成時に検査する。
+export const GATEWAY_ARTIFACTS = Object.freeze({
+  schema: 'sendtexttodots-gateway-artifacts/1',
+  roles: Object.freeze([
+    Object.freeze({ role: 'gateway-api', name: 'gateway-api.zip', format: 'zip32-store', main: 'dist/deployment/gateway-api.js', gateway: true }),
+    Object.freeze({ role: 'gateway-connect', name: 'gateway-connect.tar.gz', format: 'ustar-gzip', main: 'dist/deployment/gateway-connect.js', gateway: true }),
+    Object.freeze({ role: 'backend-api', name: 'backend-api.tar.gz', format: 'ustar-gzip', main: 'dist/deployment/backend-api.js', gateway: false }),
+    Object.freeze({ role: 'backend-connect', name: 'backend-connect.tar.gz', format: 'ustar-gzip', main: 'dist/deployment/backend-connect.js', gateway: false }),
+  ]),
+  outputPrefix: 'sendtexttodots-gateway-artifacts-',
+});
+export const GATEWAY_FORBIDDEN_PACKAGES = Object.freeze(['@google-cloud/kms', '@google-cloud/secret-manager', 'firebase-admin', 'oidc-provider', '@modelcontextprotocol/server', '@modelcontextprotocol/node', 'standardwebhooks']);
+const GATEWAY_FORBIDDEN_FILES = Object.freeze(['dist/google-runtime/', 'dist/keys/', 'dist/connect/kms-server.js', 'dist/delivery/kms-service.js', 'dist/delivery/kms-runtime.js', 'dist/protection/google-kms-transport.js']);
+const forbiddenFile = (name) => GATEWAY_FORBIDDEN_FILES.some((prefix) => name === prefix || (prefix.endsWith('/') && name.startsWith(prefix)));
+
+export function buildGatewayArtifacts(inputs) {
+  const packages = derivePackages(inputs.packageJson, inputs.packageLock);
+  const legal = inputs.legal;
+  if (!Array.isArray(legal) || legal.length !== LEGAL_FILES.length || !legal.every((file, index) => file?.name === LEGAL_FILES[index] && Buffer.isBuffer(file.bytes) && file.bytes.length > 0)) fail('license_missing');
+  const legalEntries = legal.map((file) => ({ name: file.name, bytes: file.bytes }));
+  const base = parseJson(packages.api, 'package_invalid');
+  const dist = new Map([...inputs.dist].map(([name, bytes]) => [`dist/${name}`, bytes]));
+  const built = GATEWAY_ARTIFACTS.roles.map((role) => {
+    const closure = closureOf(role.main, dist, packages.dependencies);
+    for (const name of closure.files) if (inputs.checkSyntax(name.slice('dist/'.length)) !== true) fail('syntax_invalid');
+    if (role.gateway) {
+      // 違反は閉包内の名前（package名・dist path）だけを持たせる（内容・値は持たない）。
+      const packages = closure.packages.filter((item) => GATEWAY_FORBIDDEN_PACKAGES.includes(item));
+      const files = closure.files.filter(forbiddenFile);
+      if (packages.length > 0 || files.length > 0) {
+        const via = closure.files.filter((name) => packages.some((item) => dist.get(name).toString('utf8').includes(`'${item}`)));
+        const error = new ArtifactError('gateway_closure_rejected');
+        error.detail = { role: role.role, packages, files, via };
+        throw error;
+      }
+    }
+    const zip = role.format === 'zip32-store';
+    const extra = [
+      ...legalEntries,
+      ...(zip ? [] : [{ name: '.dockerignore', bytes: lines(DOCKERIGNORE_LINES) }]),
+      { name: '.npmrc', bytes: lines(NPMRC_LINES) },
+      ...(zip ? [] : [{ name: 'Dockerfile', bytes: dockerfile(role.main) }]),
+      { name: 'package-lock.json', bytes: packages.lock },
+      { name: 'package.json', bytes: json({ ...base, main: role.main }) },
+    ];
+    const entries = [...closure.files.map((name) => ({ name, bytes: dist.get(name) })), ...extra].sort((left, right) => byteOrder(left.name, right.name));
+    const archive = zip ? buildZip(entries) : buildTarGz(entries);
+    const parsed = zip ? parseZip(archive) : parseTarGz(archive);
+    const main = parseJson(parsed.find((entry) => entry.name === 'package.json')?.bytes ?? Buffer.alloc(0), 'archive_verify_failed').main;
+    if (!sameEntries(parsed, entries) || main !== role.main || !parsed.some((entry) => entry.name === role.main)) fail('archive_verify_failed');
+    return { role, archive, parsed, closure };
+  });
+  const receipt = {
+    schema: GATEWAY_ARTIFACTS.schema,
+    package: { packageJsonSha256: sha256(inputs.packageJson), packageLockSha256: sha256(inputs.packageLock), node: ARTIFACTS.node, license: packages.license, legalFiles: [...LEGAL_FILES] },
+    roles: built.map(({ role, archive, parsed, closure }) => ({
+      role: role.role,
+      name: role.name,
+      format: role.format,
+      main: role.main,
+      ...(role.format === 'zip32-store' ? {} : { baseImage: ARTIFACTS.baseImage }),
+      entries: parsed.length,
+      dependencies: closure.packages,
+      ...digestsOf(archive),
+      files: parsed.map((entry) => ({ name: entry.name, size: entry.bytes.length, sha256: sha256(entry.bytes) })),
+    })),
+    planningOnly: true,
+    executionPermitted: false,
+    notice: 'local archive metadata only; not evidence of Cloud upload, build, deployment, IAM, signature or authorization',
+  };
+  return { archives: built.map(({ role, archive }) => ({ name: role.name, bytes: archive })), receipt };
+}
+
 // ---------- 出力 ----------
 function writeExclusive(path, bytes) {
   try {
@@ -516,6 +591,28 @@ export function packageArtifacts({ serverRoot, outputRoot }) {
   }
 }
 
+/** gateway-v1配置の4成果物を、output root（.tmp）直下の別directoryへ1回だけ書く。 */
+export function packageGatewayArtifacts({ serverRoot, outputRoot }) {
+  try {
+    const built = buildGatewayArtifacts(readServerInputs(serverRoot));
+    lstatKind(outputRoot, 'directory', 'output_invalid');
+    const name = `${GATEWAY_ARTIFACTS.outputPrefix}${sha256(Buffer.from(built.receipt.roles.map((item) => `${item.sha256}\n`).join(''), 'utf8')).slice(0, 12)}`;
+    const directory = join(outputRoot, name);
+    try {
+      mkdirSync(directory);
+    } catch {
+      return fail('output_exists');
+    }
+    lstatKind(directory, 'directory', 'output_invalid');
+    for (const archive of built.archives) writeExclusive(join(directory, archive.name), archive.bytes);
+    writeExclusive(join(directory, 'receipt.json'), json(built.receipt));
+    return Object.freeze({ output: name, receipt: built.receipt });
+  } catch (error) {
+    if (error instanceof ArtifactError) throw error;
+    throw new ArtifactError('internal_failed');
+  }
+}
+
 function isDirectMain() {
   const entry = process.argv[1];
   if (typeof entry !== 'string' || entry === '') return false;
@@ -528,8 +625,18 @@ function isDirectMain() {
 
 if (isDirectMain()) {
   const args = process.argv.slice(2);
-  if (args.length !== 1 || args[0] !== 'package') {
-    process.stderr.write('usage: node scripts/package-artifacts.mjs package\n');
+  if (args.length === 1 && args[0] === 'package-gateway') {
+    try {
+      mkdirSync(join(SERVER, '.tmp'), { recursive: true });
+      const { output, receipt } = packageGatewayArtifacts({ serverRoot: SERVER, outputRoot: join(SERVER, '.tmp') });
+      const brief = (item) => ({ role: item.role, name: item.name, entries: item.entries, size: item.size, sha256: item.sha256, dependencies: item.dependencies });
+      process.stdout.write(`${JSON.stringify({ event: 'sendtexttodots_gateway_artifacts.ready', output: `.tmp/${output}`, roles: receipt.roles.map(brief) })}\n`);
+    } catch (error) {
+      process.stdout.write(`${JSON.stringify({ event: 'sendtexttodots_gateway_artifacts.failed', code: error instanceof ArtifactError ? error.code : 'internal_failed', ...(error instanceof ArtifactError && error.detail !== undefined ? { detail: error.detail } : {}) })}\n`);
+      process.exitCode = 1;
+    }
+  } else if (args.length !== 1 || args[0] !== 'package') {
+    process.stderr.write('usage: node scripts/package-artifacts.mjs package | package-gateway\n');
     process.exitCode = 2;
   } else {
     try {
