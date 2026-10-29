@@ -19,6 +19,7 @@ import { PRODUCT_POLICY } from '../../dist/policy.js';
 import { crc32c } from '../../dist/protection/kms-sealing.js';
 import { createHmacHasher } from '../../dist/secrets.js';
 import { SourceStore } from '../../dist/source/firestore.js';
+import { newSourceGeneration, newSourceId } from '../../dist/source/admin.js';
 
 const DAY = 86_400_000;
 
@@ -173,6 +174,288 @@ export function createResolverRuntime({ strict = true } = {}) {
       db.docs.set(`${root}/sourceGrants/${hasher.hash(`t256:${NS}:grant`, grantId)}`, { sourceId: binding.sourceId, generation: binding.generation });
     },
     dispose: () => ctx.dispose(),
+  };
+}
+
+/**
+ * 実connect server（startDevelopmentKmsConnectServer: 実Provider 9.12.2・JWKS・cookie・KMS封緘・ConnectStorage adapter・route handler）を、
+ * 合成DB（where/limit/batch・updateTime）・合成AES-GCM KMS・合成本人verifier・固定CIMD文書だけを返すfake egressで起動する。
+ * 本番のlisten境界（0.0.0.0/明示port）だけを試験内で局所interceptして127.0.0.1/port 0へ結び、起動後すぐrestoreする（製品codeは不変）。
+ * 要求はNode HTTP clientで、元のhttps Host（設定のauthority）・Origin・cookieを付けて127.0.0.1へ送る。redirectは追わない。
+ */
+export async function startConnectHttpRuntime({ strict = true } = {}) {
+  const net = await import('node:net');
+  const http = await import('node:http');
+  const { startDevelopmentKmsConnectServer } = await import('../../dist/connect/kms-server.js');
+  const { CHATGPT_CIMD_CANDIDATE } = await import('../../dist/oauth/cimd.js');
+  const { connectIdentityHash } = await import('../../dist/connect/firestore.js');
+  const projectId = 'sttd-http-test';
+  const issuer = 'https://connect.sttd-http.example.com';
+  const authority = new URL(issuer).host;
+  const NS = `t256_${randomUUID()}`;
+  const SUB_NS = `t268_${randomUUID()}`;
+  const docs = new Map();
+  let tick = 0;
+  const stamp = () => {
+    tick += 1;
+    const time = { seconds: 1_900_000_000 + tick, nanoseconds: tick };
+    return { ...time, isEqual: (other) => other?.seconds === time.seconds && other?.nanoseconds === time.nanoseconds, toMillis: () => time.seconds * 1000 };
+  };
+  const write = (path, data) => docs.set(path, { data: structuredClone(data), updateTime: stamp() });
+  const snapshot = (path) => {
+    const entry = docs.get(path);
+    return {
+      id: path.split('/').pop(),
+      ref: refOf(path),
+      exists: entry !== undefined,
+      updateTime: entry?.updateTime,
+      get: (field) => entry?.data[field],
+      data: () => (entry === undefined ? undefined : structuredClone(entry.data)),
+    };
+  };
+  /** collection pathの直下の文書だけを、等値のwhere・limitで絞るquery。 */
+  const queryOf = (collectionPath, filters = [], max = Infinity) => ({
+    where: (field, op, value) => {
+      if (op !== '==') throw new Error('synthetic query: only ==');
+      return queryOf(collectionPath, [...filters, [field, value]], max);
+    },
+    limit: (n) => queryOf(collectionPath, filters, n),
+    get: async () => {
+      const matched = [...docs.keys()]
+        .filter((path) => path.startsWith(`${collectionPath}/`) && !path.slice(collectionPath.length + 1).includes('/'))
+        .filter((path) => filters.every(([field, value]) => docs.get(path).data[field] === value))
+        .slice(0, max)
+        .map(snapshot);
+      return { docs: matched, empty: matched.length === 0, size: matched.length };
+    },
+  });
+  const collectionOf = (path) => ({ doc: (id) => refOf(`${path}/${id}`), ...queryOf(path) });
+  function refOf(path) {
+    return {
+      firestore: db,
+      path,
+      id: path.split('/').pop(),
+      collection: (name) => collectionOf(`${path}/${name}`),
+      set: async (data) => write(path, data),
+      create: async (data) => {
+        if (docs.has(path)) throw new Error('ALREADY_EXISTS');
+        write(path, data);
+      },
+      update: async (partial) => {
+        if (!docs.has(path)) throw new Error('NOT_FOUND');
+        write(path, { ...docs.get(path).data, ...structuredClone(partial) });
+      },
+      delete: async () => void docs.delete(path),
+      get: async () => snapshot(path),
+    };
+  }
+  let lock = Promise.resolve();
+  const db = {
+    projectId,
+    docs,
+    collection: (name) => collectionOf(name),
+    doc: (path) => refOf(path),
+    batch() {
+      const ops = [];
+      const batch = {
+        set: (ref, data) => (ops.push(() => write(ref.path, data)), batch),
+        update: (ref, partial) => (ops.push(() => write(ref.path, { ...docs.get(ref.path)?.data, ...structuredClone(partial) })), batch),
+        delete: (ref) => (ops.push(() => docs.delete(ref.path)), batch),
+        commit: async () => {
+          for (const op of ops) op();
+          return [];
+        },
+      };
+      return batch;
+    },
+    runTransaction(fn) {
+      const run = lock.then(async () => {
+        const pending = [];
+        const tx = {
+          get: async (ref) => snapshot(ref.path),
+          getAll: async (...refs) => refs.map((ref) => snapshot(ref.path)),
+          set: (ref, data) => (pending.push(() => write(ref.path, data)), tx),
+          create: (ref, data) =>
+            (pending.push(() => {
+              if (docs.has(ref.path)) throw new Error('ALREADY_EXISTS');
+              write(ref.path, data);
+            }),
+            tx),
+          update: (ref, partial) =>
+            (pending.push(() => {
+              if (!docs.has(ref.path)) throw new Error('NOT_FOUND');
+              write(ref.path, { ...docs.get(ref.path).data, ...structuredClone(partial) });
+            }),
+            tx),
+          delete: (ref) => (pending.push(() => docs.delete(ref.path)), tx),
+        };
+        const result = await fn(tx);
+        for (const apply of pending) apply();
+        return result;
+      });
+      lock = run.catch(() => {});
+      return run;
+    },
+  };
+  const offset = { ms: 0 };
+  const clock = { now: () => Date.now() + offset.ms };
+  const cryptoKey = `projects/${projectId}/locations/asia-northeast1/keyRings/sttd/cryptoKeys/connect`;
+  const kms = { environment: 'development', projectId, databaseId: '(default)', namespace: SUB_NS, cryptoKey, writeVersion: 1, readVersions: [1] };
+  const policy = createKmsSubscriptionPolicy(kms);
+  write(`sttdAuth/${SUB_NS}/config/kms-subscription`, kmsMarkerDocument(policy));
+  const identifierKey = randomBytes(32);
+  const hasher = createHmacHasher(identifierKey);
+  const es = { ...generateKeyPairSync('ec', { namedCurve: 'P-256' }).privateKey.export({ format: 'jwk' }), alg: 'ES256', use: 'sig', kid: randomUUID() };
+  const rs = { ...generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ format: 'jwk' }), alg: 'RS256', use: 'sig', kid: randomUUID() };
+  // 固定CIMD候補のclient metadata（cimd.tsのcreateAllowClientが要求する形）。jwksは要求されたら空集合。
+  const cimdDocument = {
+    client_id: CHATGPT_CIMD_CANDIDATE.clientId,
+    client_name: 'ChatGPT',
+    redirect_uris: [CHATGPT_CIMD_CANDIDATE.redirectUri],
+    grant_types: ['authorization_code', 'refresh_token'],
+    response_types: ['code'],
+    token_endpoint_auth_method: 'private_key_jwt',
+    jwks_uri: CHATGPT_CIMD_CANDIDATE.jwksUri,
+  };
+  const egressCalls = [];
+  const clientEgress = {
+    getJson: async (url) => {
+      egressCalls.push(url);
+      if (url === CHATGPT_CIMD_CANDIDATE.clientId) return { status: 200, headers: {}, body: JSON.stringify(cimdDocument) };
+      if (url === CHATGPT_CIMD_CANDIDATE.jwksUri) return { status: 200, headers: {}, body: JSON.stringify({ keys: [] }) };
+      throw new Error('synthetic egress: forbidden');
+    },
+  };
+  // 合成本人verifier: `id-<uid>`の形のtokenを、このprojectのAppleの本人として検証済みにする（外部通信0）。
+  const identity = {
+    projectId,
+    async verifyIdToken(token) {
+      const match = /^id-([a-z0-9-]{1,40})$/.exec(token);
+      if (!match) throw Object.assign(new Error('invalid'), { code: 'invalid' });
+      return Object.freeze({ projectId, uid: match[1], authTimeSec: Math.floor(clock.now() / 1000) });
+    },
+    async accountStatus() {
+      return 'active';
+    },
+  };
+  // listen境界だけの局所intercept（0.0.0.0/明示port → 127.0.0.1/port 0）。起動後すぐrestoreする。
+  const originalListen = net.Server.prototype.listen;
+  let listened = null;
+  net.Server.prototype.listen = function intercepted(port, host, callback) {
+    listened = this;
+    return originalListen.call(this, 0, '127.0.0.1', typeof host === 'function' ? host : callback);
+  };
+  let server;
+  try {
+    server = await startDevelopmentKmsConnectServer({
+      bindPort: 18_080,
+      db,
+      namespace: NS,
+      kms: { ...kms, transport: syntheticKmsTransport() },
+      secrets: { load: async () => ({ jwks: { keys: [es, rs] }, cookieKeys: [randomBytes(32)], identifierKey: Buffer.from(identifierKey) }) },
+      identity,
+      web: { apiKey: 'synthetic-web-key', authDomain: `${projectId}.firebaseapp.com`, projectId },
+      clientEgress,
+      verificationSender: async () => ({ status: 500, body: '' }),
+      clock,
+      publicOrigin: issuer,
+      ...(strict ? { sourceAuthorization: { policy: { mode: 'strict-v1', methods: ['developer-key-v1'] }, projectNumber: '123456789012' } } : {}),
+    });
+  } finally {
+    net.Server.prototype.listen = originalListen;
+  }
+  const port = listened.address().port;
+  const sources = new SourceStore({ db, namespace: NS, clock });
+  const root = `sttdConnect/${NS}`;
+
+  /** 1つのbrowser（cookie jar）。元issuerのpathだけを127.0.0.1へ送る。 */
+  const browser = () => {
+    const jar = new Map();
+    const store = (setCookie) => {
+      for (const line of setCookie ?? []) {
+        const [pair, ...attributes] = line.split(';').map((part) => part.trim());
+        const index = pair.indexOf('=');
+        const name = pair.slice(0, index);
+        const value = pair.slice(index + 1);
+        const path = attributes.find((attribute) => attribute.toLowerCase().startsWith('path='))?.slice(5) ?? '/';
+        const expired = attributes.some((attribute) => /^expires=/i.test(attribute) && Date.parse(attribute.slice(8)) < Date.now()) || value === '';
+        const key = `${name};${path}`;
+        if (expired) jar.delete(key);
+        else jar.set(key, { name, value, path });
+      }
+    };
+    const cookieFor = (path) =>
+      [...jar.values()]
+        .filter((cookie) => path === cookie.path || path.startsWith(cookie.path.endsWith('/') ? cookie.path : `${cookie.path}/`))
+        .map((cookie) => `${cookie.name}=${cookie.value}`)
+        .join('; ');
+    return {
+      jar,
+      request: (method, target, { headers = {}, body, cookies = true } = {}) =>
+        new Promise((resolve, reject) => {
+          const url = new URL(target, issuer);
+          if (url.origin !== issuer) throw new Error('synthetic browser: only the original issuer is mapped to localhost');
+          const path = `${url.pathname}${url.search}`;
+          const cookie = cookies ? cookieFor(url.pathname) : '';
+          const req = http.request(
+            { host: '127.0.0.1', port, method, path, headers: { Host: authority, ...(cookie ? { Cookie: cookie } : {}), ...headers, ...(body !== undefined ? { 'Content-Length': Buffer.byteLength(body) } : {}) } },
+            (res) => {
+              const chunks = [];
+              res.on('data', (chunk) => chunks.push(chunk));
+              res.on('end', () => {
+                if (cookies) store(res.headers['set-cookie']);
+                resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') });
+              });
+            },
+          );
+          req.on('error', reject);
+          if (body !== undefined) req.write(body);
+          req.end();
+        }),
+    };
+  };
+
+  /** 利用許可と、その本人へ結んだ登録開発者source（connect操作）と鍵。 */
+  const enrollPerson = async (uid) => {
+    const identityHash = connectIdentityHash(hasher, NS, { projectId, uid });
+    write(`${root}/access/${identityHash}`, { version: 1, state: 'active', generation: randomUUID(), updatedAt: clock.now() });
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    const now = clock.now();
+    const record = {
+      schemaVersion: 1,
+      sourceId: newSourceId(),
+      kind: 'developer',
+      state: 'active',
+      generation: newSourceGeneration(),
+      operations: ['connect'],
+      publicKey: publicKey.export({ format: 'jwk' }).x,
+      identityHash,
+      expiresAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    if ((await sources.create(record)) !== 'created') throw new Error('synthetic source create failed');
+    return { uid, idToken: `id-${uid}`, identityHash, record, privateKey };
+  };
+
+  return {
+    issuer,
+    authority,
+    NS,
+    SUB_NS,
+    db,
+    docs,
+    write,
+    offset,
+    clock,
+    hasher,
+    sources,
+    policy,
+    egressCalls,
+    root,
+    browser,
+    enrollPerson,
+    close: () => server.close(),
   };
 }
 
