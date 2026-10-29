@@ -10,6 +10,12 @@ On 2026-10-25, in the author's development environment, 0.3.0 was used for Apple
 
 On the same day the service was stopped and restarted, and the receiving state was confirmed in the same browser. The receiving Dots was told to treat the text as a work request, and the result and identifier of one simple calculation instruction sent from the demo matched. Dots performs the work; SendTextToDots itself does not interpret or execute the text.
 
+### Limited check in the author's environment on 2026-10-29 (receiver-settings recovery and encryption APIs)
+
+In the author's environment, a version with the receiver-settings recovery and the encryption APIs was used. After reconnecting the plugin with Apple and consenting, re-registering the subscription in the same Dots was confirmed by the author's report and the screen. The author then used the public API to send four new Japanese messages (one plaintext and three encrypted: before a key reissue, with the previous key within its grace period, and with the new key; each HTTP 200), repeat one request for the same command, fetch the public key twice, and reissue the key once (normal). An encrypted text using the previous key after the grace period was rejected with `409 encryption_key_unavailable`. The author reported the overall result as OK.
+
+The check is limited to this scope. HTTP 200 does not show display or processing completion in Dots. Arrival counts, receiver-side processing and the state of each request were not reconciled independently. The reply to the send with the previous key was observed to come back from Dots together with the reply to the next send; the cause was not identified and is not treated as specified behaviour. Text with emoji or line breaks (skipped this time), integration with other apps, actual billing and installation in a third-party environment are unverified.
+
 ### Use of the GitHub source on a Mac (author's report)
 
 Material provided by the author dated 2026-10-25 reports that GitHub commit `ad276fccc504bc367df209edb694809570496c3e` (0.3.0) was obtained on a Mac and deployed without changing product code, tests or dependencies. The changes were the deployment values in `src/config/deployment.ts` and the additional deployment configuration files `.firebaserc` and `firebase.json`. This does not mean the service works with the unset placeholders.
