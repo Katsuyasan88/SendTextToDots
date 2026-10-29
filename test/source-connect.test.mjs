@@ -237,6 +237,141 @@ test('二配置: Aの承認・Grant bindingはBで使えない', async () => {
   assert.equal(await b.storage.grantSourceUsable('grant-a'), false);
 });
 
+// ---- 実部品の接合: 本物の固定oidc-provider＋実resolver、実KmsRequestDeliveryStore＋実serviceの送出確定（test/fixtures/source-runtime.mjs） ----
+
+const appRecord = (now, overrides = {}) => ({
+  schemaVersion: 1,
+  sourceId: newSourceId(),
+  kind: 'app',
+  state: 'active',
+  generation: newSourceGeneration(),
+  operations: ['send', 'connect'],
+  appId: '1:123456789012:ios:0123abcd',
+  createdAt: now,
+  updatedAt: now,
+  ...overrides,
+});
+
+test('実MCP resolver（本物のoidc-provider）: bound Grantだけ解決し、旧Grant・停止・世代違い・削除はnull、互換は従来どおり', async () => {
+  const { createResolverRuntime } = await import('./fixtures/source-runtime.mjs');
+  const r = createResolverRuntime({ strict: true });
+  const compat = createResolverRuntime({ strict: false });
+  try {
+    const ownerId = r.addOwner();
+    const source = appRecord(Date.now());
+    assert.equal(await r.sources.create(source), 'created');
+    const issued = await r.issue(ownerId);
+    // strict前の旧Grant（binding無し）は使えない。
+    assert.equal(await r.resolve(issued.value), null);
+    r.bind(issued.grantId, source);
+    const resolved = await r.resolve(issued.value);
+    assert.equal(resolved?.ownerId, ownerId);
+    assert.equal(resolved?.grantId, issued.grantId);
+    // 停止 → null。再有効化（新世代）→ 旧bindingはnull。
+    const sourcePath = `sttdConnect/${r.NS}/sources/${source.sourceId}`;
+    r.db.docs.set(sourcePath, { ...source, state: 'disabled', updatedAt: source.updatedAt + 1 });
+    assert.equal(await r.resolve(issued.value), null);
+    r.db.docs.set(sourcePath, { ...source, generation: newSourceGeneration(), updatedAt: source.updatedAt + 2 });
+    assert.equal(await r.resolve(issued.value), null);
+    // 削除（物理削除）→ null。
+    r.db.docs.delete(sourcePath);
+    assert.equal(await r.resolve(issued.value), null);
+    // 互換配置（sourceを結ばない）はbinding無しでも従来どおり解決する。
+    const compatOwner = compat.addOwner();
+    const compatIssued = await compat.issue(compatOwner);
+    assert.equal((await compat.resolve(compatIssued.value))?.ownerId, compatOwner);
+  } finally {
+    r.dispose();
+    compat.dispose();
+  }
+});
+
+test('実送出確定（実KmsRequestDeliveryStore＋実service）: 要求sourceと購読Grantのsourceが両方有効な時だけ送出し、片方の停止・旧Grant・世代違いは送出0', async () => {
+  const { createDeliveryRuntime } = await import('./fixtures/source-runtime.mjs');
+  const w = createDeliveryRuntime();
+  const requestSource = appRecord(w.clock.t);
+  const grantSource = appRecord(w.clock.t);
+  assert.equal(await w.sources.create(requestSource), 'created');
+  assert.equal(await w.sources.create(grantSource), 'created');
+  const owner = w.enroll();
+  w.bindGrant(owner.grantId, grantSource);
+  const reqBinding = { sourceId: requestSource.sourceId, generation: requestSource.generation };
+
+  // 両方有効（別々のsource）→ 送出。source文書の読取りとCommandの書込み（送出確定）が同じtx。
+  const ok = await w.post(owner, reqBinding);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.state, 'delivered');
+  assert.equal(w.sent.length, 1);
+  const requestPath = `sttdConnect/${w.NS}/sources/${requestSource.sourceId}`;
+  const grantPath = `sttdConnect/${w.NS}/sources/${grantSource.sourceId}`;
+  const txs = (path) => new Set(w.log.filter((entry) => entry.kind === 'read' && entry.path === path).map((entry) => entry.tx));
+  const dispatchTx = [...txs(requestPath)].find((tx) => txs(grantPath).has(tx) && w.log.some((entry) => entry.tx === tx && entry.kind === 'write' && entry.path.includes('/commands/')));
+  assert.ok(dispatchTx !== undefined, 'both sources are read in the dispatch transaction that writes the command');
+
+  // 入口認可の後に要求sourceを停止 → 送出0。
+  w.clock.t += 1_000;
+  w.docs.set(requestPath, { ...requestSource, state: 'disabled', updatedAt: requestSource.updatedAt + 1 });
+  const stoppedRequest = await w.post(owner, reqBinding);
+  assert.notEqual(stoppedRequest.body.state, 'delivered');
+  assert.equal(w.sent.length, 1);
+  w.docs.set(requestPath, { ...requestSource, updatedAt: requestSource.updatedAt + 2 });
+
+  // 購読Grantのsourceを停止 → 送出0。
+  w.docs.set(grantPath, { ...grantSource, state: 'disabled', updatedAt: grantSource.updatedAt + 1 });
+  const stoppedGrant = await w.post(owner, reqBinding);
+  assert.notEqual(stoppedGrant.body.state, 'delivered');
+  assert.equal(w.sent.length, 1);
+
+  // 購読Grantのsourceが新世代（再有効化）→ 旧bindingの購読は送出0。
+  w.docs.set(grantPath, { ...grantSource, generation: newSourceGeneration(), updatedAt: grantSource.updatedAt + 2 });
+  assert.notEqual((await w.post(owner, reqBinding)).body.state, 'delivered');
+  assert.equal(w.sent.length, 1);
+
+  // 旧（unbound）Grantの購読 → 送出0。
+  const legacy = w.enroll();
+  assert.notEqual((await w.post(legacy, reqBinding)).body.state, 'delivered');
+  assert.equal(w.sent.length, 1);
+
+  // 回復: 購読Grantのsourceを元の世代で有効へ戻した場合だけ再び送出（新世代への付替えはしない）。
+  w.docs.set(grantPath, { ...grantSource, updatedAt: grantSource.updatedAt + 3 });
+  assert.equal((await w.post(owner, reqBinding)).body.state, 'delivered');
+  assert.equal(w.sent.length, 2);
+});
+
+test('実購読保存（実registration runtime/storeの最終tx）: bound Grantだけ保存し、旧Grant・停止・世代違いは保存0', async () => {
+  const { createSubscriptionRuntime } = await import('./fixtures/source-runtime.mjs');
+  const s = await createSubscriptionRuntime();
+  try {
+    const source = appRecord(Date.now());
+    assert.equal(await s.sources.create(source), 'created');
+    const sourcePath = `sttdConnect/${s.NS}/sources/${source.sourceId}`;
+    // 正規: bound Grantの購読は保存される。
+    const good = await s.enroll();
+    s.bind(good.grantId, source);
+    const saved = await s.subscribe(good);
+    assert.equal(saved.ok, true, `bound grant subscribes (${saved.kind})`);
+    assert.ok(s.subscriptionOf(good.ownerId)?.active);
+    // 旧（unbound）Grant → grant_inactive・保存0。
+    const legacy = await s.enroll();
+    const refused = await s.subscribe(legacy);
+    assert.deepEqual([refused.ok, refused.kind], [false, 'grant_inactive']);
+    assert.equal(s.subscriptionOf(legacy.ownerId)?.active ?? null, null);
+    // 停止 → 保存0。
+    const stopped = await s.enroll();
+    s.bind(stopped.grantId, source);
+    s.docs.set(sourcePath, { data: { ...source, state: 'disabled', updatedAt: source.updatedAt + 1 }, updateTime: { seconds: 1, nanoseconds: 1 } });
+    const stoppedResult = await s.subscribe(stopped);
+    assert.deepEqual([stoppedResult.ok, stoppedResult.kind], [false, 'grant_inactive']);
+    assert.equal(s.subscriptionOf(stopped.ownerId)?.active ?? null, null);
+    // 世代違い（再有効化）→ 保存0。
+    s.docs.set(sourcePath, { data: { ...source, generation: newSourceGeneration(), updatedAt: source.updatedAt + 2 }, updateTime: { seconds: 2, nanoseconds: 2 } });
+    const renewed = await s.subscribe(stopped);
+    assert.deepEqual([renewed.ok, renewed.kind], [false, 'grant_inactive']);
+  } finally {
+    await s.close();
+  }
+});
+
 test('同意前の確認: 承認後にsourceを停止すると待機中と同じ（同意の消費・受信先設定の削除へ進まない）', async () => {
   const d = deployment();
   await consented(d, 'uid-a', 'ia-1');
