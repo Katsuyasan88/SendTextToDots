@@ -13,6 +13,11 @@ export const DEPLOYMENT_CONFIG = {
   accessPolicy: 'explicit-allow-v1',
   /** Developer 6-digit code. `off` (default) or `operator-code-v1` (codes issued by the operator-mode local console). See docs/CONFIGURATION_EN.md. */
   developerLogin: 'off',
+  /**
+   * Trusted source authorization. `compatible` (default, existing behaviour) or an explicit strict choice such as
+   * `{ mode: 'strict-v1', methods: ['developer-key-v1', 'app-check-v1'] }`. See "Trusted source authorization" in docs/CONFIGURATION_EN.md.
+   */
+  sourceAuthorization: 'compatible',
   /** Google Cloud / Firebase project ID (6 to 30 characters). */
   projectId: 'your-project-id',
   /** Numeric project number of the same project. */

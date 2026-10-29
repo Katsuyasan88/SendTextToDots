@@ -228,3 +228,18 @@ console.log(response.status, await response.json());
 ## プラグイン接続画面のコード入力（開発者向け6桁コード）
 
 機能が有効な配置だけ、OAuth interactionのlogin画面に「コードで接続」が表示されます。`POST /interaction/{uid}/code`（同origin・interaction cookie・CSRF必須、JSON `{"csrf","code"}` 1KiBまで）は成功時だけ同originの応答でcustom tokenを返し、画面がFirebase SDKでログインして既存の`/login`へID tokenを送ります（同意・購読は通常どおり）。不存在・期限切れ・使用済み・取消は同じ`400 code_rejected`、試行上限は`429`、作成/署名の失敗は`503 code_failed`（コンソールで新しいコードを発行）、その他の障害は`503`です。機能offでは`404`です。API/MCPのBearerは従来どおりFirebase ID tokenで、送信回数はコードで制限しません。
+
+## 許可元の証明（strict配置だけ、開発中）
+
+配置設定の`sourceAuthorization`で管理者がstrictを明示した配置だけ、送信APIの`POST /v2/commands`・`POST /v2/encrypted-commands`・`GET /v2/encryption-key`・`POST /v2/encryption-key/reissue`は、Bearer（本人のFirebase ID token）と利用許可に加えて、管理者が登録した許可元（source）の証明を必須にします。既定（`compatible`）では従来どおりで、下のheaderは使いません。command照会`GET /v2/commands/{id}`・取消`POST /v2/commands/{id}/cancel`は、証明を紛失した時の最小回復として従来の本人/owner条件のままです（新しい送信・鍵の取得/再発行はできません）。
+
+両方式とも`X-STTD-Source: src_<26文字>`（登録済みsource ID）を付け、次のどちらか1つだけを付けます。
+
+- **登録開発者環境**（`developer-key-v1`）: `X-STTD-Source-Signature: v1.<issuedAt>.<expiresAt>.<nonce>.<signature>`。時刻はUNIX秒、`expiresAt - issuedAt`は1〜60秒、時計の許容は±30秒。nonceはbase64url 22〜43文字で、一度通ったnonceは同じsourceで再利用できません。signatureは登録した公開鍵に対応するEd25519秘密鍵による、次の12行（LF区切り、末尾改行なし）への署名のbase64url（64byte）です: `STTD-SOURCE-SIG-V1`、送信APIの公開origin（`https://<host>`）、method、path、query（`?`を含む。無ければ空行）、source ID、wire本文のSHA-256（base64url）、`Authorization`のBearer tokenのSHA-256（base64url）、`Idempotency-Key`（無ければ`-`）、issuedAt、expiresAt、nonce。本文・宛先・本人token・Idempotency-Key・期限・nonceのどれかが違えば拒否します。algorithmは固定で、外部JWKSは使いません。
+- **許可アプリ**（`app-check-v1`）: `X-Firebase-AppCheck: <limited-use token>`。同じ配置projectのFirebase App Checkが発行し、管理者が登録したApp IDのtokenだけを受け、要求ごとにFirebase Admin SDKの`verifyToken(token, { consume: true })`で消費します。消費済み（同じ/別route）は拒否します。
+
+欠落は`403 source_required`、形違い・重複header・両方式の併記・検証失敗・replay・消費済み・停止/削除/期限切れ/操作外・別本人のsourceは`403 source_rejected`、保存やApp Checkの結果不明・障害は`503 temporarily_unavailable`です（別方式・互換へ降格しません）。欠落と形違いは本人確認・DB・鍵・配送より前に拒否します。
+
+限界: App Check tokenはbearerで、要求本文・宛先・本人tokenへ暗号学的に束縛されていません。未消費のtokenを盗まれた場合の先取り・中継・別本文への流用は防げません。成功は「その配置projectの登録App IDが発行し初めて消費したtoken」であることだけを意味し、個々のtokenがnative provider由来かdebug資格由来かは判別しません。debug資格の管理は各配置の責任です。開発者鍵はsoftware保管なら秘密鍵のコピーを防げません。
+
+この版の未実装（strictでは接続serverが起動しません）: OAuth接続承認への許可元承認の結合、Grantのsource binding、code交換/refresh/MCP/購読保存/配送確定での最新状態の照合、ローカル送信画面helperの署名。送信APIのsource照合は配送確定と同じtransactionではないため、照合の直後にsourceを停止しても、その要求の送出は止まりません。

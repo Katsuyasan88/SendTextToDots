@@ -11,6 +11,7 @@ import { KMS_REGION_PATTERN } from '../protection/kms-sealing.js';
 import { arrayItems, dataFields } from '../protection/google-sdk-call.js';
 import { createKmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
 import { isEncryptionNamespace, PAYLOAD_ENCRYPTION_MODE } from '../encryption/contract.js';
+import { parseSourceAuthorization, type SourceAuthorizationConfig } from '../source/contract.js';
 import { DEPLOYMENT_CONFIG } from './deployment.js';
 
 /** src/deployment/functions.tsのexport名（ESMの静的名）。設定のapi.functionName・api.serviceNameはこれと一致しなければならない。 */
@@ -113,6 +114,8 @@ export interface DeploymentConfig {
   };
   /** 本文暗号化（欠落は'off'）。有効時だけ専用secretの固定数値版を持つ。 */
   readonly payloadEncryption: 'off' | PayloadEncryptionConfig;
+  /** 許可元の認可（欠落は'compatible'）。strictは管理者が明示した方式だけ。 */
+  readonly sourceAuthorization: SourceAuthorizationConfig;
 }
 
 export interface PayloadEncryptionConfig {
@@ -217,7 +220,7 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
   let top: Map<string, unknown>;
   try {
     // accessPolicyは配布placeholder（未設定）の判定を先に保つため存在だけ任意で読み、設定済みの時は下で必須にする。
-    top = dataFields(raw, TOP_KEYS, ['accessPolicy', 'developerLogin', 'payloadEncryption']);
+    top = dataFields(raw, TOP_KEYS, ['accessPolicy', 'developerLogin', 'payloadEncryption', 'sourceAuthorization']);
   } catch {
     throw invalid();
   }
@@ -298,6 +301,8 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
     requireThat(web.projectId === projectId && isDnsHost(web.authDomain) && isApiKeyEnvName(web.apiKeyEnv));
 
     const payloadEncryption = parsePayloadEncryption(top.has('payloadEncryption') ? top.get('payloadEncryption') : 'off', projectNumber, ids);
+    // 省略は既存互換。strictは明示objectだけで、空・未知・重複の方式は設定error（互換へ降格しない）。
+    const sourceAuthorization = parseSourceAuthorization(top.has('sourceAuthorization') ? top.get('sourceAuthorization') : 'compatible');
 
     return deepFreeze({
       accessPolicy: ACCESS_POLICY,
@@ -322,6 +327,7 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
       secretVersions: secretVersions as unknown as DeploymentConfig['secretVersions'],
       web,
       payloadEncryption,
+      sourceAuthorization: sourceAuthorization === 'compatible' ? sourceAuthorization : { mode: sourceAuthorization.mode, methods: [...sourceAuthorization.methods] },
     });
   } catch {
     throw invalid();

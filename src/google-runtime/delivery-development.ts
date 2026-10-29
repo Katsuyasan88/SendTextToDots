@@ -48,6 +48,9 @@ import { PRODUCT_POLICY } from '../policy.js';
 import { createGoogleKmsTransport, type GoogleKmsTransport } from '../protection/google-kms-transport.js';
 import { arrayItems, dataFields, GoogleSdkPortError, isEpochMs, isRealSignal, methodOf } from '../protection/google-sdk-call.js';
 import { createHmacHasher } from '../secrets.js';
+import { createAppCheckVerifier, type AppCheckAdminLike } from '../source/app-check.js';
+import { SourceStore } from '../source/firestore.js';
+import { createSourceGate, type SourceGate } from '../source/http.js';
 import { createKmsSubscriptionPolicy, requireKmsMarker, type KmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
 import { AUTH_STORAGE_ROOT, KMS_SUBSCRIPTION_CONFIG_DOC } from '../storage/firestore/kms-subscription-format.js';
 import type { GoogleKmsConnectKmsOptions } from '../connect/google-kms-server.js';
@@ -587,6 +590,30 @@ async function startWith(config: Captured): Promise<OwnedDevelopmentDeliveryFunc
       if (developerCode === undefined) throw new DeveloperLoginError('unavailable');
       developerCode.lookup.bind(createCodeIdentityLookup(developerStore));
     }
+    // 許可元strict（配置設定で明示した時だけ）: 同じdb・hasherのsource保存と、App Check方式は同じAdmin AppのAppCheckを結ぶ。
+    // App Checkを選んだのにSDK部品が無い構成は起動失敗に閉じる（開発者方式・互換へ黙って落とさない）。
+    let sources: SourceGate | undefined;
+    const sourceAuthorization = config.deployment.sourceAuthorization;
+    if (sourceAuthorization !== 'compatible') {
+      const adminAppCheck = (sdk as unknown as { readonly appCheck?: AppCheckAdminLike }).appCheck;
+      const wantsAppCheck = sourceAuthorization.methods.includes('app-check-v1');
+      if (wantsAppCheck && adminAppCheck === undefined) {
+        code ??= 'format_mismatch';
+        throw new OwnedDevelopmentDeliveryStartupError();
+      }
+      sources = createSourceGate({
+        policy: sourceAuthorization,
+        store: new SourceStore({ db: sdk.db, namespace: config.connectNamespace, clock }),
+        hasher,
+        namespace: config.connectNamespace,
+        audience: config.deployment.api.publicOrigin,
+        clock,
+        appCheck:
+          wantsAppCheck && adminAppCheck !== undefined
+            ? createAppCheckVerifier({ appCheck: adminAppCheck, projectNumber: config.deployment.projectNumber, projectId: config.deployment.projectId })
+            : undefined,
+      });
+    }
     const transport = createGoogleKmsTransport({
       client: sdk.kmsClient,
       projectId: policy.projectId,
@@ -637,6 +664,7 @@ async function startWith(config: Captured): Promise<OwnedDevelopmentDeliveryFunc
         namespace: config.deliveryNamespace,
         ...(config.log !== undefined ? { log: config.log } : {}),
         ...(encryption !== undefined ? { encryptionKeys: encryption.endpoint, encryptedCommands: encryption.commands } : {}),
+        ...(sources !== undefined ? { sources } : {}),
       };
       owned.app = createIngressKmsRequestDeliveryFunction({ ...appOptions, ingress: config.ingress });
     } finally {

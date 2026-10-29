@@ -21,12 +21,13 @@ import type { EncryptedCommandEndpoint, ValidatedCommandDelivery } from '../encr
 import type { IdentityVerifier, VerifiedIdentity } from '../identity/firebase.js';
 import type { Clock } from '../policy.js';
 import type { SecretHasher } from '../secrets.js';
+import type { SourceGate } from '../source/http.js';
 import { createIngressOperationDeliveryRequestHandler, type DeliveryHttpIngress } from './api.js';
 import { createRequestDeliveryFunction } from './functions.js';
 import { createKmsRequestDeliveryRuntime, type KmsRequestDeliveryRuntime, type KmsRequestDeliveryRuntimeOptions } from './kms-runtime.js';
 
 const REQUIRED = ['db', 'connect', 'hasher', 'digestKey', 'kms', 'identity', 'egress', 'clock', 'namespace', 'ingress'] as const;
-const OPTIONAL = ['log', 'encryptionKeys', 'encryptedCommands'] as const;
+const OPTIONAL = ['log', 'encryptionKeys', 'encryptedCommands', 'sources'] as const;
 
 export type KmsDeliveryFunctionErrorCode = 'delivery_function_invalid' | 'delivery_function_close_failed';
 
@@ -194,6 +195,8 @@ export function createIngressKmsRequestDeliveryFunction(options: KmsRequestDeliv
       lifetime: lifetime.signal,
       ...(fields.has('encryptionKeys') ? { encryptionKeys: fields.get('encryptionKeys') as EncryptionKeyEndpoint } : {}),
       ...(fields.has('encryptedCommands') ? { encryptedCommands: encryptedCommandsOf(fields.get('encryptedCommands'), runtime) } : {}),
+      // 許可元strictの配置だけ（frozenなgate。形の検査はHTTP入口の組立てで行う）。
+      ...(fields.has('sources') ? { sources: fields.get('sources') as SourceGate } : {}),
     };
     handler = createRequestDeliveryFunction(createIngressOperationDeliveryRequestHandler({ ...apiDeps, ingress }));
   } catch {

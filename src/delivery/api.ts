@@ -22,6 +22,9 @@ import { ENCRYPTED_CONTENT_TYPE, ENCRYPTED_WIRE_MAX_BYTES, type EncryptedCommand
 import { IdentityError, type IdentityVerifier, type VerifiedIdentity } from '../identity/firebase.js';
 import { MAX_COMMAND_BODY_BYTES, type Clock } from '../policy.js';
 import { isRealSignal } from '../protection/google-sdk-call.js';
+import { idempotencyKeyOf, type SourceProof } from '../source/proof.js';
+import type { SourceAuthorizeInput, SourceDecision, SourceGate } from '../source/http.js';
+import type { SourceOperation } from '../source/contract.js';
 import { errorResponse, type DeliveryResponse } from './event.js';
 
 const BEARER_ID_TOKEN = /^Bearer ([A-Za-z0-9._-]{1,4096})$/;
@@ -104,6 +107,11 @@ export interface IngressOperationDeliveryApiDeps {
   readonly encryptionKeys?: EncryptionKeyEndpoint | undefined;
   /** 本文暗号化が有効な配置だけ: 暗号文の送信（frozenでown dataの`post`関数を持つobject）。無ければ/v2/encrypted-commandsは404。 */
   readonly encryptedCommands?: EncryptedCommandEndpoint | undefined;
+  /**
+   * 許可元strictの配置だけ（source/http.tsのfrozenなgate）: 平文/暗号文の送信・公開鍵の取得/再発行で、本人確認の前にheaderの形、
+   * 本人確認の後にsourceの証明を検査する。照会/取消は最小回復としてgateを通さない。無ければ既存互換。
+   */
+  readonly sources?: SourceGate | undefined;
 }
 
 /** depsの不正（ingress sourceが関数でない・Proxy・accessor）。固定のmessageだけ。 */
@@ -252,7 +260,26 @@ export function createIngressOperationDeliveryRequestHandler(deps: IngressOperat
   const source = descriptor.value as Function;
   const encryptionKeys = captureEncryptionKeys(deps);
   const encryptedCommands = captureEncryptedCommands(deps);
-  return buildOperationHandler(deps, () => Reflect.apply(source, undefined, []) as unknown, encryptionKeys, encryptedCommands);
+  const sources = captureSources(deps);
+  return buildOperationHandler(deps, () => Reflect.apply(source, undefined, []) as unknown, encryptionKeys, encryptedCommands, sources);
+}
+
+function captureSources(deps: object): SourceGate | undefined {
+  const inspect = capturePort(deps, 'sources', 'inspect');
+  if (inspect === undefined) return undefined;
+  const authorize = capturePort(deps, 'sources', 'authorize');
+  if (authorize === undefined) throw new DeliveryIngressConfigError();
+  return Object.freeze({
+    inspect: (headers: IncomingMessage['headers']) => inspect(headers) as ReturnType<SourceGate['inspect']>,
+    authorize: (proof: SourceProof, input: SourceAuthorizeInput) => authorize(proof, input) as Promise<SourceDecision>,
+  });
+}
+
+/** strictでsourceの証明が要る操作（照会/取消・未知routeは含めない）。 */
+function sourceOperationOf(label: string): SourceOperation | undefined {
+  if (label === 'commands.post' || label === 'encrypted_commands.post') return 'send';
+  if (label === 'encryption_key.get' || label === 'encryption_key.reissue') return 'keys';
+  return undefined;
 }
 
 /** 任意のport（欠落/undefinedは無効）。own dataのfrozen objectで、own dataのmethod関数だけを捕捉する（Proxy・accessorは拒否）。 */
@@ -326,6 +353,7 @@ function buildOperationHandler(
   ingress: () => unknown,
   encryptionKeys: EncryptionKeyEndpoint | undefined,
   encryptedCommands: EncryptedCommandEndpoint | undefined,
+  sources: SourceGate | undefined,
 ): (req: DeliveryRequest, res: ServerResponse) => Promise<void> {
   const { identity, findOwner, service, clock, lifetime } = deps;
   const log = (entry: Record<string, unknown>) => {
@@ -429,7 +457,7 @@ function buildOperationHandler(
         return;
       }
       try {
-        response = await handleWith(req, label, match, read.body, receivedAt, operation, live);
+        response = await handleWith(req, label, match, read.body, receivedAt, operation, live, { method, path, search });
       } finally {
         // 自分で読んだ本文だけを0で上書きする（frameworkのrawBodyには触れない）。
         if (read.owned) read.body.fill(0);
@@ -462,34 +490,82 @@ function buildOperationHandler(
     receivedAt: number,
     operation: DeliveryRequestOperation,
     live: () => boolean,
+    target: { readonly method: string; readonly path: string; readonly search: string },
   ): Promise<DeliveryResponse> {
     if (label === 'commands.post') {
       if (!isJson(req) || body.length < 1) return errorResponse(400, 'invalid_request');
     } else if (label !== 'encrypted_commands.post' && label !== 'encryption_key.reissue' && body.length > 0) {
       return errorResponse(400, 'invalid_request');
     }
+    if (label === 'encrypted_commands.post') {
+      const type = header(req, 'content-type');
+      if (type === undefined || !ENCRYPTED_CONTENT_TYPE.test(type.trim()) || body.length < 1) return errorResponse(400, 'invalid_encrypted_request');
+    }
+    let reissue: ReissueRequest | null = null;
     if (label === 'encryption_key.reissue') {
       // 本文の形・Idempotency-Keyとの一致は、本人確認・DBより前に確かめる。
-      const request = isJson(req) ? parseReissueBody(body, header(req, 'idempotency-key')) : null;
-      if (request === null) return errorResponse(400, 'invalid_request');
+      reissue = isJson(req) ? parseReissueBody(body, header(req, 'idempotency-key')) : null;
+      if (reissue === null) return errorResponse(400, 'invalid_request');
+    }
+    // strict: 証明headerの欠落・形違いは本人確認・DB・鍵・serviceの前に拒否する（照会/取消は対象外）。
+    const sourceOperation = sources === undefined ? undefined : sourceOperationOf(label);
+    let proof: SourceProof | undefined;
+    if (sources !== undefined && sourceOperation !== undefined) {
+      const inspected = sources.inspect(req.headers);
+      if (inspected.kind === 'denied') {
+        log({ event: 'source.rejected', code: inspected.code });
+        return errorResponse(403, inspected.code);
+      }
+      proof = inspected.proof;
+    }
+    const sourceCheck = async (verified: VerifiedIdentity): Promise<DeliveryResponse | undefined> => {
+      if (sources === undefined || sourceOperation === undefined || proof === undefined) return undefined;
+      const bearer = BEARER_ID_TOKEN.exec(header(req, 'authorization') ?? '')?.[1];
+      const idempotencyKey = idempotencyKeyOf(req.headers);
+      if (bearer === undefined || idempotencyKey === null) return errorResponse(403, 'source_rejected');
+      if (!live()) return unavailable();
+      const proofTaken = proof;
+      let decision: SourceDecision | typeof STOPPED;
+      try {
+        decision = await untilStopped(
+          () => sources.authorize(proofTaken, { identity: verified, operation: sourceOperation, ...target, body, bearer, idempotencyKey }),
+          operation.signal,
+        );
+      } catch {
+        return unavailable();
+      }
+      if (decision === STOPPED || !live()) return unavailable();
+      if (decision.kind === 'unavailable') return unavailable();
+      if (decision.kind === 'denied') {
+        log({ event: 'source.rejected', code: decision.code, reason: decision.reason });
+        return errorResponse(403, decision.code);
+      }
+      return undefined;
+    };
+    if (label === 'encryption_key.reissue' && reissue !== null) {
+      const request = reissue;
       const verified = await verifiedWith(req, operation, live);
       if (!('uid' in verified)) return verified;
+      const rejectedBySource = await sourceCheck(verified);
+      if (rejectedBySource !== undefined) return rejectedBySource;
       return adopted(() => encryptionKeys!.reissue(verified, request, operation), operation, live);
     }
     if (label === 'encryption_key.get') {
       const verified = await verifiedWith(req, operation, live);
       if (!('uid' in verified)) return verified;
+      const rejectedBySource = await sourceCheck(verified);
+      if (rejectedBySource !== undefined) return rejectedBySource;
       return adopted(() => encryptionKeys!.get(verified, operation), operation, live);
     }
     if (label === 'encrypted_commands.post') {
-      const type = header(req, 'content-type');
-      if (type === undefined || !ENCRYPTED_CONTENT_TYPE.test(type.trim()) || body.length < 1) return errorResponse(400, 'invalid_encrypted_request');
       const verified = await verifiedWith(req, operation, live);
       if (!('uid' in verified)) return verified;
+      const rejectedBySource = await sourceCheck(verified);
+      if (rejectedBySource !== undefined) return rejectedBySource;
       const key = header(req, 'idempotency-key');
       return adopted(() => encryptedCommands!.post(verified, key, body, receivedAt, operation), operation, live);
     }
-    const resolved = await ownerWith(req, operation, live);
+    const resolved = await ownerWith(req, operation, live, label === 'commands.post' ? sourceCheck : undefined);
     if (typeof resolved !== 'string') return resolved;
     if (!live()) return unavailable();
     if (label === 'commands.post') {
@@ -530,7 +606,12 @@ function buildOperationHandler(
     return verified;
   }
 
-  async function ownerWith(req: IncomingMessage, operation: DeliveryRequestOperation, live: () => boolean): Promise<string | DeliveryResponse> {
+  async function ownerWith(
+    req: IncomingMessage,
+    operation: DeliveryRequestOperation,
+    live: () => boolean,
+    sourceCheck?: (verified: VerifiedIdentity) => Promise<DeliveryResponse | undefined>,
+  ): Promise<string | DeliveryResponse> {
     const match = BEARER_ID_TOKEN.exec(header(req, 'authorization') ?? '');
     if (!match) return errorResponse(401, 'authentication_required');
     if (!live()) return unavailable();
@@ -546,6 +627,11 @@ function buildOperationHandler(
     // 遅い本人確認の結果（成功・非成功）は採用せず、owner照会・serviceを始めない。
     if (verified === STOPPED || !live()) return unavailable();
     const verifiedIdentity: VerifiedIdentity = verified;
+    // strictの送信: owner照会・serviceの前にsourceを検査する（照会/取消はsourceCheckなし）。
+    if (sourceCheck !== undefined) {
+      const rejectedBySource = await sourceCheck(verifiedIdentity);
+      if (rejectedBySource !== undefined) return rejectedBySource;
+    }
     let ownerId: string | undefined | typeof STOPPED;
     try {
       ownerId = await untilStopped(() => findOwner(verifiedIdentity), operation.signal);

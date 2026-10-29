@@ -41,8 +41,11 @@ const gax = requireCjs('google-gax') as typeof import('google-gax');
 const firestoreModule = requireCjs('@google-cloud/firestore') as typeof import('@google-cloud/firestore');
 const kmsModule = requireCjs('@google-cloud/kms') as typeof import('@google-cloud/kms');
 const secretModule = requireCjs('@google-cloud/secret-manager') as typeof import('@google-cloud/secret-manager');
+import type { AppCheckAdminLike } from '../source/app-check.js';
+
 const adminAppModule = requireCjs('firebase-admin/app') as typeof import('firebase-admin/app');
 const adminAuthModule = requireCjs('firebase-admin/auth') as typeof import('firebase-admin/auth');
+const adminAppCheckModule = requireCjs('firebase-admin/app-check') as typeof import('firebase-admin/app-check');
 
 const UNIVERSE_DOMAIN = 'googleapis.com';
 const CLOUD_PLATFORM_SCOPE = 'https://www.googleapis.com/auth/cloud-platform';
@@ -454,6 +457,20 @@ export async function openDevelopmentGoogleSdk(options: DevelopmentGoogleSdkOpti
     const ownApp = adminAppModule.initializeApp({ projectId: PROJECT_ID, credential }, `${ADMIN_APP_PREFIX}${randomUUID()}`);
     app = ownApp;
     const ownAuth = adminAuthModule.getAuth(ownApp) as unknown as AdminAuthLike & CodeAuthAdmin;
+    // 許可元のApp Check方式（strictで有効化した配置だけが使う）。同じ専有named AppのAppCheckを最初の検証時に1回だけ取得する
+    // （起動時のSDK呼出しを増やさない。verifyTokenのconsumeはSDKが外部APIを呼ぶ）。close後は呼ばない。
+    let adminAppCheck: AppCheckAdminLike | undefined;
+    const ownAppCheck: AppCheckAdminLike = Object.freeze({
+      verifyToken: (appCheckToken: string, options?: { consume?: boolean }) => {
+        if (closed) return Promise.reject(fail('closed'));
+        try {
+          adminAppCheck ??= adminAppCheckModule.getAppCheck(ownApp) as unknown as AppCheckAdminLike;
+          return adminAppCheck.verifyToken(appCheckToken, options);
+        } catch {
+          return Promise.reject(fail('unavailable'));
+        }
+      },
+    });
     // 開発者向けコードの照合は、起動口が秘密を読んだ後に同じ配置の保存層を結ぶ（未結合＝機能off。customのID tokenを受けない）。
     const codeIdentities = createLateCodeIdentityCheck();
     const identity = createFirebaseAdminVerifier({ auth: ownAuth, projectId: PROJECT_ID, codeIdentities });
@@ -497,7 +514,7 @@ export async function openDevelopmentGoogleSdk(options: DevelopmentGoogleSdkOpti
     stopWaiting = null;
     // ready後は起動operationを監視しない（以後の終了はcallerのclose）。
     signal.removeEventListener('abort', onAbort);
-    return Object.freeze({ db: ownDb, kmsClient: ownKms, secretClient: ownSecrets, identity, developerCode, close });
+    return Object.freeze({ db: ownDb, kmsClient: ownKms, secretClient: ownSecrets, identity, developerCode, appCheck: ownAppCheck, close });
   } catch (error) {
     clearTimeout(initTimer);
     stopWaiting = null;

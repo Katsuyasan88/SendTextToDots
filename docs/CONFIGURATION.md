@@ -137,3 +137,15 @@ operator modeの設定ファイル（例: `operator.local.json`、commitしな�
 helperは既定のADCで動き、custom tokenの署名はFirebase Adminの`serviceAccountId`へ渡した`signingServiceAccount`だけを使います（ADCやmetadata serverから署名先を推測しません。自分のGoogleユーザーのADCにはservice accountのemailが無いためです）。helperを動かす資格に、そのservice accountへの`iam.serviceAccounts.signBlob`（例: Service Account Token Creator）が必要です。service accountの鍵JSONは配布しないでください。
 
 初期値（小規模な自己配置向け）: コード10分・予約は発行から24時間以上、発行候補20個・DB transaction最大5回・全体15秒。同時有効コードはnamespace 5・発行元1、発行は発行元3回/時・namespace 20回/時、入力はinteraction 5回・送信元5回・namespace全体の失敗5回/10分。onにする配置では、接続serverのservice accountにFirebaseユーザー作成とcustom token署名の権限が要ります（送信APIは照合の読取りだけ）。operator helperの資格もユーザー情報の署名・該当collectionの読み書き・identifierKeyの読取りに限ってください。TTLを使う場合は`developerLoginCodeReservations.deleteAfter`等へ配置側で設定します（認証期限の判定にはTTLを使いません）。
+
+## 許可元の認可（既定compatible、開発中）
+
+`sourceAuthorization`は省略または`'compatible'`で既存互換です。strictは`{ mode: 'strict-v1', methods: ['developer-key-v1', 'app-check-v1'] }`のように、使う方式（1〜2個）を管理者が明示します。空・未知・重複の方式、未知のkeyは設定errorで、互換へ降格しません。wireの形は[API](API.md)「許可元の証明」。この版ではstrictの接続serverは起動しません（接続承認・Grantへの結合が未実装のため）。
+
+許可元は管理CLIで登録します（標準入力の1行JSON。UID・公開鍵をargvへ書かない）:
+
+- `node scripts/manage-sources.mjs register-app --project … --database … --namespace …` に`{"appId":"1:<projectNumber>:ios:…","operations":["send"]}`。App IDは同じ配置projectのものだけです。
+- `register-developer`に`{"uid":"…","publicKey":"<Ed25519公開鍵のPEMまたはraw base64url>","operations":["send","keys"],"expiresAt":"<ISO時刻>"}`。期限は必須で、無期限は`"never"`を明示した時だけです。秘密鍵はCLIへ渡さず、作成・登録もしません。秘密鍵はその端末だけに置き、Git・配布物・browser・URL・CLI引数・ログへ入れないでください。
+- `status`／`disable`／`enable`／`delete`は`--source <src_…>`、変更は`--expect <statusの版>`が必要です。停止→有効化は新しい世代になり、停止前の承認・Grantは戻りません。削除は墓標を残し、同じIDは再利用されません。
+
+操作（`operations`）は`send`（平文/暗号文の送信）・`keys`（公開鍵の取得/再発行）・`connect`（接続承認）です。保存先は`sttdConnect/{connectNamespace}/sources`・`sourceReplay`・`sourceApprovals`で、replay・承認は鍵付きhashの文書IDと期限だけを持ちます。掃除にTTLを使う場合は`sourceReplay.deleteAfter`・`sourceApprovals.deleteAfter`（最後の期限から24時間）へ配置側で設定します（期限の判定にはTTLを使いません）。App Check方式は、送信APIのservice accountにApp Check tokenの消費（Firebase App Check API）の権限と追加の通信が要り、SDKのconsume機能はbetaです。各Forkの管理者が自分のproject/appでApp Checkを設定してください。

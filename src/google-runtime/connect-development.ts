@@ -320,6 +320,12 @@ export async function startOwnedDevelopmentConnectServer(options: OwnedDevelopme
   let failure = 'startup' as 'config' | 'startup' | 'close';
   try {
     if (!live()) throw new OwnedDevelopmentConnectStartupError();
+    // 許可元strict: 接続承認・Grant binding・code交換/refresh/MCPの照合はこの版の接続serverに未実装のため、strictでは起動しない
+    // （SDK・秘密・DB・listenの前に設定errorで閉じる。互換方式へ黙って降格しない）。
+    if (config.deployment.sourceAuthorization !== 'compatible') {
+      failure = 'config';
+      throw new OwnedDevelopmentConnectStartupError();
+    }
     try {
       sdk = await openDevelopmentGoogleSdk({
         projectId: config.deployment.projectId,
