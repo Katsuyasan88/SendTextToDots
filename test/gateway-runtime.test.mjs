@@ -29,7 +29,17 @@ const GATEWAY_ENV = Object.freeze({
 });
 const copy = isolatedDist(GATEWAY_CONFIG);
 
+/** 公開SDK境界の代替は1組だけ（SDK factoryは読込み時に束縛するため、API/MCP backendの正規起動で共有）。 */
+let sdkInstalled;
+const sdkDocs = new Map();
+function sdkSubstitutes(config, docs) {
+  for (const [path, value] of docs ?? []) sdkDocs.set(path, value);
+  sdkInstalled ??= installGoogleSdkSubstitutes({ resolveFrom: copy.url('google-runtime/development.js'), secretVersions: config.secretVersions, docs: sdkDocs });
+  return sdkInstalled;
+}
+
 after(async () => {
+  sdkInstalled?.restore();
   copy.cleanup();
   await closeAll();
   assert.ok(listenerCount() <= 20);
@@ -320,7 +330,7 @@ test('backend API entry: 実owned bootstrap・実Google SDK factoryを公開SDK�
   for (const name of ['connect/firestore.js', 'connect/kms-port.js', 'connect/kms-server.js', 'connect/google-kms-server.js', 'delivery/kms-functions.js', 'delivery/kms-store.js', 'egress/product.js', 'keys/google-secret-reader.js', 'oauth/request-auth-runtime.js', 'protection/google-kms-transport.js', 'identity/firebase.js']) {
     await import(copy.url(name));
   }
-  const sdk = installGoogleSdkSubstitutes({ resolveFrom: copy.url('google-runtime/development.js'), secretVersions: config.secretVersions, docs });
+  const sdk = sdkSubstitutes(config, docs);
   const entry = await import(copy.url('deployment/backend-api.js', '?ok'));
   const backendName = config.topology.api.backendServiceName;
   try {
@@ -334,7 +344,7 @@ test('backend API entry: 実owned bootstrap・実Google SDK factoryを公開SDK�
       // gateway形（transport Host・絶対期限）の未認証要求は、実handlerの既存401。
       const res = await request(port, { method: 'POST', path: '/v2/commands', headers: { Host: transportHost, 'X-STTD-Gateway-Deadline': String(Date.now() + 10_000), 'Content-Type': 'application/json' }, body: '{}' });
       assert.equal(res.status, 401, res.body);
-      assert.deepEqual(sdk.reads.sort(), ['commandDigestKey', 'identifierKey']);
+      assert.deepEqual([...sdk.reads].sort(), ['commandDigestKey', 'identifierKey']);
       assert.ok(sdk.events.includes('sdk.firestore') && sdk.events.includes('sdk.initializeApp'));
       await handle.close();
       for (const event of ['sdk.terminate', 'sdk.kms.close', 'sdk.secrets.close', 'sdk.deleteApp']) assert.ok(sdk.events.includes(event), event);
@@ -342,8 +352,41 @@ test('backend API entry: 実owned bootstrap・実Google SDK factoryを公開SDK�
       assert.equal(counts.external, 0);
     });
   } finally {
-    sdk.restore();
+    // 代替はbackend MCPの正規起動と共有し、after()で戻す。
   }
+});
+
+test('backend MCP entry: 実owned bootstrap・実Google SDK factory・合成のMCP鍵束で正規起動し、公開issuerのdiscoveryとcloseまで', async () => {
+  const config = validateDeploymentConfig(GATEWAY_CONFIG);
+  const sdk = sdkSubstitutes(config);
+  const entry = await import(copy.url('deployment/backend-connect.js', '?ok'));
+  const backendName = config.topology.connect.backendServiceName;
+  const readsBefore = sdk.reads.length;
+  const eventsBefore = sdk.events.length;
+  await guarded({ PORT: '18086', K_SERVICE: backendName, K_REVISION: `${backendName}-00001-abc`, K_CONFIGURATION: backendName, [config.web.apiKeyEnv]: 'synthetic-web-key' }, async (counts) => {
+    const handle = await entry.runBackendConnect();
+    assert.equal(counts.listened.length, 1);
+    const port = counts.listened[0].address().port;
+    const transportHost = new URL(config.topology.connect.backendOrigin).host;
+    const publicHost = new URL(config.connect.publicOrigin).host;
+    // 公開Hostでの直行はadapterで400（transport authority不一致）。
+    assert.equal((await request(port, { path: '/.well-known/oauth-authorization-server', headers: { Host: publicHost } })).status, 400);
+    // gateway形（transport Host・絶対期限）は実Providerのdiscoveryで、issuerは公開origin、backend名は出ない。
+    const discovery = await request(port, { path: '/.well-known/oauth-authorization-server', headers: { Host: transportHost, 'X-STTD-Gateway-Deadline': String(Date.now() + 10_000) } });
+    assert.equal(discovery.status, 200, discovery.body);
+    assert.equal(JSON.parse(discovery.body).issuer, config.connect.publicOrigin);
+    assert.ok(!discovery.body.includes(transportHost));
+    const resource = await request(port, { path: '/.well-known/oauth-protected-resource/mcp', headers: { Host: transportHost, 'X-STTD-Gateway-Deadline': String(Date.now() + 10_000) } });
+    assert.equal(resource.status, 200, resource.body);
+    assert.equal(JSON.parse(resource.body).resource, `${config.connect.publicOrigin}/mcp`);
+    // 起動はMCP鍵束（jwks・cookieKeys・identifierKey）を読み、command digest鍵は読まない。
+    assert.deepEqual(sdk.reads.slice(readsBefore).sort(), ['cookieKeys', 'identifierKey', 'jwks']);
+    await handle.close();
+    const closed = sdk.events.slice(eventsBefore);
+    for (const event of ['sdk.terminate', 'sdk.kms.close', 'sdk.secrets.close', 'sdk.deleteApp']) assert.ok(closed.includes(event), event);
+    assert.equal(counts.listened[0].listening, false);
+    assert.equal(counts.external, 0);
+  });
 });
 
 test('MCP gateway entry: 実runで待受し、未知route・Host偽装は転送前に拒否。K_SERVICE不一致は起動拒否（listen 0）', async () => {

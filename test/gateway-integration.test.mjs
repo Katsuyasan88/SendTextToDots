@@ -497,7 +497,7 @@ test('MCP: gateway経由で元の公開URLのcode交換（PKCE・private_key_jwt
   assert.match(tools.body, /"tools"/);
   // 購読保存: 実registration runtime/storeが合成callback challengeを確認して保存する（実HTTP 0）。
   const subscribe = (token, id) =>
-    mcpCall(token, id, 'events/subscribe', { name: 'text.submitted', arguments: {}, delivery: { mode: 'webhook', url: `https://hooks.sttd-gateway.example/${randomBytes(6).toString('hex')}`, secret: `whsec_${randomBytes(32).toString('base64')}` } });
+    mcpCall(token, id, 'events/subscribe', { name: 'text.submitted', delivery: { mode: 'webhook', url: `https://hooks.sttd-gateway.example/${randomBytes(6).toString('hex')}`, secret: `whsec_${randomBytes(32).toString('base64')}` } });
   const subscriptions = () => [...rt.docs.keys()].filter((path) => path.startsWith(`sttdAuth/${rt.SUB_NS}/subscriptions/`));
   const challengesBefore = rt.challenges.length;
   const saved = await subscribe(rotated.access_token, 3);

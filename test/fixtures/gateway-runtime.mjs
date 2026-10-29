@@ -4,7 +4,7 @@
 //   - listen: 所有の127.0.0.1/ephemeral listenerだけ（各runの上限LISTENER_LIMIT。closeAllで必ず閉じる）。
 //   - isolatedDist: build済みdistの.jsだけを所有の一時directoryへ写し、配置設定moduleだけを合成のgateway-v1配置へ置き換える。
 
-import { randomBytes, randomUUID } from 'node:crypto';
+import { generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
 import { cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import Module from 'node:module';
@@ -200,6 +200,10 @@ export function installGoogleSdkSubstitutes({ resolveFrom, secretVersions, docs 
     runTransaction() {
       throw new Error('transactions are not used in this unit');
     }
+    /** 接続serverが起動時に存在だけを要求する公開method（この試験の起動・discoveryでは呼ばれない）。 */
+    batch() {
+      throw new Error('batches are not used in this unit');
+    }
     terminate() {
       events.push('sdk.terminate');
       return Promise.resolve();
@@ -221,7 +225,15 @@ export function installGoogleSdkSubstitutes({ resolveFrom, secretVersions, docs 
         return client;
       }
     };
-  const payloads = { identifierKey: randomBytes(32), commandDigestKey: randomBytes(32), cookieKeys: randomBytes(32), jwks: randomBytes(32) };
+  // 用途ごとの合成secret（keys/google-connect-secrets.tsの形式）: identifier/command digestはraw 32byte、cookieKeysは32byte鍵の連結、
+  // jwksは秘密ES256/RS256の2鍵のJSON（MCPのOAuth署名鍵束。APIの32byte鍵を流用しない）。
+  const privateJwk = (type, options, alg) => ({ ...generateKeyPairSync(type, options).privateKey.export({ format: 'jwk' }), alg, use: 'sig', kid: randomUUID() });
+  const payloads = {
+    identifierKey: randomBytes(32),
+    commandDigestKey: randomBytes(32),
+    cookieKeys: randomBytes(64),
+    jwks: Buffer.from(JSON.stringify({ keys: [privateJwk('ec', { namedCurve: 'P-256' }, 'ES256'), privateJwk('rsa', { modulusLength: 2048 }, 'RS256')] }), 'utf8'),
+  };
   const purposeOf = (name) => Object.keys(secretVersions).find((purpose) => secretVersions[purpose] === name);
   const FakeKms = gapic('kms', [['iamClient', 'iamPolicyStub'], ['locationsClient', 'locationsStub'], ['operationsClient', 'operationsStub']], () => ({
     encrypt: () => gaxPromise(() => Promise.reject(new Error('unused'))),
