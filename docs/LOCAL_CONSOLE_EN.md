@@ -2,6 +2,8 @@
 
 English | [日本語](LOCAL_CONSOLE.md)
 
+This screen sends plaintext only, through `POST /v2/commands`; it has no screen for sending encrypted text, fetching the public key or reissuing the key. Those are separate [APIs](API_EN.md#encryption-key): the client on your own device encrypts the text, and SendTextToDots decrypts it for delivery (this is not end-to-end encryption). Stopping the helper with Ctrl+C stops only this screen on your computer; the Cloud services remain available and the Dots subscription stays. Use "Disconnect" in step 2 to revoke the authorization and subscription; stopping the Cloud services is your own operation.
+
 The send screen is not served by Cloud Run. A small helper running on your own computer serves it at `http://localhost:8765/console`. Opening the page, reloading it, switching the language, and showing or copying the fixed instructions never contact Cloud Run, the send API or Firebase. Requests leave the page only when you press a button, and the Firebase authentication library is loaded only when you press "Sign in with Apple" in step 1.
 
 ## What you need
@@ -68,8 +70,6 @@ When the helper itself refuses a request before calling upstream (a nonce mismat
 
 - Behaviour in third-party environments and real browsers is unverified beyond the synthetic tests ([LIMITATIONS](LIMITATIONS_EN.md)).
 - The helper is a development aid on your own computer; it adds no authentication or secret handling and does not change Cloud settings or start or stop services.
-- This screen sends plaintext only, through `POST /v2/commands`. It has no screen for sending encrypted text, fetching the public key or reissuing the key. Those are separate [APIs](API_EN.md#encryption-key): the client on your own device encrypts the text, and SendTextToDots decrypts it for delivery (this is not end-to-end encryption).
-- Stopping the helper with Ctrl+C stops only this screen on your computer. The Cloud services keep running and the Dots subscription stays. Use "Disconnect" in step 2 to revoke the authorization and subscription; stopping the Cloud services is your own operation.
 
 ## Connecting with a developer 6-digit code (operator mode)
 
