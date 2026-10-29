@@ -320,12 +320,6 @@ export async function startOwnedDevelopmentConnectServer(options: OwnedDevelopme
   let failure = 'startup' as 'config' | 'startup' | 'close';
   try {
     if (!live()) throw new OwnedDevelopmentConnectStartupError();
-    // 許可元strict: 接続承認・Grant binding・code交換/refresh/MCPの照合はこの版の接続serverに未実装のため、strictでは起動しない
-    // （SDK・秘密・DB・listenの前に設定errorで閉じる。互換方式へ黙って降格しない）。
-    if (config.deployment.sourceAuthorization !== 'compatible') {
-      failure = 'config';
-      throw new OwnedDevelopmentConnectStartupError();
-    }
     try {
       sdk = await openDevelopmentGoogleSdk({
         projectId: config.deployment.projectId,
@@ -368,6 +362,18 @@ export async function startOwnedDevelopmentConnectServer(options: OwnedDevelopme
               }
             : {}),
           startupOperation: operation,
+          // 許可元strict（配置設定で明示した時だけ）。App Check方式は同じ所有Admin AppのAppCheck（初回検証時に取得）を渡す。
+          ...(config.deployment.sourceAuthorization !== 'compatible'
+            ? {
+                sourceAuthorization: {
+                  policy: config.deployment.sourceAuthorization,
+                  projectNumber: config.deployment.projectNumber,
+                  ...((ownedSdk as unknown as { readonly appCheck?: unknown }).appCheck !== undefined
+                    ? { appCheck: (ownedSdk as unknown as { readonly appCheck: unknown }).appCheck }
+                    : {}),
+                },
+              }
+            : {}),
         },
         kms: {
           environment: 'development',

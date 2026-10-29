@@ -52,7 +52,7 @@ export async function main(argv, io) {
     try {
       const result = await admin.runSourceAdmin(request, input, opened.deps);
       io.stdout.write(admin.formatSourceAdminResult(result));
-      return ['status', 'created', 'changed'].includes(result.code) ? 0 : result.code === 'conflict' ? 3 : 1;
+      return ['status', 'created', 'changed', 'deleted'].includes(result.code) ? 0 : result.code === 'conflict' ? 3 : 1;
     } finally {
       await opened.close().catch(() => {});
     }

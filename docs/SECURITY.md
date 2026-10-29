@@ -89,3 +89,9 @@ callbackの検証・配送・CIMD取得は共通の送出部品を使います�
 - API/MCPは共通の本人確認で、custom providerであることだけでは受理せず、認証marker・専用UID・保存identityのstate/family・利用許可の世代を確かめます。再発行・取消はそのfamilyだけを失効させ、Appleや別コンソールへ波及しません。
 - 6桁だけではコンソール用の資格や再発行権を得られません（発行元helperのメモリにある32byteの照会secretが必要）。
 - Firebaseの作成/署名の失敗・応答消失・期限超過でコードを未使用へ戻しません。期限後に遅れて確定した接続は失効させます。
+
+## 許可元の認可（strict配置、開発中）
+
+管理者が`sourceAuthorization`でstrictを明示した配置では、本人のFirebase認証・利用許可に加えて、登録した許可元（アプリのFirebase App Check、または開発者環境のEd25519要求署名）を送信・鍵の取得/再発行・接続承認で要求します。Grantには承認したsourceのID/世代を結び、code交換・refresh・MCP・購読保存・送出確定で現在の状態を照合します。停止・削除・再有効化（新世代）では旧Grantは使えず、新しい承認でだけ回復します。照会/取消・接続状態/解除は従来の本人/owner条件のままです。詳細は[API](API.md)「許可元の証明」。
+
+限界: App Check tokenはbearerで、本文・宛先・本人tokenに束縛されません。未消費tokenの盗用による先取り・中継・別本文への流用は防げず、native provider由来かdebug資格由来かも判別しません。開発者鍵はsoftware保管なら秘密鍵のコピーを防げません。送出を確定した後のHTTP送信は撤回できません。完全な濫用防止・費用ゼロは保証しません。

@@ -221,6 +221,11 @@ interface PlanRecord {
 interface AccessSnapshots {
   readonly access: DocumentSnapshot;
   readonly meta: DocumentSnapshot;
+  /** 許可元strictだけ: 要求GrantのsourceのbindingとsourceのRAWなsnapshot（判定は全readの後）。 */
+  readonly source?: {
+    readonly binding: { readonly exists: boolean; readonly data: unknown };
+    readonly record: { readonly exists: boolean; readonly id: string; readonly data: unknown } | null;
+  };
 }
 
 interface ProvenGrant {
@@ -251,6 +256,11 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
   const accessDocRefForOwner = methodOf(connectTarget, 'accessDocRefForOwner');
   const grantMetaDocRef = methodOf(connectTarget, 'grantMetaDocRef');
   const grantUseDecision = methodOf(connectTarget, 'grantUseDecision');
+  // 許可元strict（接続保存にsourceを結んだ配置）だけ: 購読保存の最終transactionでGrantのsource binding・sourceを照合する。
+  const strictSources = (connectTarget as { readonly sourcesEnabled?: unknown }).sourcesEnabled === true;
+  const grantSourceDocRefByHash = strictSources ? methodOf(connectTarget, 'grantSourceDocRefByHash') : undefined;
+  const grantSourceRecordRef = strictSources ? methodOf(connectTarget, 'grantSourceRecordRef') : undefined;
+  const grantSourceDecision = strictSources ? methodOf(connectTarget, 'grantSourceDecision') : undefined;
 
   const connectNamespace = fields.get('connectNamespace');
   if (!isConnectNamespace(connectNamespace)) fail();
@@ -410,7 +420,11 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
    * 接続保存の参照は、借用した同じinstance・同じt256 namespaceの決まったpathだけを使う（別instanceは同じproject文字列でも、
    * そのrefを使うI/Oの前に拒否）。実target・IAMの証明とはしない。
    */
-  function ownConnectRef(make: () => unknown, collection: 'owners' | 'oidc' | 'access' | 'grantMeta', accept: (id: string) => boolean): DocumentReference {
+  function ownConnectRef(
+    make: () => unknown,
+    collection: 'owners' | 'oidc' | 'access' | 'grantMeta' | 'sourceGrants' | 'sources',
+    accept: (id: string) => boolean,
+  ): DocumentReference {
     let ref: unknown;
     let firestore: unknown;
     let path: unknown;
@@ -463,7 +477,26 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
    */
   async function readAccess(tx: Transaction, operation: Captured, owner: DocumentSnapshot, metaRef: DocumentReference): Promise<AccessSnapshots> {
     const [access, meta] = (await read(tx, operation, [accessRefOf(owner), metaRef])) as [DocumentSnapshot, DocumentSnapshot];
-    return { access, meta };
+    if (grantSourceDocRefByHash === undefined || grantSourceRecordRef === undefined) return { access, meta };
+    // grantMetaの文書IDはGrantの鍵付きhash。同じhashのbinding記録と、その指すsourceを同じtransactionで読む。
+    let bindingRef: DocumentReference;
+    try {
+      bindingRef = ownConnectRef(() => grantSourceDocRefByHash(metaRef.id), 'sourceGrants', (id) => HEX_DOC_ID.test(id));
+    } catch {
+      throw registrationError('unavailable');
+    }
+    const [bindingSnapshot] = (await read(tx, operation, [bindingRef])) as [DocumentSnapshot];
+    const binding = { exists: bindingSnapshot.exists, data: bindingSnapshot.exists ? bindingSnapshot.data() : undefined };
+    let sourceRef: DocumentReference | null;
+    try {
+      const made = grantSourceRecordRef(binding);
+      sourceRef = made === null ? null : ownConnectRef(() => made, 'sources', (id) => /^src_[a-z2-7]{26}$/.test(id));
+    } catch {
+      throw registrationError('unavailable');
+    }
+    const sourceSnapshot = sourceRef === null ? null : ((await read(tx, operation, [sourceRef])) as [DocumentSnapshot])[0];
+    const record = sourceSnapshot === null ? null : { exists: sourceSnapshot.exists, id: sourceSnapshot.id, data: sourceSnapshot.exists ? sourceSnapshot.data() : undefined };
+    return { access, meta, source: { binding, record } };
   }
 
   /**
@@ -478,6 +511,13 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
     );
     if (decision === 'denied') throw registrationError('grant_inactive');
     if (decision !== 'allowed') throw registrationError('unavailable');
+    // 許可元strict: 旧（unbound）Grant・停止/削除/世代違いのsourceでは購読を保存しない。時刻は全readの後（この判定の時点）。
+    if (grantSourceDecision !== undefined) {
+      if (snapshots.source === undefined) throw registrationError('unavailable');
+      const sourceDecision = grantSourceDecision(snapshots.source.binding, snapshots.source.record, now());
+      if (sourceDecision === 'denied') throw registrationError('grant_inactive');
+      if (sourceDecision !== 'allowed') throw registrationError('unavailable');
+    }
     const grantReceiver = grantReceiverGenerationOf(snapshots.meta.data());
     let ownerReceiver: number;
     try {

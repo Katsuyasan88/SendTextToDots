@@ -81,7 +81,8 @@ test('登録record: exact schemaだけを受け、不正は修復せず拒否す
   assert.equal(parseSourceRecord(developer(), ID).kind, 'developer');
   assert.equal(parseSourceRecord(developer({ expiresAt: null }), ID).expiresAt, null);
   assert.equal(parseSourceRecord(app(), ID).kind, 'app');
-  assert.equal(parseSourceRecord({ schemaVersion: 1, sourceId: ID, kind: 'deleted', deletedAt: 5 }, ID).kind, 'deleted');
+  // 削除は物理削除で、墓標の形は保存されない（あれば不正として拒否）。
+  assert.throws(() => parseSourceRecord({ schemaVersion: 1, sourceId: ID, kind: 'deleted', deletedAt: 5 }, ID), SourceContractError);
   const bad = [
     developer({ sourceId: 'src_bbbbbbbbbbbbbbbbbbbbbbbbbb' }),
     developer({ extra: 1 }),
@@ -109,7 +110,6 @@ test('要求の判定: 不存在・墓標・停止・期限・操作外・方式
   };
   assert.equal(reason(developer()), 'usable');
   assert.equal(reason(null), 'missing');
-  assert.equal(reason({ schemaVersion: 1, sourceId: ID, kind: 'deleted', deletedAt: 5 }), 'deleted');
   assert.equal(reason(developer({ state: 'disabled' })), 'disabled');
   assert.equal(reason(developer(), { now: 2_000 }), 'expired');
   assert.equal(reason(developer({ expiresAt: null }), { now: 9_999_999 }), 'usable');

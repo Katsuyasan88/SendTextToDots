@@ -8,7 +8,9 @@ import { connectIdentityHash } from '../connect/firestore.js';
 import type { VerifiedIdentity } from '../identity/firebase.js';
 import type { SecretHasher } from '../secrets.js';
 import type { AppCheckVerifier } from './app-check.js';
-import type { SourceOperation, StrictSourcePolicy } from './contract.js';
+import type { Transaction } from '@google-cloud/firestore';
+
+import { sourceRequestBindingVerdict, type SourceBinding, type SourceOperation, type StrictSourcePolicy } from './contract.js';
 import type { RequestAuthorization, SourceStore } from './firestore.js';
 import { parseSourceProof, signatureReplayUntil, signatureTimeVerdict, sourceReplayId, verifySourceSignature, type SignedRequest, type SourceProof } from './proof.js';
 
@@ -33,11 +35,16 @@ export interface SourceAuthorizeInput {
 export interface SourceGate {
   inspect(headers: Readonly<Record<string, string | string[] | undefined>>): SourceInspection;
   authorize(proof: SourceProof, input: SourceAuthorizeInput): Promise<SourceDecision>;
+  /**
+   * 送出確定のtransaction（kms-storeのdispatch）で、入口で認可したsourceを同じtxで読み直し、全readの後の時刻で照合する関数。
+   * 停止・削除・期限・世代違いはfalse（送出0）。不正・障害はthrow（送出しない）。
+   */
+  dispatchCheck(binding: SourceBinding, operation: SourceOperation): (tx: Transaction) => Promise<boolean>;
 }
 
 export interface SourceGateDeps {
   readonly policy: StrictSourcePolicy;
-  readonly store: Pick<SourceStore, 'authorizeRequest'>;
+  readonly store: Pick<SourceStore, 'authorizeRequest' | 'sourceIn' | 'now'>;
   readonly hasher: SecretHasher;
   readonly namespace: string;
   /** 署名の宛先（配置設定のapi.publicOrigin）。 */
@@ -106,6 +113,8 @@ export function createSourceGate(deps: SourceGateDeps): SourceGate {
             operation: input.operation,
             identityHash,
             proofMatches: (record) => record.kind === 'developer' && verifySourceSignature(record.publicKey, request, proof.claims, proof.signature),
+            // DB待機中に署名の期限を過ぎた要求は、全readの後の時刻で拒否する。
+            validAt: (now) => signatureTimeVerdict(proof.claims, now) === 'ok',
             replay: { id: sourceReplayId(hasher, namespace, proof.sourceId, proof.claims.nonce), until: signatureReplayUntil(proof.claims) },
           });
         }
@@ -115,6 +124,14 @@ export function createSourceGate(deps: SourceGateDeps): SourceGate {
       }
       if (result.kind === 'rejected') return denied(result.reason);
       return { kind: 'allowed', sourceId: result.binding.sourceId, generation: result.binding.generation };
+    },
+
+    dispatchCheck(binding: SourceBinding, operation: SourceOperation): (tx: Transaction) => Promise<boolean> {
+      const bound: SourceBinding = Object.freeze({ sourceId: binding.sourceId, generation: binding.generation });
+      return async (tx: Transaction): Promise<boolean> => {
+        const record = await store.sourceIn(tx, bound);
+        return sourceRequestBindingVerdict(record, bound, operation, store.now()).kind === 'usable';
+      };
     },
   });
 }

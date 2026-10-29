@@ -593,6 +593,7 @@ async function startWith(config: Captured): Promise<OwnedDevelopmentDeliveryFunc
     // 許可元strict（配置設定で明示した時だけ）: 同じdb・hasherのsource保存と、App Check方式は同じAdmin AppのAppCheckを結ぶ。
     // App Checkを選んだのにSDK部品が無い構成は起動失敗に閉じる（開発者方式・互換へ黙って落とさない）。
     let sources: SourceGate | undefined;
+    let apiSourceStore: SourceStore | undefined;
     const sourceAuthorization = config.deployment.sourceAuthorization;
     if (sourceAuthorization !== 'compatible') {
       const adminAppCheck = (sdk as unknown as { readonly appCheck?: AppCheckAdminLike }).appCheck;
@@ -601,9 +602,10 @@ async function startWith(config: Captured): Promise<OwnedDevelopmentDeliveryFunc
         code ??= 'format_mismatch';
         throw new OwnedDevelopmentDeliveryStartupError();
       }
+      apiSourceStore = new SourceStore({ db: sdk.db, namespace: config.connectNamespace, clock });
       sources = createSourceGate({
         policy: sourceAuthorization,
-        store: new SourceStore({ db: sdk.db, namespace: config.connectNamespace, clock }),
+        store: apiSourceStore,
         hasher,
         namespace: config.connectNamespace,
         audience: config.deployment.api.publicOrigin,
@@ -646,6 +648,8 @@ async function startWith(config: Captured): Promise<OwnedDevelopmentDeliveryFunc
       interactionTtlMs: PRODUCT_POLICY.interactionTtlMs,
       grantInactivityMs: PRODUCT_POLICY.refreshFamilyMaxSec * 1000,
     });
+    // strict: 送出確定のtransactionで購読Grantのsource binding・sourceも照合する（API要求のsourceはgateのdispatchCheck）。
+    if (apiSourceStore !== undefined) connect.useSources(apiSourceStore);
     // 本文暗号化（配置設定で有効な時だけ）: 同じdb・hasher・clockで公開鍵取得を組み立てる。起動時の専用Secret読取り0（要求時だけ）。
     // offはnullで、専用Secretのclient・新しい秘密に触れない。
     const encryption = createEncryptionKeyRuntime({ db: sdk.db, secretClient: sdk.secretClient, deployment: config.deployment, hasher, clock }) ?? undefined;

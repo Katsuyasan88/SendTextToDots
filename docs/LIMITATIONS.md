@@ -67,3 +67,10 @@ MacはNode.js 22.23.2/npm 12.0.2で、`npm ci --ignore-scripts --no-audit --no-f
 ローカルの確認版はNode.js 22.23.4/npm 10.9.9です。packageの`engines: >=22.2.0 <23`は使用APIの必要条件と22系列への限定で、全ての22.xの動作保証や22.2.0での全試験合格を意味しません。使用する`URL.parse`は22.1.0、`zlib.crc32`は22.2.0追加のため、初期22.xは対象にできません。最低版の全機能検証やNode23以降の検証はしていません。Cloud管理のNode22 runtimeとMCPの固定base imageのpatchもローカル版と別で、同一環境ではありません。
 
 `npm run package`は同じdigestの出力を上書きせず`output_exists`で停止します。archiveは依存を含まず配置先buildでregistryへ接続します。ローカル包装が成功しても、image取得/依存取得/Cloud Build/IAM/サービス起動を保証しません。
+
+## 許可元の認可（strict、開発中）
+
+- App Check方式はbearer tokenの消費で、要求本文・宛先・本人tokenへの束縛やnative/debugの判別はありません。consumeは追加の通信・権限が要り、SDK機能はbetaです。実SDK・実機・実App IDでの確認は各配置で行ってください。
+- strictへ切り替えると、source bindingの無い既存の接続・購読は使えず、本人の再承認・再同意が要ります。
+- 同意画面には接続要求の参照・案内の専用表示がまだ無く、参照は接続画面のURLのinteraction IDです。
+- 送出を確定した後のHTTP送信は撤回できません。開始済みのSDK内部I/Oを物理的に止める保証はありません。

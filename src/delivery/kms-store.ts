@@ -108,6 +108,16 @@ export interface KmsDeliveryConnect {
     meta: { readonly exists: boolean; readonly data: unknown },
     ownerId: string,
   ): 'allowed' | 'denied' | 'unavailable';
+  /** 許可元strictの配置だけ: Grantのsource binding記録の参照（strictでなければ無い/null）。 */
+  grantSourceDocRef?(grantId: string): DocumentReference | null;
+  /** binding記録のsnapshotからsource文書の参照（unbound・不正はnull＝拒否）。 */
+  grantSourceRecordRef?(binding: { readonly exists: boolean; readonly data: unknown }): DocumentReference | null;
+  /** 同じtxで読んだbinding・source（全readの後の時刻）からのGrantのsource面の可否。 */
+  grantSourceDecision?(
+    binding: { readonly exists: boolean; readonly data: unknown },
+    source: { readonly exists: boolean; readonly id: string; readonly data: unknown } | null,
+    now: number,
+  ): 'allowed' | 'denied' | 'unavailable';
 }
 
 /**
@@ -381,6 +391,18 @@ export class KmsRequestDeliveryStore {
     } else {
       [access] = (await this.#read(tx, operation, [accessRef])) as [DocumentSnapshot];
     }
+    // 許可元strict: 購読が束縛したGrantのsource binding・sourceも同じtransactionで読む（API要求のsourceはdispatchのkeyCheckで別に照合）。
+    let sourceAt: ((at: number) => 'allowed' | 'denied' | 'unavailable') | undefined;
+    const bindingRefInput = grantId !== undefined && connect.grantSourceDocRef !== undefined ? connect.grantSourceDocRef(grantId) : null;
+    if (bindingRefInput !== null && connect.grantSourceRecordRef !== undefined && connect.grantSourceDecision !== undefined) {
+      const [binding] = (await this.#read(tx, operation, [this.#own(bindingRefInput)])) as [DocumentSnapshot];
+      const bindingInput = { exists: binding.exists, data: binding.exists ? binding.data() : undefined };
+      const sourceRefInput = connect.grantSourceRecordRef(bindingInput);
+      const source = sourceRefInput === null ? null : ((await this.#read(tx, operation, [this.#own(sourceRefInput)])) as [DocumentSnapshot])[0];
+      const sourceInput = source === null ? null : { exists: source.exists, id: source.id, data: source.exists ? source.data() : undefined };
+      const judge = connect.grantSourceDecision.bind(connect);
+      sourceAt = (at) => judge(bindingInput, sourceInput, at);
+    }
     // 全ての読取りの後の最新時刻で判断する。
     const now = liveNow(this.#d.clock, operation);
     this.#reader.check(marker);
@@ -391,12 +413,14 @@ export class KmsRequestDeliveryStore {
         : connect.grantUseDecision(accessInput, { exists: meta.exists, data: meta.exists ? meta.data() : undefined }, ownerId);
     // 読めない・不正な許可/同意記録は固定の一時障害（許可・拒否のどちらへも読み替えない。送出しない）。
     if (decision !== 'allowed' && decision !== 'denied') throw new DeliveryStateError();
+    if (sourceAt !== undefined && sourceAt(now) === 'unavailable') throw new DeliveryStateError();
     const ownerData = owner.data();
     const viewAt = (at: number): AuthorizationView => ({
       ownerActive: connect.ownerDocActive(ownerData, at),
       subscription: state,
       grantLive: grantId !== undefined && connect.grantDocLive(grantData, ownerId, grantId, at),
-      access: decision,
+      // 旧（unbound）Grant・停止/削除/世代違いのsourceの購読は利用不許可と同じく送出0。
+      access: decision === 'allowed' && sourceAt !== undefined && sourceAt(at) !== 'allowed' ? 'denied' : decision,
     });
     return { command, control, ownerRef, state, now, view: viewAt(now), viewAt };
   }

@@ -25,6 +25,16 @@ import { accessVerdictOf, ACCESS_UNAVAILABLE, grantGenerationOf, grantUseVerdict
 import { ownerReceiverGeneration, receiverResetWrites, receiverSettingsPresent, receiverSnapshotMaterial, RECEIVER_GENERATION_FIELD, ReceiverResetUnavailableError } from '../storage/firestore/receiver-reset.js';
 import type { KmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
 
+import { isSourceBinding, parseSourceRecord, sourceBindingVerdict } from '../source/contract.js';
+import { SOURCE_GRANTS_COLLECTION, type SourceStore } from '../source/firestore.js';
+
+/** strictの同意で消費する許可元承認の位置と、元interactionのclient/resourceのHMAC（本人のhashはowner文書から同じtxで読む）。 */
+export interface SourceApprovalRequest {
+  readonly approvalId: string;
+  readonly clientHash: string;
+  readonly resourceHash: string;
+}
+
 export const CONNECT_STORAGE_ROOT = 'sttdConnect';
 
 /** owner文書の受信reset世代（欠落は0）。不正は一時障害（AccessUnavailableError）。 */
@@ -205,6 +215,74 @@ export class ConnectStorage {
 
   #hash(purpose: string, value: string): string {
     return this.#d.hasher.hash(`t256:${this.#d.namespace}:${purpose}`, value);
+  }
+
+  // ---- 許可元strict（配置設定で明示した時だけ。起動口が1回だけ結ぶ） ----
+
+  #sources: SourceStore | undefined;
+
+  /** strictの配置だけ: 同意でGrantへsource bindingを作り、code交換/refresh/最終保存/送出でsourceの現在の状態・世代を照合する。 */
+  useSources(sources: SourceStore): void {
+    if (this.#sources !== undefined) throw new Error('connect storage: sources already bound');
+    this.#sources = sources;
+  }
+
+  get sourcesEnabled(): boolean {
+    return this.#sources !== undefined;
+  }
+
+  /** Grantのsource binding記録の位置（sourceGrants/{grantHash}）。strictでなければnull。 */
+  grantSourceDocRef(grantId: string): DocumentReference | null {
+    return this.#sources === undefined ? null : this.#sources.grantRef(this.#hash('grant', grantId));
+  }
+
+  /** MCP入口のGrant照合（transaction外の読取り）。strictでなければtrue。不正・障害はSourceUnavailableError。 */
+  async grantSourceUsable(grantId: string): Promise<boolean> {
+    if (this.#sources === undefined) return true;
+    return (await this.#sources.grantUsable(this.#hash('grant', grantId))).kind === 'usable';
+  }
+
+  /** grantMetaと同じGrantの鍵付きhashからbinding記録の位置（購読保存のtransactionが読む）。strictでなければnull。 */
+  grantSourceDocRefByHash(grantHash: string): DocumentReference | null {
+    return this.#sources === undefined ? null : this.#sources.grantRef(grantHash);
+  }
+
+  /** binding記録のsnapshotからsource文書の参照（unbound/不正はnull＝拒否側）。strictでなければnull。 */
+  grantSourceRecordRef(binding: { readonly exists: boolean; readonly data: unknown }): DocumentReference | null {
+    if (this.#sources === undefined || !binding.exists) return null;
+    const data = binding.data as Record<string, unknown> | undefined;
+    const value = { sourceId: data?.sourceId, generation: data?.generation };
+    return isSourceBinding(value) ? this.#sources.sourceRef(value.sourceId) : null;
+  }
+
+  /**
+   * transactionで読んだbinding記録とsource文書（全readの後の時刻now）からの、Grantのsource面の可否。strictでなければ'allowed'。
+   * unbound（旧Grant）・停止・削除・世代違い・connect操作外は'denied'、不正は'unavailable'（allowedへ読み替えない）。
+   */
+  grantSourceDecision(
+    binding: { readonly exists: boolean; readonly data: unknown },
+    source: { readonly exists: boolean; readonly id: string; readonly data: unknown } | null,
+    now: number,
+  ): 'allowed' | 'denied' | 'unavailable' {
+    if (this.#sources === undefined) return 'allowed';
+    if (!binding.exists || source === null) return 'denied';
+    try {
+      const data = binding.data as Record<string, unknown>;
+      const bound = { sourceId: data.sourceId, generation: data.generation };
+      if (!isSourceBinding(bound) || Object.keys(data).length !== 2) return 'unavailable';
+      const record = source.exists ? parseSourceRecord(source.data, source.id) : null;
+      return sourceBindingVerdict(record, bound, now).kind === 'usable' ? 'allowed' : 'denied';
+    } catch {
+      return 'unavailable';
+    }
+  }
+
+  /** 接続承認の照会/承認のための元interaction（login済み・期限内だけ）。ownerと期限だけを返す。 */
+  async interactionForApproval(uid: string): Promise<{ readonly ownerId: string; readonly expiresAt: number } | undefined> {
+    const data = (await this.#interactionRef(uid).get()).data() as Record<string, unknown> | undefined;
+    if (data === undefined || data.state !== 'authenticated' || typeof data.ownerId !== 'string' || typeof data.expiresAt !== 'number') return undefined;
+    if (!(this.#d.clock.now() < data.expiresAt)) return undefined;
+    return { ownerId: data.ownerId, expiresAt: data.expiresAt };
   }
 
   // ---- oidc-provider adapter ----
@@ -404,7 +482,11 @@ export class ConnectStorage {
       await batch.commit();
       if (snapshot.size < DELETE_PAGE) break;
     }
-    if (model === undefined || model === 'Grant') await this.#root.collection('grantMeta').doc(grantHash).delete();
+    if (model === undefined || model === 'Grant') {
+      await this.#root.collection('grantMeta').doc(grantHash).delete();
+      // Grantのsource binding記録もGrantと同じ保持で消す（strictでない配置では存在しない）。
+      await this.#root.collection(SOURCE_GRANTS_COLLECTION).doc(grantHash).delete();
+    }
   }
 
   /** ownerの保存済みpayloadのうち、指定modelの期限内のもの（grantIdの列挙に使う）。 */
@@ -551,11 +633,21 @@ export class ConnectStorage {
   async grantUsable(ownerId: string, grantId: string): Promise<boolean> {
     const ownerRef = this.#ownerRef(ownerId);
     const metaRef = this.#grantMetaRef(grantId);
-    const verdict = await this.#d.db.runTransaction(async (tx): Promise<AccessVerdict> => {
+    const bindingRef = this.grantSourceDocRef(grantId);
+    const verdict = await this.#d.db.runTransaction(async (tx): Promise<AccessVerdict | { readonly kind: 'source_denied' }> => {
       const owner = await tx.get(ownerRef);
       const meta = await tx.get(metaRef);
       const access = await this.#accessForOwner(tx, owner.data());
-      return grantUseVerdict(access, grantGenerationOfSnapshot(meta), ownerId);
+      const result = grantUseVerdict(access, grantGenerationOfSnapshot(meta), ownerId);
+      if (bindingRef === null || result.kind !== 'allowed') return result;
+      // strict: Grantのsource binding・sourceを同じtransactionで読み、全readの後の時刻で判定する（旧Grant・停止・世代違いは不成立）。
+      const binding = await tx.get(bindingRef);
+      const bindingInput = { exists: binding.exists, data: binding.data() };
+      const sourceRef = this.grantSourceRecordRef(bindingInput);
+      const source = sourceRef === null ? null : await tx.get(sourceRef);
+      const decision = this.grantSourceDecision(bindingInput, source === null ? null : { exists: source.exists, id: source.id, data: source.data() }, this.#d.clock.now());
+      if (decision === 'unavailable') return { kind: 'unavailable' };
+      return decision === 'allowed' ? result : { kind: 'source_denied' };
     });
     if (verdict.kind === 'unavailable') throw new AccessUnavailableError();
     return verdict.kind === 'allowed';
@@ -849,18 +941,35 @@ export class ConnectStorage {
    * 同意したGrantの記録を作る。同じtransactionでownerの許可recordを読み、activeかつ同意（login）時と同じ世代の時だけ作る。
    * 停止・再登録を跨いだら作らず'denied'（そのGrantはmetadataなしで新規利用に使えない）。不正・障害はAccessUnavailableError。
    */
-  async putGrantMeta(grantId: string, record: ConsentRecord): Promise<'created' | 'denied'> {
+  async putGrantMeta(grantId: string, record: ConsentRecord, approval?: SourceApprovalRequest): Promise<'created' | 'denied'> {
     const metaRef = this.#grantMetaRef(grantId);
     const ownerRef = this.#ownerRef(record.ownerId);
+    const sources = this.#sources;
+    // strictでは元interactionの許可元承認が必須（欠落は作らない）。
+    if (sources !== undefined && approval === undefined) return 'denied';
     return this.#d.db.runTransaction(async (tx): Promise<'created' | 'denied'> => {
       const owner = (await tx.get(ownerRef)).data();
       const access = await this.#accessForOwner(tx, owner);
+      // strict: 同じ本人（owner文書のidentityHash）・client・resourceの承認とsourceを同じtransactionで読み、全readの後の時刻で判定する。
+      const identityHash = ownerIdentityHash(owner);
+      const judgeApproval =
+        sources !== undefined && approval !== undefined && identityHash !== null
+          ? await sources.readApprovalIn(tx, { approvalId: approval.approvalId, identityHash, clientHash: approval.clientHash, resourceHash: approval.resourceHash })
+          : undefined;
+      const now = this.#d.clock.now();
       if (access.kind === 'unavailable') throw new AccessUnavailableError();
       if (access.kind === 'denied' || access.generation !== record.accessGeneration) return 'denied';
       // 同意の時に捕捉した受信reset世代が、ownerの現在の値と同じ時だけ作る（後の別のresetを跨いだ同意を、現在の値で救済しない）。
       const captured = record.receiverGeneration ?? 0;
       if (!Number.isSafeInteger(captured) || captured < 0) return 'denied';
       if (receiverGenerationOrUnavailable(owner) !== captured) return 'denied';
+      if (sources !== undefined) {
+        const approved = judgeApproval?.(now);
+        if (approved === undefined || approved.kind !== 'usable') return 'denied';
+        // 承認の単回消費とGrantへのbindingを、grantMetaの作成と同じtransactionで書く。
+        approved.apply();
+        sources.bindGrantIn(tx, this.#hash('grant', grantId), approved.binding);
+      }
       tx.create(metaRef, {
         ownerId: record.ownerId,
         authTimeSec: record.authTimeSec,

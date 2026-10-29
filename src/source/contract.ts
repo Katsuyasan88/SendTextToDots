@@ -1,7 +1,8 @@
 // 許可元（source）の共通契約。正本はdocs/API.md「許可元の証明」・docs/CONFIGURATION.md「許可元の認可」。純粋（I/O・SDK・乱数・時計0）。
 //   - 配置設定のsourceAuthorization: 省略/'compatible'は既存互換（source検査なし）。strictは{mode:'strict-v1', methods}を管理者が明示する。
 //     空・未知・重複の方式は設定error（互換へ降格しない）。
-//   - 登録record（sttdConnect/{connectNamespace}/sources/{sourceId}）のexact schemaと判定。source IDは不変で、削除は墓標を残し再利用しない。
+//   - 登録record（sttdConnect/{connectNamespace}/sources/{sourceId}）のexact schemaと判定。source IDは不変で、管理者削除は物理削除。
+//     新規ID・世代は管理CLIが暗号学的乱数で作り、廃止IDを指定して再登録する操作は無い（不在のsourceを参照するbindingは常に拒否）。
 //   - Grant/承認へ結ぶbinding（sourceId＋世代）。停止後の再有効化は新しい世代で、旧bindingは復活しない。
 // 本文・token・生証明・秘密鍵はrecordへ入れない。開発者のUIDは接続保存の既存identity用HMAC（identityHash）だけを持つ。
 
@@ -129,15 +130,8 @@ export interface DeveloperSourceRecord extends SourceRecordBase {
   readonly expiresAt: number | null;
 }
 
-/** 管理者削除の墓標（IDの再利用を防ぎ、旧bindingを拒否し続ける）。 */
-export interface DeletedSourceRecord {
-  readonly schemaVersion: 1;
-  readonly sourceId: string;
-  readonly kind: 'deleted';
-  readonly deletedAt: number;
-}
-
-export type SourceRecord = AppSourceRecord | DeveloperSourceRecord | DeletedSourceRecord;
+/** 管理者削除は登録recordの物理削除（墓標・App ID・公開鍵・identityHash・日時を残さない）。不在のsourceは常に拒否する。 */
+export type SourceRecord = AppSourceRecord | DeveloperSourceRecord;
 
 const BASE_KEYS = ['schemaVersion', 'sourceId', 'kind', 'state', 'generation', 'operations', 'createdAt', 'updatedAt'] as const;
 
@@ -145,11 +139,6 @@ const BASE_KEYS = ['schemaVersion', 'sourceId', 'kind', 'state', 'generation', '
 export function parseSourceRecord(data: unknown, expectedId: string): SourceRecord {
   if (!SOURCE_ID.test(expectedId)) fail();
   const kind = typeof data === 'object' && data !== null ? (data as { kind?: unknown }).kind : undefined;
-  if (kind === 'deleted') {
-    const fields = exactFields(data, ['schemaVersion', 'sourceId', 'kind', 'deletedAt']);
-    if (fields.get('schemaVersion') !== 1 || fields.get('sourceId') !== expectedId || !isTime(fields.get('deletedAt'))) fail();
-    return Object.freeze({ schemaVersion: 1, sourceId: expectedId, kind: 'deleted', deletedAt: fields.get('deletedAt') as number });
-  }
   const extra = kind === 'app' ? ['appId'] : kind === 'developer' ? ['publicKey', 'identityHash', 'expiresAt'] : fail();
   const fields = exactFields(data, [...BASE_KEYS, ...extra]);
   const state = fields.get('state');
@@ -187,7 +176,7 @@ export function isSourceBinding(value: unknown): value is SourceBinding {
   return typeof sourceId === 'string' && SOURCE_ID.test(sourceId) && typeof generation === 'string' && SOURCE_GENERATION.test(generation);
 }
 
-export type SourceRejection = 'missing' | 'deleted' | 'disabled' | 'expired' | 'operation' | 'subject' | 'method' | 'generation';
+export type SourceRejection = 'missing' | 'disabled' | 'expired' | 'operation' | 'subject' | 'method' | 'generation';
 
 export type SourceVerdict = { readonly kind: 'usable'; readonly record: AppSourceRecord | DeveloperSourceRecord } | { readonly kind: 'rejected'; readonly reason: SourceRejection };
 
@@ -196,7 +185,6 @@ const rejected = (reason: SourceRejection): SourceVerdict => ({ kind: 'rejected'
 /** sourceのいまの状態（不存在・墓標・停止・期限・操作外を区別して拒否）。 */
 function liveSource(record: SourceRecord | null, operation: SourceOperation, now: number): SourceVerdict {
   if (record === null) return rejected('missing');
-  if (record.kind === 'deleted') return rejected('deleted');
   if (record.state !== 'active') return rejected('disabled');
   if (record.kind === 'developer' && record.expiresAt !== null && !(now < record.expiresAt)) return rejected('expired');
   if (!record.operations.includes(operation)) return rejected('operation');
@@ -216,6 +204,14 @@ export function sourceRequestVerdict(
   const expected = need.method === 'developer-key-v1' ? 'developer' : 'app';
   if (verdict.record.kind !== expected) return rejected('method');
   if (verdict.record.kind === 'developer' && verdict.record.identityHash !== need.identityHash) return rejected('subject');
+  return verdict;
+}
+
+/** API要求で認可したsourceが、送出確定の時点でも同じ世代のまま有効でその操作を許すか（停止・削除・期限・世代違いは拒否）。 */
+export function sourceRequestBindingVerdict(record: SourceRecord | null, binding: SourceBinding, operation: SourceOperation, now: number): SourceVerdict {
+  const verdict = liveSource(record, operation, now);
+  if (verdict.kind !== 'usable') return verdict;
+  if (verdict.record.generation !== binding.generation) return rejected('generation');
   return verdict;
 }
 

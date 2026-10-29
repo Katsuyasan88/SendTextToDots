@@ -468,6 +468,7 @@ export function createRequestScopedOAuthOwnerResolver(options: RequestScopedOAut
   const connectTarget = fields.get('connect');
   if (!isObject(connectTarget) || !(connectTarget instanceof ConnectStorage)) configFail();
   const isOwnerActive = methodOf(connectTarget, 'isOwnerActive');
+  const sourceGrantUsable = connectTarget.sourcesEnabled ? methodOf(connectTarget, 'grantSourceUsable') : undefined;
 
   const contextTarget = fields.get('context');
   const found = isObject(contextTarget) ? CONTEXTS.get(contextTarget) : undefined;
@@ -544,6 +545,16 @@ export function createRequestScopedOAuthOwnerResolver(options: RequestScopedOAut
     check();
     if (typeof active !== 'boolean') throw INTERNAL;
     if (!active) return null;
+
+    // 許可元strict: MCP入口でもGrantのsource binding・sourceの現在の状態/世代を照合する（旧Grant・停止・削除・世代違いはnull）。
+    // 購読保存・送出の順序は各最終transactionで決める。読めない・不正は成功にしない。
+    if (sourceGrantUsable !== undefined) {
+      check();
+      const usable: unknown = await waitFor(state, slot, invoke(() => sourceGrantUsable(view.grantId)));
+      check();
+      if (typeof usable !== 'boolean') throw INTERNAL;
+      if (!usable) return null;
+    }
 
     // 正常返却の直前: 最新の時刻でtoken/Grantの期限・属性・scopeと元期限を再検査する。
     const at = check();

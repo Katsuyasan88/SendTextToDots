@@ -89,3 +89,9 @@ node dist/console/operator-server.js --config console.local.json --operator oper
 Switching between Apple and a code happens in step 1. Switching does not stop the previous connection. Remove the previous plugin and add it again from step 2. The previous connection will not carry over.
 
 The operator claim secret lives only in the helper's memory. If the helper exits, issued codes can no longer be checked or reissued (an unused code expires in 10 minutes; issue a new one).
+
+## Registered developer environment (strict trusted-source deployments)
+
+Only if the operator registered this PC's public key with `manage-sources.mjs register-developer`, add `"source": {"sourceId": "src_…", "keyFile": "<path to the Ed25519 private key (PKCS#8 PEM)>"}` to the helper's configuration JSON. The helper reads the key once at start and keeps it only in memory (never in the browser, URLs, CLI arguments or logs). Make the key file readable only by you on this PC.
+
+Only with this setting, the helper signs `POST /v2/commands` to the fixed apiOrigin and the connection approval `GET/POST /v1/source/approvals/{interactionId}` to the fixed mcpOrigin. Status/cancel and connection state/disconnect are not signed. There is no way to sign for arbitrary destinations or headers. The send screen shows an "Approve a connection" section: enter the interaction ID from the plugin connection screen's URL, press "Check", confirm the content, press "Approve", then continue consenting on the original connection screen. There is no automatic polling. The helper does not start if the key is not Ed25519, cannot be read, or the setting is malformed.

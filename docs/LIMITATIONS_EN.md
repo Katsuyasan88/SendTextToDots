@@ -67,3 +67,10 @@ The deployment command examples in [INSTALL_EN.md](INSTALL_EN.md) follow the pub
 The locally verified versions are Node.js 22.23.4/npm 10.9.9. The package's `engines: >=22.2.0 <23` states the requirement of the APIs used and limits it to the 22 line; it is not a guarantee for every 22.x and does not mean every test passes on 22.2.0. `URL.parse` was added in 22.1.0 and `zlib.crc32` in 22.2.0, so early 22.x cannot be targeted. Full verification at the minimum version and verification on Node 23 or later have not been done. The Cloud-managed Node 22 runtime and the MCP's fixed base image have different patch versions from the local one and are not the same environment.
 
 `npm run package` does not overwrite output with the same digest and stops with `output_exists`. The archives contain no dependencies and the deployment-side build connects to the registry. A successful local packaging does not guarantee image retrieval, dependency retrieval, Cloud Build, IAM or service startup.
+
+## Trusted source authorization (strict, in development)
+
+- The App Check method consumes a bearer token; it neither binds the request body, destination or identity token nor distinguishes native from debug credentials. Consumption needs an extra network call and permissions, and the SDK feature is beta. Confirm it with your real SDK, devices and App IDs in your own deployment.
+- After switching to strict, existing connections and subscriptions without a source binding cannot be used; the person must approve and consent again.
+- The consent screen does not yet show a dedicated connection request reference or guidance; the reference is the interaction ID in the connection screen's URL.
+- An HTTP delivery already confirmed cannot be recalled, and SDK-internal I/O already started is not guaranteed to stop physically.

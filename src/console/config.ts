@@ -24,9 +24,17 @@ export interface LocalConsoleConfig {
     readonly authDomain: string;
     readonly projectId: string;
   };
+  /**
+   * 任意: 管理者が登録した開発者環境（許可元strictの配置）。source IDと、このPCだけに置くEd25519秘密鍵（PKCS#8 PEM）のfile path。
+   * helperは起動時に鍵を1回読んでmemoryだけに持ち、固定上流（apiOriginの送信・mcpOriginの接続承認）向けの要求だけに署名する。
+   * 鍵の本文はbrowser・URL・CLI引数・ログへ出さない。
+   */
+  readonly source?: { readonly sourceId: string; readonly keyFile: string } | undefined;
 }
 
 const TOP_KEYS = ['apiOrigin', 'mcpOrigin', 'firebase'] as const;
+const SOURCE_KEYS = ['sourceId', 'keyFile'] as const;
+const SOURCE_ID = /^src_[a-z2-7]{26}$/;
 const FIREBASE_KEYS = ['apiKey', 'authDomain', 'projectId'] as const;
 const DNS_HOST = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/;
 /** 公開client設定の文字列（制御文字・引用符・空白・HTML/JS区切りを含まない）。 */
@@ -46,7 +54,15 @@ function plainObject(value: unknown, keys: readonly string[]): Record<string, un
 
 /** 解析済みの値を検査して凍結した設定を返す（file読取りと分離。試験は合成objectを渡せる）。 */
 export function validateLocalConsoleConfig(value: unknown): LocalConsoleConfig {
-  const top = plainObject(value, TOP_KEYS);
+  const hasSource = typeof value === 'object' && value !== null && !Array.isArray(value) && Object.keys(value).includes('source');
+  const top = plainObject(value, hasSource ? [...TOP_KEYS, 'source'] : TOP_KEYS);
+  let source: LocalConsoleConfig['source'];
+  if (hasSource) {
+    const entry = plainObject(top.source, SOURCE_KEYS);
+    if (typeof entry.sourceId !== 'string' || !SOURCE_ID.test(entry.sourceId)) fail();
+    if (typeof entry.keyFile !== 'string' || entry.keyFile.length < 1 || entry.keyFile.length > 1024 || /[\0\r\n]/.test(entry.keyFile)) fail();
+    source = Object.freeze({ sourceId: entry.sourceId, keyFile: entry.keyFile });
+  }
   const apiOrigin = top.apiOrigin;
   const mcpOrigin = top.mcpOrigin;
   if (!isDevelopmentPublicOrigin(apiOrigin) || !isDevelopmentPublicOrigin(mcpOrigin) || apiOrigin === mcpOrigin) fail();
@@ -57,6 +73,7 @@ export function validateLocalConsoleConfig(value: unknown): LocalConsoleConfig {
     apiOrigin,
     mcpOrigin,
     firebase: Object.freeze({ apiKey: firebase.apiKey as string, authDomain: firebase.authDomain as string, projectId: firebase.projectId as string }),
+    ...(source !== undefined ? { source } : {}),
   });
 }
 

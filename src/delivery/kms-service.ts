@@ -201,9 +201,12 @@ export class KmsRequestDeliveryService {
     rawBody: Buffer,
     receivedAt: number,
     parentOperation?: KmsDeliveryParentOperation,
+    requestCheck?: DispatchKeyCheck,
   ): Promise<DeliveryResponse> {
     if (this.#d.lifetime.aborted) return unavailable();
     const { store, clock } = this.#d;
+    // 許可元strictの照合関数は関数だけを受ける（不正は送出しない）。
+    if (requestCheck !== undefined && typeof requestCheck !== 'function') return unavailable();
     const parent = parentOf(parentOperation);
     if (parent === 'invalid') return unavailable();
     const until = this.#until(receivedAt, parent);
@@ -216,7 +219,8 @@ export class KmsRequestDeliveryService {
     } catch {
       return errorResponse(400, 'invalid_request');
     }
-    return this.#accept(ownerId, input, receivedAt, parent, until, undefined);
+    // requestCheckは送出権のtransaction（dispatch）の中で、入口で認可したsourceを読み直して照合する。
+    return this.#accept(ownerId, input, receivedAt, parent, until, requestCheck);
   }
 
   /**

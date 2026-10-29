@@ -15,6 +15,7 @@
 // 例外を外へ投げない（Functionsの既定のエラーログへ要求の値を渡さない）。応答・ログに本文・token・secret・URLを出さない。
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Transaction } from '@google-cloud/firestore';
 import { types } from 'node:util';
 
 import { parseReissueBody, REISSUE_BODY_MAX_BYTES, type EncryptionKeyEndpoint, type ReissueRequest } from '../encryption/api.js';
@@ -24,7 +25,7 @@ import { MAX_COMMAND_BODY_BYTES, type Clock } from '../policy.js';
 import { isRealSignal } from '../protection/google-sdk-call.js';
 import { idempotencyKeyOf, type SourceProof } from '../source/proof.js';
 import type { SourceAuthorizeInput, SourceDecision, SourceGate } from '../source/http.js';
-import type { SourceOperation } from '../source/contract.js';
+import type { SourceBinding, SourceOperation } from '../source/contract.js';
 import { errorResponse, type DeliveryResponse } from './event.js';
 
 const BEARER_ID_TOKEN = /^Bearer ([A-Za-z0-9._-]{1,4096})$/;
@@ -77,7 +78,15 @@ export interface DeliveryRequestOperation {
  * service内の処理・送出を撤回できるわけではない。
  */
 export interface OperationDeliveryService {
-  post(ownerId: string, idempotencyKey: string, rawBody: Buffer, receivedAt: number, operation: DeliveryRequestOperation): Promise<DeliveryResponse>;
+  /** requestCheckはstrictの配置だけ: 送出確定のtransactionで入口のsourceを照合する関数（kms-storeのdispatchへ渡る）。 */
+  post(
+    ownerId: string,
+    idempotencyKey: string,
+    rawBody: Buffer,
+    receivedAt: number,
+    operation: DeliveryRequestOperation,
+    requestCheck?: (tx: Transaction) => Promise<boolean>,
+  ): Promise<DeliveryResponse>;
   get(ownerId: string, commandId: string, receivedAt: number, operation: DeliveryRequestOperation): Promise<DeliveryResponse>;
   cancel(ownerId: string, commandId: string, receivedAt: number, operation: DeliveryRequestOperation): Promise<DeliveryResponse>;
 }
@@ -268,10 +277,12 @@ function captureSources(deps: object): SourceGate | undefined {
   const inspect = capturePort(deps, 'sources', 'inspect');
   if (inspect === undefined) return undefined;
   const authorize = capturePort(deps, 'sources', 'authorize');
-  if (authorize === undefined) throw new DeliveryIngressConfigError();
+  const dispatchCheck = capturePort(deps, 'sources', 'dispatchCheck');
+  if (authorize === undefined || dispatchCheck === undefined) throw new DeliveryIngressConfigError();
   return Object.freeze({
     inspect: (headers: IncomingMessage['headers']) => inspect(headers) as ReturnType<SourceGate['inspect']>,
     authorize: (proof: SourceProof, input: SourceAuthorizeInput) => authorize(proof, input) as Promise<SourceDecision>,
+    dispatchCheck: (binding: SourceBinding, operation: SourceOperation) => dispatchCheck(binding, operation) as ReturnType<SourceGate['dispatchCheck']>,
   });
 }
 
@@ -312,8 +323,14 @@ function captureEncryptedCommands(deps: object): EncryptedCommandEndpoint | unde
   return post === undefined
     ? undefined
     : Object.freeze({
-        post: (identity: VerifiedIdentity, key: string | undefined, wire: Buffer, receivedAt: number, operation: DeliveryRequestOperation) =>
-          post(identity, key, wire, receivedAt, operation) as Promise<DeliveryResponse>,
+        post: (
+          identity: VerifiedIdentity,
+          key: string | undefined,
+          wire: Buffer,
+          receivedAt: number,
+          operation: DeliveryRequestOperation,
+          requestCheck?: (tx: Transaction) => Promise<boolean>,
+        ) => (requestCheck === undefined ? post(identity, key, wire, receivedAt, operation) : post(identity, key, wire, receivedAt, operation, requestCheck)) as Promise<DeliveryResponse>,
       });
 }
 
@@ -540,8 +557,11 @@ function buildOperationHandler(
         log({ event: 'source.rejected', code: decision.code, reason: decision.reason });
         return errorResponse(403, decision.code);
       }
+      // 入口で認可したbindingを捨てず、送出確定のtransactionで同じsourceを読み直して照合する（停止が先なら送出0）。
+      if (sourceOperation === 'send') requestCheck = sources.dispatchCheck({ sourceId: decision.sourceId, generation: decision.generation }, sourceOperation);
       return undefined;
     };
+    let requestCheck: ((tx: Transaction) => Promise<boolean>) | undefined;
     if (label === 'encryption_key.reissue' && reissue !== null) {
       const request = reissue;
       const verified = await verifiedWith(req, operation, live);
@@ -563,7 +583,13 @@ function buildOperationHandler(
       const rejectedBySource = await sourceCheck(verified);
       if (rejectedBySource !== undefined) return rejectedBySource;
       const key = header(req, 'idempotency-key');
-      return adopted(() => encryptedCommands!.post(verified, key, body, receivedAt, operation), operation, live);
+      const check = requestCheck;
+      if (sources !== undefined && check === undefined) return unavailable();
+      return adopted(
+        () => (check === undefined ? encryptedCommands!.post(verified, key, body, receivedAt, operation) : encryptedCommands!.post(verified, key, body, receivedAt, operation, check)),
+        operation,
+        live,
+      );
     }
     const resolved = await ownerWith(req, operation, live, label === 'commands.post' ? sourceCheck : undefined);
     if (typeof resolved !== 'string') return resolved;
@@ -571,7 +597,14 @@ function buildOperationHandler(
     if (label === 'commands.post') {
       const key = header(req, 'idempotency-key');
       if (key === undefined) return errorResponse(400, 'invalid_request');
-      return adopted(() => service.post(resolved, key, body, receivedAt, operation), operation, live);
+      const check = requestCheck;
+      // strictで入口のbindingが無い送信は送出へ進めない（gateの欠落を互換扱いにしない）。
+      if (sources !== undefined && check === undefined) return unavailable();
+      return adopted(
+        () => (check === undefined ? service.post(resolved, key, body, receivedAt, operation) : service.post(resolved, key, body, receivedAt, operation, check)),
+        operation,
+        live,
+      );
     }
     const commandId = match![1]!.toLowerCase();
     if (label === 'commands.get') return adopted(() => service.get(resolved, commandId, receivedAt, operation), operation, live);

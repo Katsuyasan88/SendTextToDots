@@ -89,3 +89,9 @@ node dist/console/operator-server.js --config console.local.json --operator oper
 AppleとコードはStep 1で切り替えられます。切り替えても以前の接続は自動では止まりません。以前のプラグインを削除し、ステップ2から追加し直してください。以前の接続は新しい接続へ引き継がれません。
 
 operatorの照会用secretはhelperのメモリだけにあり、helperを終了すると発行済みコードの照会・再発行はできません（未使用のコードは10分で失効します。新しく発行してください）。
+
+## 登録開発者環境（許可元strictの配置）
+
+管理者が`manage-sources.mjs register-developer`でこのPCの公開鍵を登録した場合だけ、helperの設定JSONへ`"source": {"sourceId": "src_…", "keyFile": "<Ed25519秘密鍵(PKCS#8 PEM)のpath>"}`を加えます。helperは起動時に鍵を1回読み、memoryだけに持ちます（browser・URL・CLI引数・ログへ出しません）。鍵fileはこのPCの自分だけが読めるようにしてください。
+
+この設定がある時だけ、helperは固定上流への`POST /v2/commands`（apiOrigin）と接続承認`GET/POST /v1/source/approvals/{interactionId}`（mcpOrigin）に許可元の署名を付けます。照会/取消・接続状態/解除には付けません。任意の宛先・headerへ署名する口はありません。送信画面に「接続の承認」欄が出るので、プラグイン接続画面のURLにあるinteraction IDを入れて「確認」→内容を確かめて「承認」し、元の接続画面で同意を続けます。自動pollはしません。鍵がEd25519でない・読めない・設定の形が違う時はhelperが起動しません。

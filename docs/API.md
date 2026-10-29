@@ -242,4 +242,18 @@ console.log(response.status, await response.json());
 
 限界: App Check tokenはbearerで、要求本文・宛先・本人tokenへ暗号学的に束縛されていません。未消費のtokenを盗まれた場合の先取り・中継・別本文への流用は防げません。成功は「その配置projectの登録App IDが発行し初めて消費したtoken」であることだけを意味し、個々のtokenがnative provider由来かdebug資格由来かは判別しません。debug資格の管理は各配置の責任です。開発者鍵はsoftware保管なら秘密鍵のコピーを防げません。
 
-この版の未実装（strictでは接続serverが起動しません）: OAuth接続承認への許可元承認の結合、Grantのsource binding、code交換/refresh/MCP/購読保存/配送確定での最新状態の照合、ローカル送信画面helperの署名。送信APIのsource照合は配送確定と同じtransactionではないため、照合の直後にsourceを停止しても、その要求の送出は止まりません。
+欠落の403は本人確認（401）より先に返します（本人token・owner・鍵・配送を始めないため）。App Checkのconsumeは登録sourceの照合より先に行うので、停止・削除済みのsourceへ送ったtokenも消費されます。
+
+**送出までの照合:** 入口で認可したsourceは捨てず、送出確定のFirestore transactionで同じsourceを読み直し、全ての読取りの後の時刻で再確認します。購読を承認したGrantのsource（下記）も同じtransactionで照合し、API要求のsourceと購読のsourceが異なっても両方が現在有効な時だけ送出します。停止が先に確定していれば送出しません。送出を確定した後のHTTP送信は撤回できません。DB待機中に署名の期限を過ぎた要求も拒否します。
+
+### 許可元による接続承認（strict配置だけ）
+
+strictでは、Dots等のOAuth接続は同じ本人が許可元で明示承認してからだけ完了します。Dotsへ追加のheaderは要求しません。
+
+1. 元browserの接続画面（`/interaction/{interactionId}`）でログインします。接続要求の参照は、その画面のURLのinteraction IDです（この版では同意画面に参照・案内の専用表示はありません）。参照には権限が無く、参照だけではlogin・同意・Grantは作られません。
+2. 許可元（登録app、またはローカル送信画面の登録開発者環境）が、MCP originの`GET /v1/source/approvals/{interactionId}`で内容を確認し、`POST /v1/source/approvals/{interactionId}`（`Content-Type: application/json`、本文は正確に`{"approve":true}`）で明示承認します。どちらもqueryなし、`Authorization: Bearer <同じ本人のFirebase ID token>`と上の許可元証明（`connect`操作。署名の宛先はMCP origin、pathはこのpath、GETの本文は空）が必要です。App Check tokenはGET/POSTとも消費します。GETの応答は`{"client","scope","resource","expiresAt"}`、POSTは`{"state":"approved","expiresAt"}`です。
+3. 元browserで同意を押します。同意の最終transactionで、承認（同じ本人・client・resource・期限内・未消費・sourceが現在有効）を単回消費し、Grantへsource ID/世代を結びます。承認が無い同意は、interactionを消費せずに同意画面を再表示（409）します。
+
+承認は元interactionの期限以内かつ最大5分です。未ログイン・別本人・期限切れ・消費済みのinteractionは同じ`404 not_found`、証明の欠落/不正は上と同じ403、承認済みへの再承認は`409 approval_exists`、障害は503です。承認状態の匿名照会や自動pollはありません。
+
+code交換・refresh・MCPの各要求・購読保存・配送確定では、Grantのsource binding・sourceの現在の状態/世代を照合します。承認（短期票）の期限が過ぎても正常なGrantはrefresh/MCPを続けられます。sourceの停止・削除・再有効化（新世代）・strict前の旧Grant（bindingなし）は使えず、新しい承認と同意でだけ回復します。

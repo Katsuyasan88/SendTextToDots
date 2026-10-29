@@ -1,6 +1,7 @@
 // 許可元の管理（scripts/manage-sources.mjsだけが使う）。runtimeの一般APIには公開しない。
 //   status / register-app / register-developer / disable / enable / delete
-// 登録は新しいランダムIDで作り（既存・墓標へ書かない）、停止→有効化は新しい世代（旧Grantを復活させない）、削除は墓標（ID再利用0）。
+// 登録は管理CLIが暗号学的乱数で作る新しいID・世代だけ（廃止IDを指定して再登録する操作は無い）。停止→有効化は新しい世代（旧Grantを
+// 復活させない）、削除は物理削除（実App ID・公開鍵・identityHash・日時を残さない。旧bindingは不在として拒否され、付け替えない）。
 // 開発者の期限は管理者の明示値（ISO時刻、または明示の"never"）。秘密鍵の作成・登録はしない（公開鍵だけを標準入力で受ける）。
 // 入力は標準入力の1行JSON（UID・公開鍵をargv・履歴・ログへ出さない）。出力は固定code・source ID・状態/版・世代の有無だけ。
 
@@ -137,7 +138,6 @@ export function newSourceGeneration(): string {
 
 function describe(record: SourceRecord | null, version: string): SourceAdminResult {
   if (record === null) return { code: 'status', state: 'absent', version };
-  if (record.kind === 'deleted') return { code: 'status', source: record.sourceId, kind: 'deleted', state: 'deleted', version };
   return { code: 'status', source: record.sourceId, kind: record.kind, state: record.state, version };
 }
 
@@ -173,18 +173,19 @@ export async function runSourceAdmin(request: SourceAdminRequest, input: Registr
       return created === 'created' ? { code: 'created', source: sourceId, kind: record.kind, state: 'active', version: String(now) } : { code: 'conflict' };
     }
     const generation = newSourceGeneration();
-    const outcome = await deps.store.change(request.source!, request.expect!, (current): SourceRecord => {
+    const outcome = await deps.store.change(request.source!, request.expect!, (current): SourceRecord | null => {
+      // 版は前回より必ず大きくする（同じmsの連続変更でも期待版が変わる）。
       const updatedAt = Math.max(now, current.updatedAt + 1);
-      if (request.command === 'delete') return { schemaVersion: 1, sourceId: current.sourceId, kind: 'deleted', deletedAt: updatedAt };
+      // 削除は物理削除（App ID・公開鍵・identityHash・日時を残さない）。旧Grant・承認は不在として拒否される。
+      if (request.command === 'delete') return null;
       if (request.command === 'disable') return { ...current, state: 'disabled', updatedAt };
       // 有効化は常に新しい世代（停止前のGrant・承認は復活しない）。
       return { ...current, state: 'active', generation, updatedAt };
     });
+    if (outcome.kind === 'deleted') return { code: 'deleted', source: request.source!, state: 'absent', version: 'absent' };
     if (outcome.kind !== 'changed') return { code: outcome.kind };
     const record = outcome.record;
-    return record.kind === 'deleted'
-      ? { code: 'changed', source: record.sourceId, kind: 'deleted', state: 'deleted', version: String(record.deletedAt) }
-      : { code: 'changed', source: record.sourceId, kind: record.kind, state: record.state, version: String(record.updatedAt) };
+    return { code: 'changed', source: record.sourceId, kind: record.kind, state: record.state, version: String(record.updatedAt) };
   } catch {
     // SourceUnavailableError・SDKの失敗とも結果不明（再実行で上書きせず、statusで照合する）。
     return { code: 'unavailable' };

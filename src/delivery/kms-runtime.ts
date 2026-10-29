@@ -153,6 +153,8 @@ export function createKmsRequestDeliveryRuntime(options: KmsRequestDeliveryRunti
   const grantMetaDocRef = methodOf(connectTarget, 'grantMetaDocRef');
   const accessUseDecision = methodOf(connectTarget, 'accessUseDecision');
   const grantUseDecision = methodOf(connectTarget, 'grantUseDecision');
+  // ConnectStorageがsourceを結んでいる（strict）時だけtrue。試験の合成connect（sourcesEnabled無し）は従来どおり。
+  const strictSources = (connectTarget as { readonly sourcesEnabled?: unknown }).sourcesEnabled === true;
   /** 利用許可の判定は既知の3値だけを採用し、他は一時障害（unavailable）へ閉じる。 */
   const decisionOf = (value: unknown): 'allowed' | 'denied' | 'unavailable' => (value === 'allowed' || value === 'denied' ? value : 'unavailable');
   const connect: KmsDeliveryConnect = Object.freeze({
@@ -166,6 +168,19 @@ export function createKmsRequestDeliveryRuntime(options: KmsRequestDeliveryRunti
     accessUseDecision: (access: { readonly exists: boolean; readonly data: unknown }) => decisionOf(accessUseDecision(access)),
     grantUseDecision: (access: { readonly exists: boolean; readonly data: unknown }, meta: { readonly exists: boolean; readonly data: unknown }, ownerId: string) =>
       decisionOf(grantUseDecision(access, meta, ownerId)),
+    // 許可元strict（ConnectStorageにsourceを結んだ配置）だけ: 購読Grantのsource binding・sourceを最終transactionで照合する。
+    ...(strictSources
+      ? {
+          grantSourceDocRef: (grantId: string) => (methodOf(connectTarget, 'grantSourceDocRef')(grantId) ?? null) as ReturnType<NonNullable<KmsDeliveryConnect['grantSourceDocRef']>>,
+          grantSourceRecordRef: (binding: { readonly exists: boolean; readonly data: unknown }) =>
+            (methodOf(connectTarget, 'grantSourceRecordRef')(binding) ?? null) as ReturnType<NonNullable<KmsDeliveryConnect['grantSourceRecordRef']>>,
+          grantSourceDecision: (
+            binding: { readonly exists: boolean; readonly data: unknown },
+            source: { readonly exists: boolean; readonly id: string; readonly data: unknown } | null,
+            now: number,
+          ) => decisionOf(methodOf(connectTarget, 'grantSourceDecision')(binding, source, now)),
+        }
+      : {}),
   });
 
   const hashMethod = methodOf(fields.get('hasher'), 'hash');

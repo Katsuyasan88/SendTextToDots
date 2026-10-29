@@ -46,6 +46,7 @@ export function fakeDb() {
           }), tx),
           set: (r, data) => (writes.push(() => docs.set(r.path, structuredClone(data))), tx),
           update: (r, data) => (writes.push(() => docs.set(r.path, { ...docs.get(r.path), ...structuredClone(data) })), tx),
+          delete: (r) => (writes.push(() => docs.delete(r.path)), tx),
         };
         const result = await fn(tx);
         for (const write of writes) write();
@@ -127,7 +128,8 @@ test('不正record・DB障害は一時障害（成功にしない）', async () 
 
 async function consume(db, store, subject, now) {
   return db.runTransaction(async (tx) => {
-    const read = await store.readApprovalIn(tx, subject, now);
+    const judge = await store.readApprovalIn(tx, subject);
+    const read = judge(now);
     if (read.kind === 'usable') read.apply();
     return read;
   });
@@ -182,11 +184,12 @@ test('管理: 停止→有効化は新世代で旧bindingを拒否、削除は�
   assert.equal((await consume(db, store, subject, now.value)).reason, 'generation');
 
   now.value += 10;
+  // 削除は物理削除: App ID・公開鍵・identityHash・日時を残さず、旧bindingは不在として拒否。復活・付替えの操作は無い。
   const deleted = await runSourceAdmin({ command: 'delete', project: 'p', database: 'd', namespace: NS, source: id, expect: enabled.version }, null, deps);
-  assert.equal(deleted.state, 'deleted');
-  assert.deepEqual(await store.bindingUsable(binding), { kind: 'rejected', reason: 'deleted' });
-  assert.equal((await runSourceAdmin({ command: 'enable', project: 'p', database: 'd', namespace: NS, source: id, expect: deleted.version }, null, deps)).code, 'deleted');
-  assert.equal(await store.create({ ...first, sourceId: id }), 'conflict');
-  const saved = JSON.stringify(db.docs.get(`sttdConnect/${NS}/sources/${id}`));
-  assert.ok(!saved.includes('uid-synthetic'));
+  assert.equal(deleted.code, 'deleted');
+  assert.equal(db.docs.has(`sttdConnect/${NS}/sources/${id}`), false);
+  assert.deepEqual(await store.grantUsable('f'.repeat(64)), { kind: 'rejected', reason: 'unbound' });
+  assert.equal((await runSourceAdmin({ command: 'enable', project: 'p', database: 'd', namespace: NS, source: id, expect: enabled.version }, null, deps)).code, 'missing');
+  assert.equal((await consume(db, store, subject, now.value)).reason, 'missing');
+  assert.ok(![...db.docs.values()].some((doc) => JSON.stringify(doc).includes(first.identityHash) && !('consumed' in doc)));
 });

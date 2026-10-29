@@ -14,12 +14,14 @@
 //   - CLI: node dist/console/local-server.js --config <public-client-config.json> [--port 8765]。設定の読取りはconfig.ts。本番配置設定は読まない。
 
 import { OPERATOR_PATH_PREFIX, OPERATOR_SCRIPT_PATH, renderOperatorCodePanel, renderOperatorSection, type OperatorRoutes } from './operator-config.js';
-import { randomBytes } from 'node:crypto';
+import { createPrivateKey, randomBytes, type KeyObject } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
+
+import { SIGNATURE_HEADER, signSourceRequest, SOURCE_HEADER } from '../source/proof.js';
 import { fileURLToPath } from 'node:url';
 
-import { consoleAsset, CONSOLE_PATH, CONSOLE_SCRIPT_PATH, CONSOLE_STYLE_PATH, LOCAL_NONCE_HEADER, LOCAL_REFUSAL_HEADER } from '../connect/console.js';
+import { consoleAsset, CONSOLE_PATH, CONSOLE_SCRIPT_PATH, CONSOLE_SDK_BASE, CONSOLE_STYLE_PATH, LOCAL_NONCE_HEADER, LOCAL_REFUSAL_HEADER } from '../connect/console.js';
 import { isLanguage, LANGUAGE_QUERY, languageCookie, selectLanguage } from '../connect/i18n.js';
 import { ConsoleConfigFileError, loadLocalConsoleConfig, validateLocalConsoleConfig, type LocalConsoleConfig } from './config.js';
 
@@ -35,19 +37,35 @@ const ORIGIN_FORM_TARGET = /^\/(?!\/)[\x21-\x5b\x5d-\x7e]*$/;
 const JSON_TYPE = 'application/json; charset=utf-8';
 const BASE_HEADERS = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' };
 
-/** 中継してよいroute（method・上流・期限・本文の許可）。 */
+/** 中継してよいroute（method・上流・期限・本文の許可・許可元の署名）。 */
 interface RelayRoute {
   readonly method: 'GET' | 'POST';
   readonly upstream: 'api' | 'mcp';
   readonly timeoutMs: number;
-  readonly body: 'json' | 'none';
+  readonly body: 'json' | 'none' | 'approve';
+  /** 登録開発者環境の設定がある時だけ署名する（照会/取消・接続状態/解除は署名しない最小回復）。 */
+  readonly sign?: true | undefined;
 }
 
-function relayRouteFor(method: string, path: string): RelayRoute | 'method' | null {
+/** 接続承認の参照（元interaction ID）。 */
+const APPROVAL_PATH = /^\/v1\/source\/approvals\/([A-Za-z0-9_-]{1,128})$/;
+/** 接続承認のPOST本文（明示承認だけ）。 */
+const APPROVE_BODY = '{"approve":true}';
+/** 許可元の承認画面のscript（同origin。CSPのscript-src 'self'）。 */
+export const SOURCE_SCRIPT_PATH = '/console/source.js';
+
+function relayRouteFor(method: string, path: string, sourceEnabled = false): RelayRoute | 'method' | null {
   const table: Array<{ test: (p: string) => boolean; method: 'GET' | 'POST'; route: RelayRoute }> = [
+    // 登録開発者環境の設定がある時だけ: 固定MCP originの接続承認（内容の照会・明示承認）。
+    ...(sourceEnabled
+      ? [
+          { test: (p: string) => APPROVAL_PATH.test(p), method: 'GET' as const, route: { method: 'GET' as const, upstream: 'mcp' as const, timeoutMs: 11_000, body: 'none' as const, sign: true as const } },
+          { test: (p: string) => APPROVAL_PATH.test(p), method: 'POST' as const, route: { method: 'POST' as const, upstream: 'mcp' as const, timeoutMs: 11_000, body: 'approve' as const, sign: true as const } },
+        ]
+      : []),
     { test: (p) => p === '/v1/web/connection', method: 'GET', route: { method: 'GET', upstream: 'mcp', timeoutMs: 11_000, body: 'none' } },
     { test: (p) => p === '/v1/web/disconnect', method: 'POST', route: { method: 'POST', upstream: 'mcp', timeoutMs: 11_000, body: 'none' } },
-    { test: (p) => p === '/v2/commands', method: 'POST', route: { method: 'POST', upstream: 'api', timeoutMs: 26_000, body: 'json' } },
+    { test: (p) => p === '/v2/commands', method: 'POST', route: { method: 'POST', upstream: 'api', timeoutMs: 26_000, body: 'json', ...(sourceEnabled ? { sign: true as const } : {}) } },
     { test: (p) => COMMAND_PATH.test(p) && !p.endsWith('/cancel'), method: 'GET', route: { method: 'GET', upstream: 'api', timeoutMs: 11_000, body: 'none' } },
     { test: (p) => COMMAND_PATH.test(p) && p.endsWith('/cancel'), method: 'POST', route: { method: 'POST', upstream: 'api', timeoutMs: 6_000, body: 'none' } },
   ];
@@ -56,6 +74,107 @@ function relayRouteFor(method: string, path: string): RelayRoute | 'method' | nu
   const exact = matches.find((entry) => entry.method === method);
   return exact ? exact.route : 'method';
 }
+
+/** 登録開発者環境の署名に使う鍵（memoryだけ。browser・応答・ログへ出さない）。 */
+interface SourceSigner {
+  readonly sourceId: string;
+  readonly key: KeyObject;
+}
+
+function loadSourceSigner(source: { readonly sourceId: string; readonly keyFile: string }): SourceSigner {
+  let pem: Buffer;
+  try {
+    pem = readFileSync(source.keyFile);
+  } catch {
+    throw new ConsoleConfigFileError('unreadable');
+  }
+  try {
+    const key = createPrivateKey({ key: pem, format: 'pem' });
+    if (key.type !== 'private' || key.asymmetricKeyType !== 'ed25519') throw new ConsoleConfigFileError('invalid');
+    return Object.freeze({ sourceId: source.sourceId, key });
+  } catch {
+    throw new ConsoleConfigFileError('invalid');
+  } finally {
+    pem.fill(0);
+  }
+}
+
+const SOURCE_TEXT = {
+  en: {
+    title: 'Approve a connection (registered developer environment)',
+    label: 'Connection request reference shown on the plugin connection screen',
+    check: 'Check',
+    approve: 'Approve',
+    login: 'Sign in on this screen first.',
+    checked: 'Request for {client}. Approve only if you started this connection.',
+    approved: 'Approved. Continue on the original connection screen.',
+    failed: 'Could not check or approve this request.',
+  },
+  ja: {
+    title: '接続の承認（登録済み開発者環境）',
+    label: 'プラグイン接続画面に表示された接続要求の参照',
+    check: '確認',
+    approve: '承認',
+    login: '先にこの画面でログインしてください。',
+    checked: '{client} の接続要求です。自分で始めた接続の時だけ承認してください。',
+    approved: '承認しました。元の接続画面で続けてください。',
+    failed: 'この接続要求を確認・承認できませんでした。',
+  },
+} as const;
+
+function escapeAttribute(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/** 許可元の承認欄（登録開発者環境の設定がある時だけ）。参照の入力→確認→明示承認。元画面の同意はbrowserで続ける。 */
+function renderSourceApprovalSection(language: 'en' | 'ja', nonce: string): string {
+  const t = SOURCE_TEXT[language];
+  const data = Object.entries(t)
+    .map(([key, value]) => ` data-sttd-source-${key}="${escapeAttribute(value)}"`)
+    .join('');
+  return `<section id="sttd-source"${data} data-sttd-source-nonce="${escapeAttribute(nonce)}"><h3>${escapeAttribute(t.title)}</h3>
+<label for="sttd-source-ref">${escapeAttribute(t.label)}</label> <input id="sttd-source-ref" maxlength="128" autocomplete="off" spellcheck="false">
+<div class="sttd-actions"><button type="button" id="sttd-source-check">${escapeAttribute(t.check)}</button> <button type="button" id="sttd-source-approve" disabled>${escapeAttribute(t.approve)}</button></div>
+<p id="sttd-source-message" role="status"></p></section>
+<script type="module" src="${SOURCE_SCRIPT_PATH}"></script>`;
+}
+
+/**
+ * 承認欄のscript。同じ画面のFirebase SDK（同じmodule URL）のログイン中の本人tokenで、helperの承認routeだけを呼ぶ（nonce付き）。
+ * 鍵・署名はhelperだけが扱い、この画面は参照・本人token・明示操作だけを渡す。自動pollはしない。
+ */
+const SOURCE_SCRIPT = `import { getApps } from '${CONSOLE_SDK_BASE}firebase-app.js';
+import { getAuth } from '${CONSOLE_SDK_BASE}firebase-auth.js';
+const root = document.getElementById('sttd-source');
+const text = (key) => root.dataset['sttdSource' + key.charAt(0).toUpperCase() + key.slice(1)] || '';
+const input = document.getElementById('sttd-source-ref');
+const approve = document.getElementById('sttd-source-approve');
+const message = document.getElementById('sttd-source-message');
+const show = (value) => { message.textContent = value; };
+async function call(method) {
+  const ref = input.value.trim();
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(ref)) { show(text('failed')); return null; }
+  const app = getApps()[0];
+  const user = app ? getAuth(app).currentUser : null;
+  if (!user) { show(text('login')); return null; }
+  const token = await user.getIdToken();
+  const headers = { Authorization: 'Bearer ' + token, '${LOCAL_NONCE_HEADER}': root.dataset.sttdSourceNonce };
+  if (method === 'POST') headers['Content-Type'] = 'application/json';
+  const response = await fetch('/v1/source/approvals/' + ref, { method, headers, body: method === 'POST' ? '${APPROVE_BODY}' : undefined, credentials: 'omit', cache: 'no-store' });
+  if (!response.ok) { show(text('failed')); return null; }
+  return response.json();
+}
+document.getElementById('sttd-source-check').addEventListener('click', async () => {
+  approve.disabled = true;
+  const body = await call('GET').catch(() => null);
+  if (body && typeof body.client === 'string') { show(text('checked').replace('{client}', body.client)); approve.disabled = false; }
+});
+approve.addEventListener('click', async () => {
+  approve.disabled = true;
+  const body = await call('POST').catch(() => null);
+  if (body && body.state === 'approved') show(text('approved'));
+});
+`;
 
 /** 固定の非成功（値を持たない）。 */
 class RelayRefusal extends Error {
@@ -165,6 +284,8 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
   const log = options.log ?? (() => {});
   const nonce = randomBytes(32).toString('hex');
   const web = config.firebase;
+  // 登録開発者環境の鍵（設定がある時だけ、起動時に1回だけ読む。Ed25519以外・読めない鍵は起動しない）。
+  const signer = config.source === undefined ? null : loadSourceSigner(config.source);
 
   let port = requestedPort;
   let authority = '';
@@ -216,13 +337,34 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
       headers['Idempotency-Key'] = idempotency;
       body = await readBody(req, MAX_COMMAND_BODY_BYTES);
       if (body.length === 0) refuse(400, 'invalid_request');
+    } else if (route.body === 'approve') {
+      // 接続承認: 明示承認の固定本文だけ（他の本文・fieldは上流へ送らない）。
+      const contentType = single(raw, 'content-type');
+      if (contentType === undefined || contentType.split(';')[0]!.trim().toLowerCase() !== 'application/json') refuse(400, 'invalid_request');
+      const approval = await readBody(req, APPROVE_BODY.length);
+      if (approval.toString('utf8') !== APPROVE_BODY) refuse(400, 'invalid_request');
+      body = approval;
+      headers['Content-Type'] = 'application/json';
     } else {
       // 本文を持たないroute: 本文を示すheaderがあれば読む前に拒否し、無くても届いた本文は拒否する。
       const declared = single(raw, 'content-length');
       if ((declared !== undefined && declared !== '0') || single(raw, 'transfer-encoding') !== undefined || single(raw, 'content-type') !== undefined) refuse(400, 'invalid_request');
       if ((await readBody(req, MAX_COMMAND_BODY_BYTES)).length !== 0) refuse(400, 'invalid_request');
     }
-    const target = (route.upstream === 'api' ? config.apiOrigin : config.mcpOrigin) + path;
+    const upstreamOrigin = route.upstream === 'api' ? config.apiOrigin : config.mcpOrigin;
+    const target = upstreamOrigin + path;
+    // 登録開発者環境: 固定上流のこのroute/method/path/本文/本人token/Idempotency-Keyだけに署名する（任意宛先・任意headerの署名はしない）。
+    if (route.sign === true && signer !== null) {
+      const bearer = authorization.slice('Bearer '.length);
+      const nowSec = Math.floor(Date.now() / 1000);
+      const claims = { issuedAt: nowSec, expiresAt: nowSec + 30, nonce: randomBytes(16).toString('base64url') };
+      headers[SOURCE_HEADER] = signer.sourceId;
+      headers[SIGNATURE_HEADER] = signSourceRequest(
+        { audience: upstreamOrigin, method: route.method, path, search: '', sourceId: signer.sourceId, body: body ?? new Uint8Array(0), bearer, idempotencyKey: headers['Idempotency-Key'] },
+        claims,
+        signer.key,
+      );
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), route.timeoutMs);
     // browser側の切断/中止は上流へ伝える（正常に書き終えた後のcloseは中止にしない）。
@@ -285,7 +427,8 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
       const query = url.searchParams.get(LANGUAGE_QUERY);
       const language = selectLanguage({ query, cookie: req.headers.cookie, acceptLanguage: req.headers['accept-language'] });
       const extra: Record<string, string> = path === CONSOLE_PATH && isLanguage(query) ? { 'Set-Cookie': languageCookie(language, false) } : {};
-      const operatorSection = renderOperatorSection({ language, enabled: options.operator !== undefined, nonce, web });
+      const operatorSection =
+        renderOperatorSection({ language, enabled: options.operator !== undefined, nonce, web }) + (signer === null ? '' : renderSourceApprovalSection(language === 'ja' ? 'ja' : 'en', nonce));
       const operatorCodePanel = renderOperatorCodePanel({ language, enabled: options.operator !== undefined });
   const asset = consoleAsset(path, web, { language, nonce, secure: false, mcpOrigin: config.mcpOrigin, operatorSection, operatorFirst: options.operator !== undefined, operatorCodePanel })!;
       log({ event: 'local.asset', route: path });
@@ -296,7 +439,13 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
       log({ event: 'local.operator', route: path });
       return options.operator.handle(req, res, { path, method, nonce, origin });
     }
-    const route = relayRouteFor(method, path);
+    if (path === SOURCE_SCRIPT_PATH) {
+      if (signer === null) return sendLocalRefusal(res, 404, 'not_found');
+      if (method !== 'GET') return sendError(res, 405, 'method_not_allowed');
+      if ((await readBody(req, 0)).length !== 0) return sendError(res, 400, 'invalid_request');
+      return send(res, 200, 'text/javascript; charset=utf-8', SOURCE_SCRIPT);
+    }
+    const route = relayRouteFor(method, path, signer !== null);
     if (route === null) return sendLocalRefusal(res, 404, 'not_found');
     if (route === 'method') return sendLocalRefusal(res, 405, 'method_not_allowed');
     try {

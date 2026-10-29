@@ -310,6 +310,7 @@ export function createKmsSubscriptionRegistrationRuntime(options: KmsSubscriptio
   const accessDocRefForOwner = methodOf(connectTarget, 'accessDocRefForOwner');
   const grantMetaDocRef = methodOf(connectTarget, 'grantMetaDocRef');
   const grantUseDecision = methodOf(connectTarget, 'grantUseDecision');
+  const strictSources = (connectTarget as { readonly sourcesEnabled?: unknown }).sourcesEnabled === true;
   const connect = Object.freeze({
     ownerDocRef: (ownerId: string) => ownerDocRef(ownerId),
     grantDocRef: (grantId: string) => grantDocRef(grantId),
@@ -322,6 +323,18 @@ export function createKmsSubscriptionRegistrationRuntime(options: KmsSubscriptio
       const value = grantUseDecision(access, meta, ownerId);
       return value === 'allowed' || value === 'denied' ? value : 'unavailable';
     },
+    // 許可元strict（接続保存にsourceを結んだ配置）だけ: 購読保存の最終transactionで使うsource照合を同じ形で渡す。
+    ...(strictSources
+      ? {
+          sourcesEnabled: true,
+          grantSourceDocRefByHash: (grantHash: string) => methodOf(connectTarget, 'grantSourceDocRefByHash')(grantHash),
+          grantSourceRecordRef: (binding: unknown) => methodOf(connectTarget, 'grantSourceRecordRef')(binding),
+          grantSourceDecision: (binding: unknown, source: unknown, at: number) => {
+            const value = methodOf(connectTarget, 'grantSourceDecision')(binding, source, at);
+            return value === 'allowed' || value === 'denied' ? value : 'unavailable';
+          },
+        }
+      : {}),
   }) as unknown as KmsSubscriptionRegistrationConnect;
 
   const hashMethod = methodOf(fields.get('hasher'), 'hash');

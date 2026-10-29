@@ -173,9 +173,16 @@ export interface ValidatedCommandDelivery {
   ): Promise<DeliveryResponse>;
 }
 
-/** 送信APIの入口が使う暗号文送信のport。 */
+/** 送信APIの入口が使う暗号文送信のport。requestCheckは許可元strictの配置だけ（送出確定のtxで入口のsourceを照合）。 */
 export interface EncryptedCommandEndpoint {
-  post(identity: VerifiedIdentity, idempotencyKey: string | undefined, wire: Buffer, receivedAt: number, operation: DeliveryRequestOperation): Promise<DeliveryResponse>;
+  post(
+    identity: VerifiedIdentity,
+    idempotencyKey: string | undefined,
+    wire: Buffer,
+    receivedAt: number,
+    operation: DeliveryRequestOperation,
+    requestCheck?: (tx: Transaction) => Promise<boolean>,
+  ): Promise<DeliveryResponse>;
 }
 
 export interface EncryptedCommandDeps {
@@ -194,7 +201,14 @@ class Stopped extends Error {}
 
 export function createEncryptedCommandEndpoint(deps: EncryptedCommandDeps): EncryptedCommandEndpoint {
   const { environment, store, secrets, hasher, clock, delivery } = deps;
-  async function post(identity: VerifiedIdentity, idempotencyKey: string | undefined, wire: Buffer, receivedAt: number, operation: DeliveryRequestOperation): Promise<DeliveryResponse> {
+  async function post(
+    identity: VerifiedIdentity,
+    idempotencyKey: string | undefined,
+    wire: Buffer,
+    receivedAt: number,
+    operation: DeliveryRequestOperation,
+    requestCheck?: (tx: Transaction) => Promise<boolean>,
+  ): Promise<DeliveryResponse> {
     // 元のingressの期限・中断（20秒を取り直さない）。時計の不正も続行不可。
     const live = (): void => {
       if (operation.signal.aborted) throw new Stopped();
@@ -281,8 +295,10 @@ export function createEncryptedCommandEndpoint(deps: EncryptedCommandDeps): Encr
       let keyAccepted = false;
       const keyCheck = async (tx: Transaction): Promise<boolean> => {
         const usable = (await store.checkKeyEvidence(tx, evidence)) === 'usable';
-        keyAccepted = usable;
-        return usable;
+        // strict: 鍵に加えて、入口で認可したsourceも同じ送出確定のtxで照合する（どちらかが使えなければ送出0）。
+        const sourceUsable = usable && (requestCheck === undefined || (await requestCheck(tx)));
+        keyAccepted = sourceUsable;
+        return sourceUsable;
       };
       const response = await delivery.postValidated(binding.ownerId, input, receivedAt, operation, keyCheck);
       // この要求の配送がcallback成功として確定した時だけ、同じ本人・ring・元operationの範囲でringの最終利用を更新する。
