@@ -152,6 +152,15 @@ export interface ReceiverResetView {
  * OAuth interactionの2画面目: 認証済み本人への明示の許可（1画面）。言語リンクはformの外にあり、同意・拒否を送らない。
  * receiverがある時は、以前の受信先設定の削除を明示し、初期未選択の確認欄と削除を含む許可の文言にする（未選択なら削除しない）。
  */
+/**
+ * 許可元strictの同意画面の表示（compatibleはnull）。referenceは権限のない接続要求参照（元interaction ID）、stateは承認待ち・承認済み・
+ * 承認が無く同意できなかった（再表示）の区別。表示だけで、承認状態の匿名照会・自動pollは無い（通常の再表示で更新）。
+ */
+export interface SourceConsentView {
+  readonly reference: string;
+  readonly state: 'waiting' | 'confirmed' | 'required';
+}
+
 export function renderInteractionConsent(
   web: FirebaseWebConfig,
   uid: string,
@@ -159,10 +168,21 @@ export function renderInteractionConsent(
   csrf: string,
   language: Language = DEFAULT_LANGUAGE,
   receiver: ReceiverResetView | null = null,
+  source: SourceConsentView | null = null,
 ): string {
   const lang = languageOf(language);
   const t = (key: MessageKey) => escapeHtml(text(lang, key));
   const action = `/interaction/${escapeHtml(uid)}`;
+  const sourceBlock =
+    source === null
+      ? ''
+      : `<section id="sttd-source-approval" data-sttd-source-state="${source.state}">
+<h2>${t('interaction.source.title')}</h2>
+<p>${t('interaction.source.reference')}<code id="sttd-source-reference">${escapeHtml(source.reference)}</code></p>
+<p>${t('interaction.source.howto')}</p>
+<p role="status">${t(source.state === 'confirmed' ? 'interaction.source.confirmed' : source.state === 'required' ? 'interaction.source.required' : 'interaction.source.waiting')}</p>
+</section>
+`;
   const confirm = receiver !== null && receiver.confirm;
   const reset =
     receiver === null
@@ -180,7 +200,7 @@ ${
     'interaction-consent',
     lang,
     action,
-    `<p>${escapeHtml(clientLabel)}${t('interaction.consentQuestion')}</p>
+    `${sourceBlock}<p>${escapeHtml(clientLabel)}${t('interaction.consentQuestion')}</p>
 <form method="post" action="${action}/consent">
 <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
 ${reset}<button type="submit">${t(confirm ? 'interaction.receiverReset.allow' : 'interaction.allow')}</button>

@@ -72,5 +72,5 @@ MacはNode.js 22.23.2/npm 12.0.2で、`npm ci --ignore-scripts --no-audit --no-f
 
 - App Check方式はbearer tokenの消費で、要求本文・宛先・本人tokenへの束縛やnative/debugの判別はありません。consumeは追加の通信・権限が要り、SDK機能はbetaです。実SDK・実機・実App IDでの確認は各配置で行ってください。
 - strictへ切り替えると、source bindingの無い既存の接続・購読は使えず、本人の再承認・再同意が要ります。
-- 同意画面には接続要求の参照・案内の専用表示がまだ無く、参照は接続画面のURLのinteraction IDです。
+- 同意画面の承認状態は自動更新しません（承認後に再読み込みしてください）。
 - 送出を確定した後のHTTP送信は撤回できません。開始済みのSDK内部I/Oを物理的に止める保証はありません。

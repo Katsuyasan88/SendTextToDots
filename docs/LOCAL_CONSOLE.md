@@ -94,4 +94,4 @@ operatorの照会用secretはhelperのメモリだけにあり、helperを終了
 
 管理者が`manage-sources.mjs register-developer`でこのPCの公開鍵を登録した場合だけ、helperの設定JSONへ`"source": {"sourceId": "src_…", "keyFile": "<Ed25519秘密鍵(PKCS#8 PEM)のpath>"}`を加えます。helperは起動時に鍵を1回読み、memoryだけに持ちます（browser・URL・CLI引数・ログへ出しません）。鍵fileはこのPCの自分だけが読めるようにしてください。
 
-この設定がある時だけ、helperは固定上流への`POST /v2/commands`（apiOrigin）と接続承認`GET/POST /v1/source/approvals/{interactionId}`（mcpOrigin）に許可元の署名を付けます。照会/取消・接続状態/解除には付けません。任意の宛先・headerへ署名する口はありません。送信画面に「接続の承認」欄が出るので、プラグイン接続画面のURLにあるinteraction IDを入れて「確認」→内容を確かめて「承認」し、元の接続画面で同意を続けます。自動pollはしません。鍵がEd25519でない・読めない・設定の形が違う時はhelperが起動しません。
+この設定がある時だけ、helperは固定上流への`POST /v2/commands`（apiOrigin）と接続承認`GET/POST /v1/source/approvals/{interactionId}`（mcpOrigin）に許可元の署名を付けます。照会/取消・接続状態/解除には付けません。任意の宛先・headerへ署名する口はありません。送信画面に「接続の承認」欄が出るので、プラグイン接続画面に表示された接続要求の参照を入れて「確認」→内容を確かめて「承認」し、元の接続画面で同意を続けます。この欄は「確認」を押すまでFirebase SDKを読み込まず通信もしません。承認は確認した参照・ログイン中の本人にだけ送り、確認の後に参照やアカウントを変えると確認からやり直しになります（承認の後も再確認が必要）。自動pollはしません。鍵がEd25519でない・読めない・設定の形が違う時はhelperが起動しません。

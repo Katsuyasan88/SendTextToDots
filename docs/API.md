@@ -250,9 +250,9 @@ console.log(response.status, await response.json());
 
 strictでは、Dots等のOAuth接続は同じ本人が許可元で明示承認してからだけ完了します。Dotsへ追加のheaderは要求しません。
 
-1. 元browserの接続画面（`/interaction/{interactionId}`）でログインします。接続要求の参照は、その画面のURLのinteraction IDです（この版では同意画面に参照・案内の専用表示はありません）。参照には権限が無く、参照だけではlogin・同意・Grantは作られません。
+1. 元browserの接続画面（`/interaction/{interactionId}`）でログインします。strictの同意画面は、権限の無い接続要求の参照（interaction ID）、許可元での確認・承認の方法、状態（承認待ち・承認済み・承認なしで同意できなかった）を日英で表示します。状態は通常の表示・再読み込み・同意の操作の時だけ更新し、匿名の状態APIや自動pollはありません。参照だけではlogin・同意・Grantは作られません。
 2. 許可元（登録app、またはローカル送信画面の登録開発者環境）が、MCP originの`GET /v1/source/approvals/{interactionId}`で内容を確認し、`POST /v1/source/approvals/{interactionId}`（`Content-Type: application/json`、本文は正確に`{"approve":true}`）で明示承認します。どちらもqueryなし、`Authorization: Bearer <同じ本人のFirebase ID token>`と上の許可元証明（`connect`操作。署名の宛先はMCP origin、pathはこのpath、GETの本文は空）が必要です。App Check tokenはGET/POSTとも消費します。GETの応答は`{"client","scope","resource","expiresAt"}`、POSTは`{"state":"approved","expiresAt"}`です。
-3. 元browserで同意を押します。同意の最終transactionで、承認（同じ本人・client・resource・期限内・未消費・sourceが現在有効）を単回消費し、Grantへsource ID/世代を結びます。承認が無い同意は、interactionを消費せずに同意画面を再表示（409）します。
+3. 元browserで同意を押します。同意の最終transactionで、承認（同じ本人・client・resource・期限内・未消費・sourceが現在有効）を単回消費し、Grantへsource ID/世代を結びます。承認が無い（または承認後にsourceが停止・削除・世代変更された）同意は、interactionの消費・受信先設定の削除の前に止め、「承認なし」の状態つきで同意画面を再表示（409）します。この事前確認の後、Grant保存までの間に停止が確定した場合は、既存の「接続未完了」の結果になります。
 
 承認は元interactionの期限以内かつ最大5分です。未ログイン・別本人・期限切れ・消費済みのinteractionは同じ`404 not_found`、証明の欠落/不正は上と同じ403、承認済みへの再承認は`409 approval_exists`、障害は503です。承認状態の匿名照会や自動pollはありません。
 

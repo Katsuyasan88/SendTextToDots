@@ -54,6 +54,73 @@ export interface SourceGateDeps {
   readonly appCheck?: AppCheckVerifier | undefined;
 }
 
+/** 接続承認のPOST本文（明示承認だけ。余分なfield・空白なし）。 */
+export const APPROVE_BODY = '{"approve":true}';
+const APPROVAL_BODY_MAX_BYTES = 64;
+
+/**
+ * 接続承認のPOST本文を、元要求のoperation（期限・中止）の中だけで最大64byte読む。超過・切断・中止・期限はnullで、どの終わり方でも
+ * timer・全listenerを外し、読んだchunkを0埋めし、残りの本文は捨てる（元期限を延長しない。新しいretry・待機は作らない）。
+ */
+export function readApprovalBody(
+  req: NodeJS.ReadableStream & { readonly complete?: boolean; readonly destroyed?: boolean },
+  operation: { readonly deadlineAt: number; readonly signal: AbortSignal },
+  clock: { now(): number },
+): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    let chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (value: Buffer | null): void => {
+      if (done) return;
+      done = true;
+      if (timer !== undefined) clearTimeout(timer);
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onStop);
+      req.off('aborted', onStop);
+      req.off('close', onClose);
+      operation.signal.removeEventListener('abort', onStop);
+      const body = value === null ? null : Buffer.concat(chunks);
+      for (const chunk of chunks) chunk.fill(0);
+      chunks = [];
+      if (value === null && req.destroyed !== true) req.resume();
+      resolve(body);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
+      size += buffer.length;
+      if (size > APPROVAL_BODY_MAX_BYTES) {
+        buffer.fill(0);
+        finish(null);
+      } else chunks.push(buffer);
+    };
+    const onEnd = (): void => finish(Buffer.alloc(0));
+    const onStop = (): void => finish(null);
+    const onClose = (): void => {
+      if (req.complete !== true) finish(null);
+    };
+    let remaining: number;
+    try {
+      remaining = operation.deadlineAt - clock.now();
+    } catch {
+      remaining = Number.NaN;
+    }
+    if (operation.signal.aborted || !(remaining > 0)) {
+      finish(null);
+      return;
+    }
+    timer = setTimeout(onStop, remaining);
+    req.on('data', onData);
+    req.once('end', onEnd);
+    req.once('error', onStop);
+    req.once('aborted', onStop);
+    req.once('close', onClose);
+    operation.signal.addEventListener('abort', onStop, { once: true });
+  });
+}
+
 export class SourceGateConfigError extends Error {
   override readonly name = 'SourceGateConfigError';
   constructor() {

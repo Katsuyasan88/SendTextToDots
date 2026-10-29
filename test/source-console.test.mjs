@@ -111,3 +111,130 @@ test('登録環境の鍵: Ed25519以外・読めないfile・不正な設定は�
     rmSync(ec.dir, { recursive: true, force: true });
   }
 });
+
+// ---- 配信する実際の承認欄script（/console/source.js）を、合成DOM・合成Firebase SDK・合成fetchで実行する（実browser/実SDKの合格ではない） ----
+
+const LOADER_LINE = 'const loadSdk = (url) => import(url);';
+
+async function servedScript() {
+  const key = keyFile();
+  const { console } = await start({ ...baseConfig, source: { sourceId: SOURCE, keyFile: key.path } });
+  try {
+    return await (await globalThis.fetch(`${console.origin}/console/source.js`)).text();
+  } finally {
+    await console.close();
+    rmSync(key.dir, { recursive: true, force: true });
+  }
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+function element(extra = {}) {
+  const handlers = {};
+  return {
+    value: '',
+    disabled: false,
+    textContent: '',
+    dataset: {},
+    addEventListener: (type, handler) => (handlers[type] = handler),
+    fire: (type) => handlers[type]?.(),
+    ...extra,
+  };
+}
+
+/** 合成環境で配信scriptを実行する。SDKの遅延importの1行だけを合成loaderへ差し替える（他は配信されたbytesのまま）。 */
+function runScript(script, { gate = {} } = {}) {
+  assert.equal(script.split(LOADER_LINE).length, 2);
+  assert.ok(!/^\s*import\s/m.test(script), 'no static import');
+  const root = element({
+    dataset: { sttdSourceNonce: 'nonce', sttdSourceFailed: 'failed', sttdSourceLogin: 'login', sttdSourceChecked: 'checked {client}', sttdSourceApproved: 'approved' },
+  });
+  const nodes = { 'sttd-source': root, 'sttd-source-ref': element(), 'sttd-source-check': element(), 'sttd-source-approve': element({ disabled: true }), 'sttd-source-message': element() };
+  const user = (uid) => ({ uid, getIdToken: () => (gate.token ? gate.token.promise.then(() => `token-${uid}`) : Promise.resolve(`token-${uid}`)) });
+  const users = { a: user('a'), b: user('b') };
+  const auth = { currentUser: users.a, listener: null };
+  const loads = [];
+  const fetches = [];
+  const sdk = {
+    'firebase-app.js': { getApps: () => [{ name: '[DEFAULT]' }] },
+    'firebase-auth.js': { getAuth: () => auth, onAuthStateChanged: (target, listener) => (auth.listener = listener) },
+  };
+  const load = async (url) => {
+    loads.push(url);
+    return sdk[url.split('/').pop()];
+  };
+  const fetch = async (url, init) => {
+    fetches.push({ url, method: init.method, authorization: init.headers.Authorization });
+    if (init.method === 'GET' && gate.get) await gate.get.promise;
+    return { ok: true, json: async () => (init.method === 'GET' ? { client: 'Dots' } : { state: 'approved' }) };
+  };
+  new Function('document', 'fetch', '__load', script.replace(LOADER_LINE, 'const loadSdk = (url) => __load(url);'))({ getElementById: (id) => nodes[id] }, fetch, load);
+  const type = (value) => {
+    nodes['sttd-source-ref'].value = value;
+    nodes['sttd-source-ref'].fire('input');
+  };
+  const switchUser = (next) => {
+    auth.currentUser = next;
+    auth.listener?.(next);
+  };
+  return { nodes, users, auth, loads, fetches, type, switchUser, check: () => nodes['sttd-source-check'].fire('click'), approve: () => nodes['sttd-source-approve'].fire('click') };
+}
+
+test('承認欄script: 初期表示ではSDK import・通信0、確認Aの後に入力Bへ変えると承認できない', async () => {
+  const script = await servedScript();
+  const env = runScript(script);
+  assert.equal(env.loads.length, 0);
+  assert.equal(env.fetches.length, 0);
+  env.type('ref-a');
+  await env.check();
+  assert.equal(env.nodes['sttd-source-approve'].disabled, false);
+  assert.ok(env.loads.every((url) => url.startsWith('https://www.gstatic.com/firebasejs/')));
+  env.type('ref-b');
+  assert.equal(env.nodes['sttd-source-approve'].disabled, true);
+  await env.approve();
+  assert.equal(env.fetches.filter((call) => call.method === 'POST').length, 0);
+  // 正規: 確認した参照だけへ1回POSTし、2回目のclickは再確認が要る。
+  await env.check();
+  await Promise.all([env.approve(), env.approve()]);
+  const posts = env.fetches.filter((call) => call.method === 'POST');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, '/v1/source/approvals/ref-b');
+  await env.approve();
+  assert.equal(env.fetches.filter((call) => call.method === 'POST').length, 1);
+  assert.equal(env.nodes['sttd-source-message'].textContent, 'approved');
+  assert.ok(!JSON.stringify(env.nodes).includes('token-'));
+});
+
+test('承認欄script: GET/token待機中の本人・入力変更と多重clickでは遅い結果を採用しない', async () => {
+  const script = await servedScript();
+  // GET待機中に本人が変わる。
+  const gate = { get: deferred() };
+  const env = runScript(script, { gate });
+  env.type('ref-a');
+  const first = env.check();
+  await env.check(); // 確認中の2回目は無視
+  await new Promise((resolve) => setImmediate(resolve));
+  env.switchUser(env.users.b);
+  gate.get.resolve();
+  await first;
+  assert.equal(env.fetches.filter((call) => call.method === 'GET').length, 1);
+  assert.equal(env.nodes['sttd-source-approve'].disabled, true);
+  await env.approve();
+  assert.equal(env.fetches.filter((call) => call.method === 'POST').length, 0);
+
+  // token待機中に入力が変わる: GETを送らない。
+  const tokenGate = { token: deferred() };
+  const other = runScript(script, { gate: tokenGate });
+  other.type('ref-a');
+  const pending = other.check();
+  await new Promise((resolve) => setImmediate(resolve));
+  other.type('ref-c');
+  tokenGate.token.resolve();
+  await pending;
+  assert.equal(other.fetches.length, 0);
+  assert.equal(other.nodes['sttd-source-approve'].disabled, true);
+});

@@ -236,3 +236,103 @@ test('二配置: Aの承認・Grant bindingはBで使えない', async () => {
   assert.equal(await a.storage.putGrantMeta('grant-a', consent, a.approvalRequest('ia-1')), 'created');
   assert.equal(await b.storage.grantSourceUsable('grant-a'), false);
 });
+
+test('同意前の確認: 承認後にsourceを停止すると待機中と同じ（同意の消費・受信先設定の削除へ進まない）', async () => {
+  const d = deployment();
+  await consented(d, 'uid-a', 'ia-1');
+  const source = await registerDeveloper(d, 'uid-a');
+  await approve(d, 'uid-a', 'ia-1', source);
+  const request = d.approvalRequest('ia-1');
+  assert.equal(await d.sources.approvalPending(request), true);
+  // 別client/resourceの承認としては扱わない。
+  assert.equal(await d.sources.approvalPending({ ...request, clientHash: 'e'.repeat(64) }), false);
+  const status = await runSourceAdmin({ command: 'status', project: 'p', database: 'd', namespace: d.NS, source: source.sourceId }, null, d.deps);
+  await runSourceAdmin({ command: 'disable', project: 'p', database: 'd', namespace: d.NS, source: source.sourceId, expect: status.version }, null, d.deps);
+  assert.equal(await d.sources.approvalPending(request), false);
+});
+
+test('同意画面: strictだけ参照・承認方法・状態（待機/承認済み/承認なし）を日英で表示し、compatibleは従来どおり', async () => {
+  const { renderInteractionConsent } = await import('../dist/connect/pages.js');
+  const web = { apiKey: 'synthetic-key', authDomain: 'synthetic.example.org', projectId: PROJECT };
+  const compatible = renderInteractionConsent(web, 'ia-ref', 'Dots', 'csrf-1', 'en', null);
+  assert.ok(!compatible.includes('sttd-source-approval'));
+  for (const [language, expected] of [
+    ['en', { waiting: 'waiting for approval', confirmed: 'approved at your trusted source', required: 'no valid approval' }],
+    ['ja', { waiting: '承認待ち', confirmed: '承認済み', required: '有効な承認がまだありません' }],
+  ]) {
+    for (const state of ['waiting', 'confirmed', 'required']) {
+      const html = renderInteractionConsent(web, 'ia-ref', 'Dots', 'csrf-1', language, { token: 'tok', confirm: true }, { reference: 'ia-ref', state });
+      assert.ok(html.includes('<code id="sttd-source-reference">ia-ref</code>'));
+      assert.ok(html.includes(`data-sttd-source-state="${state}"`));
+      assert.ok(html.includes(expected[state]), `${language}/${state}`);
+      // 既存のCSRF・受信先設定の確認欄は残る。
+      assert.ok(html.includes('name="csrf" value="csrf-1"') && html.includes('name="receiverReset"'));
+    }
+  }
+  const escaped = renderInteractionConsent(web, 'x', 'Dots', 'c', 'en', null, { reference: '<script>', state: 'waiting' });
+  assert.ok(!escaped.includes('<script>'));
+});
+
+test('承認本文: 元operationの期限・中止・切断・超過で清掃して終わり、listenerを残さない', async () => {
+  const { PassThrough } = await import('node:stream');
+  const { readApprovalBody } = await import('../dist/source/http.js');
+  const clock = { now: () => Date.now() };
+  const listeners = (stream) => ['data', 'end', 'error', 'aborted', 'close'].reduce((sum, name) => sum + stream.listenerCount(name), 0);
+  const op = (ms = 5_000) => {
+    const controller = new AbortController();
+    return { controller, operation: { deadlineAt: Date.now() + ms, signal: controller.signal } };
+  };
+  // 正規
+  {
+    const stream = new PassThrough();
+    const { operation } = op();
+    const pending = readApprovalBody(stream, operation, clock);
+    stream.end('{"approve":true}');
+    assert.equal((await pending).toString('utf8'), '{"approve":true}');
+    assert.equal(listeners(stream), 0);
+  }
+  // 遅いbody: 元期限で終わる（延長しない）
+  {
+    const stream = new PassThrough();
+    const { operation } = op(50);
+    const started = Date.now();
+    assert.equal(await readApprovalBody(stream, operation, clock), null);
+    assert.ok(Date.now() - started < 2_000);
+    assert.equal(listeners(stream), 0);
+  }
+  // 中止
+  {
+    const stream = new PassThrough();
+    const { controller, operation } = op();
+    const pending = readApprovalBody(stream, operation, clock);
+    stream.write('{"appr');
+    controller.abort();
+    assert.equal(await pending, null);
+    assert.equal(listeners(stream), 0);
+  }
+  // 超過
+  {
+    const stream = new PassThrough();
+    const { operation } = op();
+    const pending = readApprovalBody(stream, operation, clock);
+    stream.write('x'.repeat(65));
+    assert.equal(await pending, null);
+    assert.equal(listeners(stream), 0);
+  }
+  // 切断（completeでないclose）
+  {
+    const stream = new PassThrough();
+    const { operation } = op();
+    const pending = readApprovalBody(stream, operation, clock);
+    stream.destroy();
+    assert.equal(await pending, null);
+  }
+  // 既に中止済み・期限切れは読み始めない
+  {
+    const stream = new PassThrough();
+    const { controller, operation } = op();
+    controller.abort();
+    assert.equal(await readApprovalBody(stream, operation, clock), null);
+    assert.equal(listeners(stream), 0);
+  }
+});

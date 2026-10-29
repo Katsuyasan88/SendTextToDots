@@ -69,8 +69,9 @@ import { AUTH_STORAGE_ROOT, KMS_SUBSCRIPTION_CONFIG_DOC } from '../storage/fires
 import { createAppCheckVerifier, type AppCheckAdminLike } from '../source/app-check.js';
 import { parseSourceAuthorization, type StrictSourcePolicy } from '../source/contract.js';
 import { SourceStore } from '../source/firestore.js';
-import { createSourceGate, type SourceGate } from '../source/http.js';
+import { APPROVE_BODY, createSourceGate, readApprovalBody, type SourceGate } from '../source/http.js';
 import { sourceApprovalId } from '../source/proof.js';
+import type { SourceConsentView } from './pages.js';
 import { AccessUnavailableError, ConnectStorage, isConnectNamespace, type SourceApprovalRequest } from './firestore.js';
 import { isLanguage, LANGUAGE_QUERY, languageCookie, selectLanguage, type Language } from './i18n.js';
 import { createConnectKmsSealingPort } from './kms-port.js';
@@ -135,8 +136,6 @@ export async function auditedRevoke(model: string, revoke: () => Promise<void>, 
 
 const REQUIRED = ['bindPort', 'db', 'namespace', 'kms', 'secrets', 'identity', 'web', 'clientEgress', 'verificationSender', 'clock', 'publicOrigin'] as const;
 const OPTIONAL = ['log', 'startupOperation', 'developerCode', 'sourceAuthorization'] as const;
-/** 接続承認のPOST本文（明示承認だけ。余分なfield・空白なし）。 */
-const APPROVE_BODY = '{"approve":true}';
 const DEVELOPER_CODE_KEYS = ['auth', 'databaseId'] as const;
 const DEVELOPER_CODE_OPTIONAL = ['store', 'bindLookup'] as const;
 
@@ -1165,17 +1164,44 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       const html =
         opened.ownerId === null
           ? renderInteractionLogin(web, uid, label, opened.csrf, language, developerExchange() !== null)
-          : renderInteractionConsent(web, uid, label, opened.csrf, language, snapshot === null ? null : { token: snapshot.token, confirm: snapshot.present });
+          : renderInteractionConsent(
+              web,
+              uid,
+              label,
+              opened.csrf,
+              language,
+              snapshot === null ? null : { token: snapshot.token, confirm: snapshot.present },
+              await sourceConsentView(uid, interaction.params.client_id, false),
+            );
       send(res, 200, 'text/html; charset=utf-8', html, { ...pageSecurityHeaders(web), ...headers });
     }
 
-    /** 削除をしなかった（未確認・設定の変化）時の同意画面の再表示（409）。interactionは消費していない。 */
-    async function reshowConsent(req: IncomingMessage, res: ServerResponse, uid: string, url: URL, label: string): Promise<void> {
+    /**
+     * strictの同意画面の許可元表示（compatibleはnull）。参照は元interaction ID（権限なし）。承認の有無は通常の画面表示/再表示の時に
+     * 読取りだけで確かめる（匿名の状態API・自動pollは無い）。missingは同意が承認なしで止まった再表示。
+     */
+    async function sourceConsentView(uid: string, clientId: unknown, missing: boolean): Promise<SourceConsentView | null> {
+      if (sourceStore === null) return null;
+      const ready = await guarded(() => sourceStore.approvalPending(approvalRequest(uid, String(clientId))));
+      return { reference: uid, state: ready ? 'confirmed' : missing ? 'required' : 'waiting' };
+    }
+
+    /** 削除をしなかった（未確認・設定の変化）・strictで承認が無い時の同意画面の再表示（409）。interactionは消費していない。 */
+    async function reshowConsent(req: IncomingMessage, res: ServerResponse, uid: string, url: URL, label: string, clientId: unknown, sourceMissing = false): Promise<void> {
       const opened = await guarded(() => storage.openInteraction(uid));
       if (opened === undefined || opened.ownerId === null) throw apiErrors.linkUnavailable();
       const snapshot = await guarded(() => storage.receiverSnapshot(uid));
       const { language, headers } = pageLanguage(req, url);
-      const html = renderInteractionConsent(web, uid, label, opened.csrf, language, snapshot === null ? null : { token: snapshot.token, confirm: snapshot.present, required: true });
+      const html = renderInteractionConsent(
+        web,
+        uid,
+        label,
+        opened.csrf,
+        language,
+        // 承認が無いことだけで止めた再表示では、受信先設定の確認の要求（required）は出さない（何も確認・削除していない）。
+        snapshot === null ? null : { token: snapshot.token, confirm: snapshot.present, ...(sourceMissing ? {} : { required: true }) },
+        await sourceConsentView(uid, clientId, sourceMissing),
+      );
       send(res, 409, 'text/html; charset=utf-8', html, { ...pageSecurityHeaders(web), ...headers });
     }
 
@@ -1277,7 +1303,7 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       const approval = sourceStore === null ? undefined : approvalRequest(uid, String(interaction.params.client_id));
       if (sourceStore !== null && approval !== undefined && !(await guarded(() => sourceStore.approvalPending(approval)))) {
         log({ event: 'interaction.source_approval_required' });
-        return reshowConsent(req, res, uid, url, await clientLabel(interaction.params.client_id));
+        return reshowConsent(req, res, uid, url, await clientLabel(interaction.params.client_id), interaction.params.client_id, true);
       }
       // 同意の消費（受信先設定の削除の確認を含む）・Grant・grantMeta・redirectは、純粋なportの手順（interaction-consent.ts）で行う。
       // 同意は同ownerと元interactionへ単回で束縛し、grantMetaは同じtransactionで利用許可の世代と受信reset世代を再確認する。
@@ -1309,7 +1335,7 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         case 'access_denied':
           return sendAccessDenied(req, res, uid, url);
         case 'reshow':
-          return reshowConsent(req, res, uid, url, await clientLabel(interaction.params.client_id));
+          return reshowConsent(req, res, uid, url, await clientLabel(interaction.params.client_id), interaction.params.client_id);
         case 'receiver_reset':
           return sendReceiverResetOutcome(req, res, uid, url, result.outcome);
       }
@@ -1319,34 +1345,6 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
     function sendReceiverResetOutcome(req: IncomingMessage, res: ServerResponse, uid: string, url: URL, outcome: 'incomplete' | 'unknown' | 'reset_unknown'): void {
       const { language, headers } = pageLanguage(req, url);
       send(res, 503, 'text/html; charset=utf-8', renderReceiverResetOutcome(web, uid, outcome, language), { ...pageSecurityHeaders(web), ...headers });
-    }
-
-    /** POST本文（明示承認だけ）を最大64byteまで読む（超過・切断はnull）。 */
-    function readApprovalBody(req: IncomingMessage): Promise<Buffer | null> {
-      return new Promise((resolve) => {
-        const chunks: Buffer[] = [];
-        let size = 0;
-        let done = false;
-        const finish = (value: Buffer | null) => {
-          if (done) return;
-          done = true;
-          req.off('data', onData);
-          req.off('end', onEnd);
-          req.off('error', onError);
-          if (value === null && !req.destroyed) req.resume();
-          resolve(value);
-        };
-        const onData = (chunk: Buffer) => {
-          size += chunk.length;
-          if (size > 64) finish(null);
-          else chunks.push(chunk);
-        };
-        const onEnd = () => finish(Buffer.concat(chunks));
-        const onError = () => finish(null);
-        req.on('data', onData);
-        req.once('end', onEnd);
-        req.once('error', onError);
-      });
     }
 
     /**
@@ -1367,7 +1365,8 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       } else {
         const type = req.headers['content-type'];
         if (typeof type !== 'string' || !/^application\/json\s*(;\s*charset=utf-8\s*)?$/i.test(type.trim())) throw apiErrors.invalidRequest();
-        const read = await guarded(() => readApprovalBody(req));
+        // 本文待ちは元要求のoperation（期限・中止）の中だけ。切断・期限・中止では清掃してnull（本人確認・保存へ進まない）。
+        const read = await guarded(() => readApprovalBody(req, context.current(), clock));
         if (read === null || read.toString('utf8') !== APPROVE_BODY) throw apiErrors.invalidRequest();
         body = read;
       }

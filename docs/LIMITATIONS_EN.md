@@ -72,5 +72,5 @@ The locally verified versions are Node.js 22.23.4/npm 10.9.9. The package's `eng
 
 - The App Check method consumes a bearer token; it neither binds the request body, destination or identity token nor distinguishes native from debug credentials. Consumption needs an extra network call and permissions, and the SDK feature is beta. Confirm it with your real SDK, devices and App IDs in your own deployment.
 - After switching to strict, existing connections and subscriptions without a source binding cannot be used; the person must approve and consent again.
-- The consent screen does not yet show a dedicated connection request reference or guidance; the reference is the interaction ID in the connection screen's URL.
+- The consent screen does not refresh the approval state automatically (reload it after approving).
 - An HTTP delivery already confirmed cannot be recalled, and SDK-internal I/O already started is not guaranteed to stop physically.

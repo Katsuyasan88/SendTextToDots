@@ -50,8 +50,7 @@ interface RelayRoute {
 /** 接続承認の参照（元interaction ID）。 */
 const APPROVAL_PATH = /^\/v1\/source\/approvals\/([A-Za-z0-9_-]{1,128})$/;
 /** 接続承認のPOST本文（明示承認だけ）。 */
-const APPROVE_BODY = '{"approve":true}';
-/** 許可元の承認画面のscript（同origin。CSPのscript-src 'self'）。 */
+const APPROVE_BODY = '{"approve":true}';/** 許可元の承認画面のscript（同origin。CSPのscript-src 'self'）。 */
 export const SOURCE_SCRIPT_PATH = '/console/source.js';
 
 function relayRouteFor(method: string, path: string, sourceEnabled = false): RelayRoute | 'method' | null {
@@ -140,39 +139,87 @@ function renderSourceApprovalSection(language: 'en' | 'ja', nonce: string): stri
 }
 
 /**
- * 承認欄のscript。同じ画面のFirebase SDK（同じmodule URL）のログイン中の本人tokenで、helperの承認routeだけを呼ぶ（nonce付き）。
- * 鍵・署名はhelperだけが扱い、この画面は参照・本人token・明示操作だけを渡す。自動pollはしない。
+ * 承認欄のscript。初期表示では何もimport・通信しない（Firebase SDKは「確認」の明示操作の時に、画面と同じ固定URLから遅延importし、
+ * 既存のApp（getApps()[0]）だけを使う。新しいApp・別projectは作らない）。確認したGETの結果を参照・本人（user object）・操作世代へ束縛し、
+ * 入力・本人の変更で確認と承認可能状態を破棄する。待機中に変わった遅い結果は採用しない。確認中/承認中の多重clickは1操作だけ。
+ * 承認は確認済みの参照だけへ1回送り、成功/失敗の後は再確認を要求する。token・UID・鍵はDOM・ログへ保存しない。自動pollはしない。
  */
-const SOURCE_SCRIPT = `import { getApps } from '${CONSOLE_SDK_BASE}firebase-app.js';
-import { getAuth } from '${CONSOLE_SDK_BASE}firebase-auth.js';
+const SOURCE_SCRIPT = `const loadSdk = (url) => import(url);
+const SDK = '${CONSOLE_SDK_BASE}';
+const REF = /^[A-Za-z0-9_-]{1,128}$/;
 const root = document.getElementById('sttd-source');
 const text = (key) => root.dataset['sttdSource' + key.charAt(0).toUpperCase() + key.slice(1)] || '';
 const input = document.getElementById('sttd-source-ref');
+const check = document.getElementById('sttd-source-check');
 const approve = document.getElementById('sttd-source-approve');
 const message = document.getElementById('sttd-source-message');
+let generation = 0;
+let confirmed = null;
+let busy = false;
+let auth = null;
+let lastUser;
 const show = (value) => { message.textContent = value; };
-async function call(method) {
-  const ref = input.value.trim();
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(ref)) { show(text('failed')); return null; }
-  const app = getApps()[0];
-  const user = app ? getAuth(app).currentUser : null;
-  if (!user) { show(text('login')); return null; }
-  const token = await user.getIdToken();
-  const headers = { Authorization: 'Bearer ' + token, '${LOCAL_NONCE_HEADER}': root.dataset.sttdSourceNonce };
-  if (method === 'POST') headers['Content-Type'] = 'application/json';
-  const response = await fetch('/v1/source/approvals/' + ref, { method, headers, body: method === 'POST' ? '${APPROVE_BODY}' : undefined, credentials: 'omit', cache: 'no-store' });
-  if (!response.ok) { show(text('failed')); return null; }
-  return response.json();
+const invalidate = () => { generation += 1; confirmed = null; approve.disabled = true; };
+input.addEventListener('input', () => { invalidate(); show(''); });
+async function currentAuth() {
+  if (auth !== null) return auth;
+  const [appModule, authModule] = await Promise.all([loadSdk(SDK + 'firebase-app.js'), loadSdk(SDK + 'firebase-auth.js')]);
+  const app = appModule.getApps()[0];
+  if (!app) return null;
+  if (auth !== null) return auth;
+  auth = authModule.getAuth(app);
+  lastUser = auth.currentUser;
+  authModule.onAuthStateChanged(auth, (user) => {
+    if (user !== lastUser) { lastUser = user; invalidate(); }
+  });
+  return auth;
 }
-document.getElementById('sttd-source-check').addEventListener('click', async () => {
-  approve.disabled = true;
-  const body = await call('GET').catch(() => null);
-  if (body && typeof body.client === 'string') { show(text('checked').replace('{client}', body.client)); approve.disabled = false; }
+check.addEventListener('click', async () => {
+  if (busy) return;
+  busy = true;
+  invalidate();
+  const mine = generation;
+  const ref = input.value.trim();
+  try {
+    if (!REF.test(ref)) { show(text('failed')); return; }
+    const current = await currentAuth();
+    const user = current === null ? null : current.currentUser;
+    if (mine !== generation) return;
+    if (!user) { show(text('login')); return; }
+    const token = await user.getIdToken();
+    if (mine !== generation || current.currentUser !== user) return;
+    const response = await fetch('/v1/source/approvals/' + ref, { method: 'GET', headers: { Authorization: 'Bearer ' + token, '${LOCAL_NONCE_HEADER}': root.dataset.sttdSourceNonce }, credentials: 'omit', cache: 'no-store' });
+    const body = response.ok ? await response.json() : null;
+    if (mine !== generation || current.currentUser !== user || input.value.trim() !== ref) return;
+    if (!body || typeof body.client !== 'string') { show(text('failed')); return; }
+    confirmed = { ref, user, generation: mine };
+    show(text('checked').replace('{client}', body.client));
+    approve.disabled = false;
+  } catch {
+    if (mine === generation) show(text('failed'));
+  } finally {
+    busy = false;
+  }
 });
 approve.addEventListener('click', async () => {
+  if (busy || confirmed === null || auth === null) return;
+  const target = confirmed;
+  // 確認後に参照・本人が変わっていれば送らない（未確認の参照を承認しない）。
+  if (target.generation !== generation || input.value.trim() !== target.ref || auth.currentUser !== target.user) { invalidate(); show(text('failed')); return; }
+  busy = true;
+  confirmed = null;
   approve.disabled = true;
-  const body = await call('POST').catch(() => null);
-  if (body && body.state === 'approved') show(text('approved'));
+  try {
+    const token = await target.user.getIdToken();
+    if (target.generation !== generation || auth.currentUser !== target.user || input.value.trim() !== target.ref) { show(text('failed')); return; }
+    const response = await fetch('/v1/source/approvals/' + target.ref, { method: 'POST', headers: { Authorization: 'Bearer ' + token, '${LOCAL_NONCE_HEADER}': root.dataset.sttdSourceNonce, 'Content-Type': 'application/json' }, body: '${APPROVE_BODY}', credentials: 'omit', cache: 'no-store' });
+    const body = response.ok ? await response.json() : null;
+    show(body && body.state === 'approved' ? text('approved') : text('failed'));
+  } catch {
+    show(text('failed'));
+  } finally {
+    busy = false;
+  }
 });
 `;
 

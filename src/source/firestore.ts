@@ -247,14 +247,18 @@ export class SourceStore {
     }
     if (!snapshot.exists) return false;
     const data = snapshot.data() as Record<string, unknown> | undefined;
-    return (
-      data !== undefined &&
-      data.consumed === false &&
-      typeof data.expiresAt === 'number' &&
-      this.now() < data.expiresAt &&
-      data.clientHash === request.clientHash &&
-      data.resourceHash === request.resourceHash
-    );
+    const bound = { sourceId: data?.sourceId, generation: data?.generation };
+    if (data === undefined || data.consumed !== false || typeof data.expiresAt !== 'number' || !isSourceBinding(bound)) return false;
+    if (data.clientHash !== request.clientHash || data.resourceHash !== request.resourceHash) return false;
+    // 承認後に停止・削除・世代変更されたsourceの承認は待機中と同じ扱い（同意の消費・受信先設定の削除へ進めない）。
+    let source: DocumentSnapshot;
+    try {
+      source = await this.sourceRef(bound.sourceId).get();
+    } catch {
+      throw new SourceUnavailableError();
+    }
+    const now = this.now();
+    return now < data.expiresAt && sourceBindingVerdict(SourceStore.recordOf(source), { sourceId: bound.sourceId, generation: bound.generation }, now).kind === 'usable';
   }
 
   /** Grantのbinding記録を同じtransactionで読む（読取りだけ）。不正はSourceUnavailableError。 */
