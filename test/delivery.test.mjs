@@ -1409,6 +1409,482 @@ import { createCodeIdentityLookup, createDeveloperCodeExchange } from '../dist/i
 import { DEVELOPER_LOGIN_PURPOSE, defaultRandom, developerLoginKeys } from '../dist/identity/developer-login.js';
 import { DeveloperLoginStore } from '../dist/identity/developer-login-store.js';
 
+// ---------- T105 取消記録の新規作成制限: 純粋計算＋実KmsRequestDeliveryStore/serviceを合成transaction（楽観的競合・再実行）へ接続 ----------
+import * as t105StoreModule from '../dist/delivery/kms-store.js';
+import { commandDocData as t105CommandDocData, decideCancelQuota, parseCancelControl } from '../dist/delivery/contract.js';
+
+const T105_NS = 't270_2b3c4d5e-6f70-4a81-9b2c-3d4e5f607182';
+const T105_DAY = 86_400_000;
+const T105_NOON = BASE - (BASE % T105_DAY) + T105_DAY / 2;
+
+/** 楽観的transactionの合成Firestore（読取り版の検査・競合時の再実行・create衝突・commit応答の喪失）。 */
+function t105Db() {
+  const docs = new Map();
+  let version = 0;
+  const stats = { attempts: 0, commits: 0, writes: [], reads: [] };
+  const hooks = { loseNextCommit: false };
+  const db = {};
+  const refOf = (path) => ({ path, id: path.slice(path.lastIndexOf('/') + 1), firestore: db, collection: (n) => ({ doc: (id) => refOf(`${path}/${n}/${id}`) }) });
+  const snap = (ref) => {
+    const e = docs.get(ref.path);
+    return { ref, id: ref.id, exists: e !== undefined, data: () => (e === undefined ? undefined : structuredClone(e.data)) };
+  };
+  db.collection = (n) => ({ doc: (id) => refOf(`${n}/${id}`) });
+  db.doc = (p) => refOf(p);
+  db.runTransaction = async (fn, options = {}) => {
+    for (let attempt = 0; attempt < (options.maxAttempts ?? 5); attempt += 1) {
+      stats.attempts += 1;
+      const reads = new Map();
+      const writes = [];
+      const read = async (ref) => {
+        await new Promise((resolve) => setImmediate(resolve));
+        if (writes.length > 0) throw new Error('read after write');
+        reads.set(ref.path, docs.get(ref.path)?.version ?? 0);
+        stats.reads.push(ref.path);
+        return snap(ref);
+      };
+      const tx = {
+        getAll: (...refs) => Promise.all(refs.map(read)),
+        get: read,
+        create: (ref, data) => writes.push(['create', ref.path, structuredClone(data)]),
+        set: (ref, data) => writes.push(['set', ref.path, structuredClone(data)]),
+        update: (ref, data) => writes.push(['update', ref.path, structuredClone(data)]),
+      };
+      const result = await fn(tx);
+      if ([...reads].some(([path, v]) => (docs.get(path)?.version ?? 0) !== v)) continue;
+      for (const [kind, path] of writes) if (kind === 'create' && docs.has(path)) throw new Error('already exists');
+      for (const [kind, path, data] of writes) {
+        version += 1;
+        docs.set(path, { data: kind === 'update' ? { ...docs.get(path).data, ...data } : data, version });
+        stats.writes.push([kind, path]);
+      }
+      stats.commits += 1;
+      if (hooks.loseNextCommit) {
+        hooks.loseNextCommit = false;
+        throw new Error('commit response lost');
+      }
+      return result;
+    }
+    throw new Error('contention');
+  };
+  return { db, docs, stats, hooks, put: (path, data) => docs.set(path, { data, version: (version += 1) }) };
+}
+const T105StoreClass = t105StoreModule.KmsRequestDeliveryStore ?? Object.values(t105StoreModule).find((v) => typeof v === 'function' && typeof v.prototype?.cancel === 'function');
+import { request as t105HttpRequest } from 'node:http';
+
+/** 所有loopbackへの1要求（status・header・本文）。 */
+function t105Call(port, path, headers) {
+  return new Promise((resolve, reject) => {
+    const rq = t105HttpRequest({ host: '127.0.0.1', port, method: 'POST', path, headers: { ...headers, 'Content-Length': '0' } }, (r) => {
+      const chunks = [];
+      r.on('data', (c) => chunks.push(c));
+      r.on('end', () => resolve({ status: r.statusCode, headers: r.headers, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    rq.on('error', reject);
+    rq.end();
+  });
+}
+
+test('T105 C08 loopback HTTP→実handler→実service/store: 429のbody/Retry-After/no-store・401・既存取消は枠枯渇でも200・存在するのにdataの無いquotaは503/write0・壊れたcommandは期限後も503で上書きなし・quota read後のowner再検査で403/write0・owner失効403', { timeout: 20_000 }, async () => {
+  clockState.value = T105_NOON;
+  const fx = t105Fixture(undefined, clockState);
+  // 製品のrequireOwnerはUUIDを要求する（fixtureは正規UUID）。
+  assert.match(fx.owner, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  const handler = createIngressOperationDeliveryRequestHandler({ identity, findOwner: async () => fx.owner, service: fx.service, clock, log, lifetime: new AbortController().signal, ingress: ingressSource });
+  const { server, port } = await startServer(handler);
+  const bearer = { Authorization: `Bearer ${TOKEN}` };
+  const path = (id = randomUUID()) => `/v2/commands/${id}/cancel`;
+  try {
+    for (let i = 0; i < 3; i += 1) {
+      const ok = await t105Call(port, path(), bearer);
+      assert.deepEqual([ok.status, JSON.parse(ok.body).state], [200, 'cancelled']);
+    }
+    const limited = await t105Call(port, path(), bearer);
+    assert.deepEqual([limited.status, limited.headers['retry-after'], limited.headers['cache-control'], JSON.parse(limited.body)], [429, '6', 'no-store', { error: { code: 'rate_limited', retryable: true } }]);
+    assert.equal((await t105Call(port, path(), {})).status, 401);
+    // 枠が尽きていても保持期限内の既存commandの取消は200（quotaを読まない）。
+    const prepared = randomUUID();
+    t105Prepared(fx, prepared, T105_NOON - 1000);
+    assert.deepEqual([(await t105Call(port, path(prepared), bearer)).status], [200]);
+    // 存在するのにdataの無いquota → 503 temporarily_unavailable、write 0。
+    fx.w.docs.set(fx.quotaPath(), { data: undefined, version: 9_999 });
+    const writes = fx.w.stats.writes.length;
+    const broken = await t105Call(port, path(), bearer);
+    assert.deepEqual([broken.status, JSON.parse(broken.body).error.code, fx.w.stats.writes.length], [503, 'temporarily_unavailable', writes]);
+    // 保持期限後でも壊れたcommandは消して作り直さない（503・内容不変）。
+    const corruptId = randomUUID();
+    fx.w.put(fx.commandPath(corruptId), { version: 1, junk: true, purgeAt: T105_NOON - 1 });
+    assert.equal((await t105Call(port, path(corruptId), bearer)).status, 503);
+    assert.deepEqual(fx.w.docs.get(fx.commandPath(corruptId)).data, { version: 1, junk: true, purgeAt: T105_NOON - 1 });
+  } finally {
+    await closeServer(server);
+  }
+  // quota read後の最新時刻でowner再検査（無活動期限の到来）→ 403・write 0。
+  const late = t105Fixture(undefined, { value: T105_NOON }, { ownerActive: (calls) => calls === 1 });
+  const lateResponse = await late.cancel();
+  assert.deepEqual([lateResponse.status, late.w.stats.writes.length], [403, 0]);
+  late.w.put(`connectOwners/${late.owner}`, { active: false });
+  assert.equal((await late.cancel()).status, 403);
+});
+
+function t105Fixture(w = t105Db(), now = { value: T105_NOON }, { ownerActive = null } = {}) {
+  let ownerChecks = 0;
+  const connect = {
+    ownerDocRef: (id) => w.db.collection('connectOwners').doc(id),
+    grantDocRef: (id) => w.db.collection('connectGrants').doc(id),
+    ownerDocActive: (data) => ((ownerChecks += 1), ownerActive === null ? data?.active === true : data?.active === true && ownerActive(ownerChecks)),
+    grantDocLive: () => false,
+    accessDocRefForOwner: () => null,
+    grantMetaDocRef: (id) => w.db.collection('connectGrantMeta').doc(id),
+    accessUseDecision: () => 'denied',
+    grantUseDecision: () => 'denied',
+  };
+  const clockOf = { now: () => now.value };
+  const store = new T105StoreClass({ db: w.db, namespace: T105_NS, connect, hash, clock: clockOf, policy: {}, onTransaction: () => {} });
+  const service = new KmsRequestDeliveryService({ store, codec: { open: async () => assert.fail('no open') }, hash, digestKey: DIGEST_KEY, send: async () => assert.fail('no send'), clock: clockOf, newAttemptId: () => 'attempt-t105', log: () => {}, budgetMs: 20_000, lifetime: new AbortController().signal, hooks: {} });
+  // 実storeのrequireOwnerはUUIDを要求する（製品の入力検査は緩めない）。
+  const owner = randomUUID();
+  w.put(`connectOwners/${owner}`, { active: true });
+  const root = `sttdDelivery/${T105_NS}`;
+  return { w, now, store, service, owner, quotaPath: (o = owner) => `${root}/cancelControls/${o}`, commandPath: (id, o = owner) => `${root}/commands/${store.commandKey(o, id)}`, cancel: (id = randomUUID(), o = owner) => service.cancel(o, id, now.value) };
+}
+const t105Text = (r) => JSON.stringify(r);
+const t105Prepared = (fx, id, receivedAt, extra = {}) =>
+  fx.w.put(fx.commandPath(id), t105CommandDocData({ version: 1, ownerId: fx.owner, tombstone: false, digest: 'd'.repeat(64), state: 'prepared', reason: null, attemptId: 'a1', destination: { subscriptionId: 'sub_t105', grantId: 'grant_t105', secretHash: 'h'.repeat(64) }, receivedAt, expiresAt: receivedAt + 60_000, deadlineAt: receivedAt + 20_000, updatedAt: receivedAt, acknowledgedAt: null, purgeAt: receivedAt + T105_DAY, ...extra }));
+const t105Quota = (fx, { updatedAt, tokenUnits = 0, hits = [updatedAt], dayCount }) => fx.w.put(fx.quotaPath(), { version: 1, ownerId: fx.owner, rate: { updatedAt, tokenUnits, hits }, dayIndex: Math.floor(updatedAt / T105_DAY), dayCount });
+
+test('T105 C01/C02 quota計算: burst3/6秒補充・rolling 60秒10件・UTC日次100（43200秒/1秒/短期優先）・日付境界の持越し・時計巻戻り/clock debt上限86400・安全域外と保存値不正の拒否', () => {
+  // rolling: 0ms×3、6000〜42000msの7件で計10件。48000msは12秒、60000msで最初の3件が外れて許可。
+  let control;
+  for (const at of [0, 0, 0, 6000, 12000, 18000, 24000, 30000, 36000, 42000]) {
+    const d = decideCancelQuota(control, T105_NOON + at);
+    assert.equal(d.outcome, 'allowed', String(at));
+    control = d.next;
+  }
+  assert.deepEqual(decideCancelQuota(control, T105_NOON + 48000), { outcome: 'rate_limited', retryAfterSec: 12 });
+  assert.equal(decideCancelQuota(control, T105_NOON + 60000).outcome, 'allowed');
+  // 日次: count99から100件目は許可、次は43200秒。23:59:59にcount100なら1秒、短期不足ならその長い待機。
+  const day = Math.floor(T105_NOON / T105_DAY);
+  const early = T105_NOON - 3_600_000;
+  const d99 = decideCancelQuota({ rate: { updatedAt: early, tokenUnits: 120_000, hits: [early] }, dayIndex: day, dayCount: 99 }, T105_NOON);
+  assert.deepEqual([d99.outcome, d99.next.dayCount], ['allowed', 100]);
+  assert.deepEqual(decideCancelQuota(d99.next, T105_NOON), { outcome: 'rate_limited', retryAfterSec: 43200 });
+  const lastSecond = (day + 1) * T105_DAY - 1000;
+  assert.deepEqual(decideCancelQuota({ rate: { updatedAt: early, tokenUnits: 120_000, hits: [early] }, dayIndex: day, dayCount: 100 }, lastSecond), { outcome: 'rate_limited', retryAfterSec: 1 });
+  const busy = { rate: { updatedAt: lastSecond - 1000, tokenUnits: 0, hits: Array(10).fill(lastSecond - 1000) }, dayIndex: day, dayCount: 100 };
+  assert.deepEqual(decideCancelQuota(busy, lastSecond), { outcome: 'rate_limited', retryAfterSec: 59 });
+  // UTC境界: 日次だけ0へ、短期hitsは持越す。
+  const crossed = decideCancelQuota({ rate: { updatedAt: lastSecond, tokenUnits: 120_000, hits: [lastSecond] }, dayIndex: day, dayCount: 100 }, lastSecond + 1500);
+  assert.deepEqual([crossed.outcome, crossed.next.dayCount, crossed.next.dayIndex, crossed.next.rate.hits.length], ['allowed', 1, day + 1, 2]);
+  // 時計の巻戻り: 補充0・日次resetなし・差をRetry-Afterへ（上限86400）。
+  const spent = { rate: { updatedAt: T105_NOON, tokenUnits: 0, hits: [T105_NOON, T105_NOON, T105_NOON] }, dayIndex: day, dayCount: 3 };
+  assert.deepEqual(decideCancelQuota(spent, T105_NOON - 3_600_000), { outcome: 'rate_limited', retryAfterSec: 3606 });
+  assert.equal(decideCancelQuota({ ...spent, dayCount: 100 }, T105_NOON - T105_DAY).outcome, 'rate_limited');
+  assert.deepEqual(decideCancelQuota(spent, T105_NOON - 10 * T105_DAY), { outcome: 'rate_limited', retryAfterSec: 86400 });
+  assert.throws(() => decideCancelQuota(undefined, 8_640_000_000_000_001));
+  assert.throws(() => decideCancelQuota(undefined, -1));
+  // 保存値: 欠落だけが初期状態。5fieldちょうど・version1・owner一致・消費直後の短期状態・UTC日・日次countの矛盾は不正。
+  const good = { version: 1, ownerId: 'o', rate: { updatedAt: T105_NOON, tokenUnits: 0, hits: [T105_NOON] }, dayIndex: day, dayCount: 1 };
+  assert.equal(parseCancelControl(undefined, 'o'), undefined);
+  assert.equal(parseCancelControl(good, 'o').dayCount, 1);
+  for (const bad of [null, {}, { ...good, extra: 1 }, { ...good, version: 2 }, { ...good, ownerId: 'x' }, { ...good, rate: { ...good.rate, hits: [] } }, { ...good, rate: { ...good.rate, hits: [T105_NOON - 1] } }, { ...good, rate: { ...good.rate, tokenUnits: 130_000 } }, { ...good, dayIndex: day + 1 }, { ...good, dayCount: 0 }, { ...good, dayCount: 101 }, { ...good, dayCount: 1.5 }, { ...good, rate: { ...good.rate, hits: [T105_NOON, T105_NOON] }, dayCount: 1 }]) {
+    assert.throws(() => parseCancelControl(bad, 'o'), undefined, JSON.stringify(bad));
+  }
+});
+
+test('T105 C03〜C08 実store＋service（合成transaction）: 新規tombstoneとquotaの原子的create・429/Retry-After/write0・既存/同ID/保持期限内は非消費（枠枯渇・破損でも）・purgeAt境界・破損503・owner失効403・並行（別ID/同ID/複数instance日次残1）・commit応答喪失で二重加算なし', async () => {
+  assert.equal(typeof T105StoreClass, 'function');
+  // burst: 3件許可、4件目は429/6秒/write0、5999msで1秒、6000msで許可。
+  let fx = t105Fixture();
+  for (let i = 0; i < 3; i += 1) assert.equal((await fx.cancel()).body.state, 'cancelled');
+  const quota = fx.w.docs.get(fx.quotaPath()).data;
+  assert.deepEqual([Object.keys(quota).sort(), quota.version, quota.dayCount, quota.rate.hits.length, quota.rate.tokenUnits], [['dayCount', 'dayIndex', 'ownerId', 'rate', 'version'], 1, 3, 3, 0]);
+  const writesBefore = fx.w.stats.writes.length;
+  const limited = await fx.cancel();
+  assert.equal(limited.status, 429);
+  assert.ok(t105Text(limited).includes('"Retry-After":"6"') && t105Text(limited).includes('rate_limited') && !t105Text(limited).includes('cancelled'));
+  assert.equal(fx.w.stats.writes.length, writesBefore);
+  fx.now.value += 5999;
+  assert.ok(t105Text(await fx.cancel()).includes('"Retry-After":"1"'));
+  fx.now.value += 1;
+  assert.equal((await fx.cancel()).status, 200);
+  // 1回の新規作成のcommitは、commandのcreateとquotaのset（初回はcreate）だけ。送信controlは書かない。
+  fx = t105Fixture();
+  await fx.cancel();
+  assert.deepEqual(fx.w.stats.writes.map(([kind, path]) => [kind, path.split('/').at(-2)]), [['create', 'commands'], ['create', 'cancelControls']]);
+  await fx.cancel();
+  assert.deepEqual(fx.w.stats.writes.slice(2).map(([kind, path]) => [kind, path.split('/').at(-2)]), [['create', 'commands'], ['set', 'cancelControls']]);
+
+  // 日次枯渇でも: prepared取消・同IDtombstone再要求・配送期限だけ超過・purgeAt−1は200で非消費（quotaを読まない）。purgeAtちょうどは消費（429）。
+  fx = t105Fixture();
+  t105Quota(fx, { updatedAt: T105_NOON - 1000, dayCount: 100 });
+  const quotaVersion = fx.w.docs.get(fx.quotaPath()).version;
+  const prepared = randomUUID();
+  t105Prepared(fx, prepared, T105_NOON - 1000);
+  const readsBefore = fx.w.stats.reads.length;
+  const r1 = await fx.cancel(prepared);
+  assert.deepEqual([r1.status, r1.body.state], [200, 'cancelled']);
+  assert.equal(fx.w.stats.reads.slice(readsBefore).includes(fx.quotaPath()), false);
+  assert.deepEqual([(await fx.cancel(prepared)).status, fx.w.docs.get(fx.quotaPath()).version], [200, quotaVersion]);
+  const stale = randomUUID();
+  t105Prepared(fx, stale, T105_NOON - 120_000);
+  assert.equal((await fx.cancel(stale)).status, 200);
+  const old = randomUUID();
+  t105Prepared(fx, old, T105_NOON - T105_DAY + 1);
+  assert.equal((await fx.cancel(old)).status, 200);
+  const purged = randomUUID();
+  t105Prepared(fx, purged, T105_NOON - T105_DAY);
+  assert.equal((await fx.cancel(purged)).status, 429);
+  assert.equal(fx.w.docs.get(fx.quotaPath()).version, quotaVersion);
+  assert.equal((await fx.cancel()).status, 429);
+  // 期限後の再作成は消費する（枠があれば）。
+  fx = t105Fixture();
+  const again = randomUUID();
+  t105Prepared(fx, again, T105_NOON - T105_DAY);
+  assert.equal((await fx.cancel(again)).status, 200);
+  assert.equal(fx.w.docs.get(fx.quotaPath()).data.dayCount, 1);
+
+  // 破損quota: 新規作成は503（空枠へfallbackしない・writeなし）、既存取消は維持。owner失効は403。
+  fx = t105Fixture();
+  fx.w.put(fx.quotaPath(), { version: 1, ownerId: fx.owner, rate: { updatedAt: T105_NOON, tokenUnits: 0, hits: [] }, dayIndex: 0, dayCount: 1 });
+  const corruptWrites = fx.w.stats.writes.length;
+  assert.equal((await fx.cancel()).status, 503);
+  assert.equal(fx.w.stats.writes.length, corruptWrites);
+  const keep = randomUUID();
+  t105Prepared(fx, keep, T105_NOON - 1000);
+  assert.equal((await fx.cancel(keep)).status, 200);
+  fx.w.put(`connectOwners/${fx.owner}`, { active: false });
+  assert.equal((await fx.cancel()).status, 403);
+
+  // 並行: 空枠へ別ID4件はcommit3件。同ID3件は1消費。日次count99へ2 store instanceから別IDは1件だけ。
+  fx = t105Fixture();
+  const parallel = await Promise.all([1, 2, 3, 4].map(() => fx.cancel()));
+  assert.deepEqual(parallel.map((r) => r.status).sort(), [200, 200, 200, 429]);
+  assert.deepEqual([fx.w.docs.get(fx.quotaPath()).data.dayCount, [...fx.w.docs.keys()].filter((p) => p.includes('/commands/')).length], [3, 3]);
+  fx = t105Fixture();
+  const same = randomUUID();
+  const sameResults = await Promise.all([1, 2, 3].map(() => fx.cancel(same)));
+  assert.deepEqual([sameResults.map((r) => r.status), fx.w.docs.get(fx.quotaPath()).data.dayCount], [[200, 200, 200], 1]);
+  fx = t105Fixture();
+  t105Quota(fx, { updatedAt: T105_NOON - 3_600_000, tokenUnits: 120_000, dayCount: 99 });
+  const second = t105Fixture(fx.w, fx.now);
+  const both = await Promise.all([fx.cancel(), second.cancel(randomUUID(), fx.owner)]);
+  assert.deepEqual([both.map((r) => r.status).sort(), fx.w.docs.get(fx.quotaPath()).data.dayCount], [[200, 429], 100]);
+  // commit応答の喪失: 503（成功と報告しない）、quotaは1回だけ加算、同ID再要求は非消費で既存の取消状態。
+  fx = t105Fixture();
+  const lost = randomUUID();
+  fx.w.hooks.loseNextCommit = true;
+  assert.equal((await fx.cancel(lost)).status, 503);
+  assert.equal(fx.w.docs.get(fx.quotaPath()).data.dayCount, 1);
+  const recovered = await fx.cancel(lost);
+  assert.deepEqual([recovered.status, recovered.body.state, fx.w.docs.get(fx.quotaPath()).data.dayCount], [200, 'cancelled', 1]);
+  // 旧形式: 送信のowner controlは作られず・変更されない。
+  assert.equal([...fx.w.docs.keys()].some((p) => p.endsWith(`/owners/${fx.owner}`)), false);
+});
+
+// ---------- T105 R2: 実配線（fixtures/source-runtime.mjsの実KmsRequestDeliveryStore/Service・実source gate）での回復・競合・CORS ----------
+import { createDeliveryRuntime as t105DeliveryRuntime } from './fixtures/source-runtime.mjs';
+import { generateKeyPairSync as t105KeyPair } from 'node:crypto';
+import { newSourceGeneration as t105NewSourceGeneration, newSourceId as t105NewSourceId } from '../dist/source/admin.js';
+import { createApiBackendServe as t105BackendServe } from '../dist/gateway/backend.js';
+import { applyConsoleCors as t105Cors, consoleAllowedOrigin as t105AllowedOrigin } from '../dist/deployment/console-cors.js';
+
+/** 許可origin（配置設定のMCP origin）。直接実行の未設定配置では取れないので、その時はCORS caseを全suiteの合成配置copyでだけ実行する。 */
+let T105_ORIGIN = null;
+try {
+  T105_ORIGIN = t105AllowedOrigin();
+} catch {
+  T105_ORIGIN = null;
+}
+const t105Identity = {
+  projectId: 'demo-sttd-t105',
+  async verifyIdToken(token) {
+    if (token !== 't105') throw new Error('bad token');
+    return { projectId: 'demo-sttd-t105', uid: 'uid-t105', authTimeSec: 1 };
+  },
+  async accountStatus() {
+    return 'active';
+  },
+};
+/** 実runtimeの合成DBへ、楽観的競合（読取り版の検査・再実行・create衝突）と次の1 transactionの保留を足す（実store/serviceは不変）。 */
+function t105Optimistic(w) {
+  const versions = new Map();
+  const control = { hold: null };
+  w.db.runTransaction = async (fn, options = {}) => {
+    const hold = control.hold;
+    control.hold = null;
+    if (hold) {
+      hold.reached();
+      await hold.promise;
+    }
+    for (let attempt = 0; attempt < (options.maxAttempts ?? 5); attempt += 1) {
+      const reads = new Map();
+      const writes = [];
+      const snap = (ref) => {
+        const data = w.docs.get(ref.path);
+        return { id: ref.id, ref, exists: data !== undefined, data: () => (data === undefined ? undefined : structuredClone(data)) };
+      };
+      const read = async (ref) => {
+        await new Promise((resolve) => setImmediate(resolve));
+        if (writes.length > 0) throw new Error('read after write');
+        reads.set(ref.path, versions.get(ref.path) ?? 0);
+        return snap(ref);
+      };
+      const tx = {
+        get: read,
+        getAll: (...refs) => Promise.all(refs.map(read)),
+        set: (ref, data) => (writes.push(['set', ref.path, structuredClone(data)]), tx),
+        create: (ref, data) => (writes.push(['create', ref.path, structuredClone(data)]), tx),
+        update: (ref, data) => (writes.push(['update', ref.path, structuredClone(data)]), tx),
+        delete: (ref) => (writes.push(['delete', ref.path]), tx),
+      };
+      const result = await fn(tx);
+      if ([...reads].some(([path, v]) => (versions.get(path) ?? 0) !== v)) continue;
+      for (const [kind, path] of writes) if (kind === 'create' && w.docs.has(path)) throw new Error('ALREADY_EXISTS');
+      for (const [kind, path, data] of writes) {
+        versions.set(path, (versions.get(path) ?? 0) + 1);
+        if (kind === 'delete') w.docs.delete(path);
+        else w.docs.set(path, kind === 'update' ? { ...w.docs.get(path), ...data } : data);
+      }
+      return result;
+    }
+    throw new Error('contention');
+  };
+  return control;
+}
+/**
+ * 有効な購読のある本人に、接続承認したsource（connect操作）へのGrant束縛を付ける（gateway-integrationのAPI試験・同意の最終txと同じ形）。
+ * 実runtimeのConnectStorageはstrict（SourceStore結合）なので、束縛の無いGrantでは送信の利用許可がdeniedになる（403）。製品の検査は緩めない。
+ */
+async function t105Enroll(w) {
+  const owner = w.enroll();
+  const grantSource = {
+    schemaVersion: 1,
+    sourceId: t105NewSourceId(),
+    kind: 'developer',
+    state: 'active',
+    generation: t105NewSourceGeneration(),
+    operations: ['connect'],
+    publicKey: t105KeyPair('ed25519').publicKey.export({ format: 'jwk' }).x,
+    identityHash: connectIdentityHash(w.hasher, w.NS, { projectId: 'demo-sttd-t105', uid: `uid-${owner.ownerId}` }),
+    expiresAt: null,
+    createdAt: w.clock.t,
+    updatedAt: w.clock.t,
+  };
+  assert.equal(await w.sources.create(grantSource), 'created');
+  w.bindGrant(owner.grantId, grantSource);
+  return owner;
+}
+const t105Op = (w) => Object.freeze({ deadlineAt: w.clock.t + 20_000, signal: new AbortController().signal });
+const t105Body = (w, commandId) => Buffer.from(JSON.stringify({ schemaVersion: 2, commandId, text: 'synthetic', createdAt: new Date(w.clock.t).toISOString(), expiresAt: new Date(w.clock.t + 60_000).toISOString() }));
+/** 実serviceのPOST（実storeのprepare/dispatch/finish・合成send）。 */
+const t105Post = (w, owner, commandId) => w.service.post(owner.ownerId, commandId, t105Body(w, commandId), w.clock.t, t105Op(w));
+const t105Cancel = (w, owner, commandId = randomUUID()) => w.service.cancel(owner.ownerId, commandId, w.clock.t, t105Op(w));
+const t105QuotaOf = (w, owner) => [...w.docs.entries()].find(([path]) => path.endsWith(`/cancelControls/${owner.ownerId}`))?.[1];
+const t105CommandDocs = (w) => [...w.docs.entries()].filter(([path]) => path.includes('/commands/')).map(([, data]) => data);
+
+test('T105 R2 実配線の競合: 先着取消→後着POSTは送出0、先着POST→取消は枠枯渇でも非消費200、同時のPOSTと取消は消費＝新規tombstoneの数、429は保存前の同IDのPOSTを中止しない', { timeout: 20_000 }, async () => {
+  let w = t105DeliveryRuntime();
+  let control = t105Optimistic(w);
+  let owner = await t105Enroll(w);
+  // 先着取消（新規tombstone・消費1）→後着POSTは取消状態で送出0。
+  const first = randomUUID();
+  assert.equal((await t105Cancel(w, owner, first)).status, 200);
+  const late = await t105Post(w, owner, first);
+  assert.deepEqual([late.status, late.body.state, w.sent.length, t105QuotaOf(w, owner).dayCount], [200, 'cancelled', 0, 1]);
+  // 先着POST（配送済み）→枠枯渇でも取消は200・非消費。
+  w.clock.t += 20_000;
+  const posted = randomUUID();
+  assert.equal((await t105Post(w, owner, posted)).body.state, 'delivered');
+  for (let i = 0; i < 3; i += 1) assert.equal((await t105Cancel(w, owner)).status, 200);
+  assert.equal((await t105Cancel(w, owner)).status, 429);
+  const before = t105QuotaOf(w, owner).dayCount;
+  const existing = await t105Cancel(w, owner, posted);
+  assert.deepEqual([existing.status, existing.body.state, t105QuotaOf(w, owner).dayCount], [200, 'delivered', before]);
+  // 枠枯渇で保存前（prepare保留中）の同IDへの取消は429。そのPOSTは中止されず配送まで進む（成功取消のabortとは別）。
+  const held = randomUUID();
+  const hold = gate();
+  control.hold = hold;
+  const sentBefore = w.sent.length;
+  const pending = t105Post(w, owner, held);
+  await hold.whenReached;
+  const refused = await t105Cancel(w, owner, held);
+  assert.deepEqual([refused.status, JSON.stringify(refused).includes('"Retry-After"')], [429, true]);
+  hold.release();
+  const done = await pending;
+  assert.deepEqual([done.status, done.body.state, w.sent.length], [200, 'delivered', sentBefore + 1]);
+  // 同時のPOSTと取消（同ID、実storeの楽観的transaction・再実行）: どちらの順でも、消費は新規tombstoneの数だけ。
+  w = t105DeliveryRuntime();
+  control = t105Optimistic(w);
+  owner = await t105Enroll(w);
+  for (let i = 0; i < 3; i += 1) {
+    const id = randomUUID();
+    const [p, c] = await Promise.all([t105Post(w, owner, id), t105Cancel(w, owner, id)]);
+    assert.deepEqual([p.status, c.status], [200, 200]);
+  }
+  const docs = t105CommandDocs(w);
+  const tombstones = docs.filter((doc) => doc.tombstone === true).length;
+  assert.equal(docs.length, 3);
+  assert.equal(t105QuotaOf(w, owner)?.dayCount ?? 0, tombstones);
+  assert.ok(w.sent.length <= 3 - tombstones);
+});
+
+test('T105 R2 compatible/strict（実handler＋実source gate）: 利用許可停止・枠枯渇でも既存commandの取消は200（strictでも新しいsource証明なし）、新規作成は枠を迂回できず429/Retry-After', { timeout: 20_000 }, async () => {
+  for (const strict of [false, true]) {
+    const w = t105DeliveryRuntime();
+    const owner = await t105Enroll(w);
+    const delivered = randomUUID();
+    assert.equal((await t105Post(w, owner, delivered)).body.state, 'delivered');
+    const handler = createIngressOperationDeliveryRequestHandler({
+      identity: t105Identity,
+      findOwner: async () => owner.ownerId,
+      service: w.service,
+      clock: w.clock,
+      log,
+      lifetime: new AbortController().signal,
+      ingress: () => ({ receivedAt: w.clock.t, deadlineAt: w.clock.t + 20_000, signal: new AbortController().signal }),
+      ...(strict ? { sources: w.gate } : {}),
+    });
+    const { server, port } = await startServer(handler);
+    const bearer = { Authorization: 'Bearer t105' };
+    try {
+      for (const [path, data] of [...w.docs.entries()]) if (path.startsWith(`sttdConnect/${w.NS}/access/`)) w.docs.set(path, { ...data, state: 'disabled' });
+      const kept = await t105Call(port, `/v2/commands/${delivered}/cancel`, bearer);
+      assert.deepEqual([kept.status, JSON.parse(kept.body).state], [200, 'delivered'], `strict=${strict}`);
+      for (let i = 0; i < 3; i += 1) assert.equal((await t105Call(port, `/v2/commands/${randomUUID()}/cancel`, bearer)).status, 200, `strict=${strict}`);
+      const limited = await t105Call(port, `/v2/commands/${randomUUID()}/cancel`, bearer);
+      assert.deepEqual([limited.status, limited.headers['retry-after'], JSON.parse(limited.body).error.code], [429, '6', 'rate_limited'], `strict=${strict}`);
+      assert.equal((await t105Call(port, `/v2/commands/${delivered}/cancel`, bearer)).status, 200, `strict=${strict}`);
+      assert.equal(t105QuotaOf(w, owner).dayCount, 3);
+    } finally {
+      await closeServer(server);
+    }
+  }
+});
+
+test('T105 R2 CORS（許可origin）: 実backend adapter＋console CORS＋実handler/service/storeの429・503でも許可originとRetry-Afterの公開を保つ', { skip: T105_ORIGIN === null ? 'needs the synthetic deployment config (runs in the isolated full suite)' : false, timeout: 20_000 }, async () => {
+  const w = t105DeliveryRuntime();
+  const owner = await t105Enroll(w);
+  const backendHost = 'sendtexttodots-api-backend-123456789012.europe-west1.run.app';
+  const backend = t105BackendServe({ transportAuthority: backendHost, logicalAuthority: 'api.sttd-http.example.com', clock: w.clock, cors: t105Cors });
+  const handler = createIngressOperationDeliveryRequestHandler({ identity: t105Identity, findOwner: async () => owner.ownerId, service: w.service, clock: w.clock, log, lifetime: new AbortController().signal, ingress: backend.ingress });
+  const { server, port } = await startServer((req, res) => void backend.serve(req, res, (rq, rs) => handler(rq, rs)));
+  const headers = () => ({ Host: backendHost, Authorization: 'Bearer t105', Origin: T105_ORIGIN, 'X-STTD-Gateway-Deadline': String(w.clock.t + 20_000) });
+  try {
+    for (let i = 0; i < 3; i += 1) assert.equal((await t105Call(port, `/v2/commands/${randomUUID()}/cancel`, headers())).status, 200);
+    const limited = await t105Call(port, `/v2/commands/${randomUUID()}/cancel`, headers());
+    assert.deepEqual([limited.status, limited.headers['access-control-allow-origin'], limited.headers['retry-after']], [429, T105_ORIGIN, '6']);
+    assert.match(limited.headers['access-control-expose-headers'] ?? '', /retry-after/i);
+    assert.match(limited.headers['vary'] ?? '', /origin/i);
+    const quotaPath = [...w.docs.keys()].find((path) => path.endsWith(`/cancelControls/${owner.ownerId}`));
+    w.docs.set(quotaPath, { version: 1 });
+    const broken = await t105Call(port, `/v2/commands/${randomUUID()}/cancel`, headers());
+    assert.deepEqual([broken.status, broken.headers['access-control-allow-origin'], JSON.parse(broken.body).error.code], [503, T105_ORIGIN, 'temporarily_unavailable']);
+  } finally {
+    await closeServer(server);
+  }
+});
+
 function miniFirestore() {
   const docs = new Map();
   let version = 1;

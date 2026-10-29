@@ -117,6 +117,49 @@ async function receive(ui) {
   assert.equal(ui.stepState(5), 'current');
 }
 
+test('W20 cancel answered 429 rate_limited: not shown as cancelled; the cancel becomes unconfirmed (button hidden) and the later API result is kept', { timeout: 20_000 }, async () => {
+  const sdk = syntheticSdk();
+  const { navigator } = clipboardStub();
+  const { state, onFetch } = helper();
+  const cancels = [];
+  const ui = await runConsole({
+    html: html('ja'),
+    onFetch: async (entry) => {
+      if (entry.url.endsWith('/cancel')) {
+        cancels.push(entry.url);
+        return { status: 429, json: { error: { code: 'rate_limited', retryable: true } }, headers: { 'retry-after': '6' } };
+      }
+      return onFetch(entry);
+    },
+    sdk,
+    navigator,
+  });
+  const { el } = ui;
+  await reachStep3(ui, sdk);
+  el('sttd-copy-test').click();
+  await settle();
+  el('sttd-done-test').click();
+  await settle();
+  await receive(ui);
+  state.mode = 'hold';
+  assert.equal(el('sttd-test-send').click(), true);
+  await settle();
+  assert.equal(el('sttd-test-cancel').hidden, false);
+  el('sttd-test-cancel').click();
+  await settle();
+  assert.equal(cancels.length, 1, 'one cancel request, no automatic retry');
+  assert.equal(el('sttd-test-cancel').hidden, true, 'the refused cancel is unconfirmed (not answered)');
+  assert.ok(!el('sttd-test-result').textContent.includes(JA('console.state.cancelled')), '429 is not shown as cancelled');
+  assert.equal(el('sttd-verify-send').disabled, true);
+  const pending = state.holds.shift();
+  pending.hold.release({ status: 200, json: { commandId: JSON.parse(pending.entry.body).commandId, state: 'delivered' } });
+  await settle();
+  // 結果行はAPIの結果（delivered）を保ち、取消済みとは表示しない（未確定の取消の注記は併記され得る）。
+  assert.ok(el('sttd-test-result').textContent.includes(JA('console.state.delivered')), 'the API result is kept as is');
+  assert.ok(!el('sttd-test-result').textContent.includes(JA('console.state.cancelled')));
+  assert.equal(cancels.length, 1);
+});
+
 test('W1 initial page: nothing is fetched and the SDK is not loaded; only step 1 is usable; locked steps ignore clicks and handlers; language switch and copies stay local', { timeout: 20_000 }, async () => {
   const sdk = syntheticSdk({ restoredUser: true });
   const { clipboard, navigator } = clipboardStub();

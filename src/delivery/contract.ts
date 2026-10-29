@@ -4,7 +4,17 @@
 // 保存するのはowner・commandの鍵付きdigest・固定したGrant/購読/宛先版・state・attempt所有者・時刻・理由コードだけで、
 // 本文・event bytes・callback URL・secretは文書へ入れない。
 
-import { decideCommandRate, parseCommandRateState, type CommandRateState } from '../commands/rate.js';
+import {
+  COMMAND_RATE_CAPACITY_UNITS,
+  COMMAND_RATE_FULL_REFILL_MS,
+  COMMAND_RATE_UNITS_PER_COMMAND,
+  COMMAND_RATE_UNITS_PER_MS,
+  COMMAND_RATE_WINDOW_LIMIT,
+  COMMAND_RATE_WINDOW_MS,
+  decideCommandRate,
+  parseCommandRateState,
+  type CommandRateState,
+} from '../commands/rate.js';
 import type { OwnerSubscriptionStateOf, SubscriptionExpiry } from '../stores.js';
 import { hashesEqual } from '../secrets.js';
 
@@ -431,6 +441,87 @@ export function decideCancel(current: CommandDoc | undefined, ownerId: string, n
     return { kind: 'cancelled', doc: { ...current, state: 'cancelled', reason: 'cancelled_before_dispatch', updatedAt: now } };
   }
   return { kind: 'observed', doc: current };
+}
+
+/** 取消の結果（store/serviceの判定）。rate_limitedは新規/保持期限後の取消記録の作成枠超過で、何も書かない。 */
+export type CancelOutcome = CancelDecision | { readonly kind: 'rate_limited'; readonly retryAfterSec: number };
+
+// ---------- 取消記録の新規作成枠（sttdDelivery/{namespace}/cancelControls/{ownerId}、docs/API.md「取消記録の新規作成制限」） ----------
+// 送信のrate controlとは独立。短期は送信と同じrolling 60秒10件・容量3（6秒/件補充）の計算、長期はUTC日次100件。新規/保持期限後の
+// tombstoneを作る時だけ、そのtombstoneと同じtransactionで消費する。既存commandの取消・同IDtombstoneの再要求では読まない。
+
+const CANCEL_CONTROL_KEYS = ['version', 'ownerId', 'rate', 'dayIndex', 'dayCount'];
+export const CANCEL_DAY_MS = 86_400_000;
+export const CANCEL_DAILY_LIMIT = 100;
+export const CANCEL_MAX_RETRY_AFTER_SEC = 86_400;
+/** Dateで表せる最大の時刻（ISO表現域）。これを超える保存値・時刻は安全域外。 */
+const MAX_CANCEL_TIME_MS = 8_640_000_000_000_000;
+
+export interface CancelControl {
+  readonly rate: CommandRateState;
+  readonly dayIndex: number;
+  readonly dayCount: number;
+}
+
+export type CancelQuotaDecision =
+  | { readonly outcome: 'allowed'; readonly next: CancelControl }
+  | { readonly outcome: 'rate_limited'; readonly retryAfterSec: number };
+
+const isIndex = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+
+/**
+ * 保存された取消作成枠の検査。欠落（文書なし）だけが未導入ownerの初期状態。exactな5field・version1・owner一致・消費直後の短期状態
+ * （hits1〜10件で最後がupdatedAt、tokenUnits≦容量−1件）・UTC日の一致・日次count（1〜100、当日のhits以上）以外は保存状態の不正。
+ */
+export function parseCancelControl(data: unknown, ownerId: string): CancelControl | undefined {
+  if (data === undefined) return undefined;
+  must(exact(data, CANCEL_CONTROL_KEYS) && data.version === DELIVERY_FORMAT_VERSION && data.ownerId === ownerId);
+  let rate: CommandRateState;
+  try {
+    rate = parseCommandRateState(data.rate);
+  } catch {
+    throw new DeliveryStateError();
+  }
+  const hits = rate.hits;
+  must(rate.updatedAt <= MAX_CANCEL_TIME_MS && hits.length >= 1 && hits[hits.length - 1] === rate.updatedAt);
+  must(rate.tokenUnits <= COMMAND_RATE_CAPACITY_UNITS - COMMAND_RATE_UNITS_PER_COMMAND);
+  const { dayIndex, dayCount } = data;
+  must(isIndex(dayIndex) && dayIndex === Math.floor(rate.updatedAt / CANCEL_DAY_MS));
+  must(isIndex(dayCount) && dayCount >= 1 && dayCount <= CANCEL_DAILY_LIMIT);
+  must(dayCount >= hits.filter((hit) => Math.floor(hit / CANCEL_DAY_MS) === dayIndex).length);
+  return { rate, dayIndex, dayCount };
+}
+
+export function cancelControlData(ownerId: string, control: CancelControl): Record<string, unknown> {
+  const { rate } = control;
+  return { version: DELIVERY_FORMAT_VERSION, ownerId, rate: { updatedAt: rate.updatedAt, tokenUnits: rate.tokenUnits, hits: [...rate.hits] }, dayIndex: control.dayIndex, dayCount: control.dayCount };
+}
+
+/**
+ * 1件の新規取消記録をnowで作れるか。論理時刻t=max(now, 保存時刻)で、時計の巻戻りは補充0・保存時刻を後退させない。日次countはUTC日が
+ * 進んだ時だけ0へ戻し、短期の状態は日付で初期化しない。不足ならnext stateを返さず、各枠の待機の最大（時計の差を含む）を1〜86400秒で返す。
+ * 時刻・計算の安全域外はDeliveryStateError（空枠へfallbackしない）。
+ */
+export function decideCancelQuota(control: CancelControl | undefined, now: number): CancelQuotaDecision {
+  must(isIndex(now) && now <= MAX_CANCEL_TIME_MS);
+  const rate: CommandRateState = control?.rate ?? { updatedAt: now, tokenUnits: COMMAND_RATE_CAPACITY_UNITS, hits: [] };
+  const t = Math.max(now, rate.updatedAt);
+  const recent = rate.hits.filter((hit) => hit > t - COMMAND_RATE_WINDOW_MS);
+  const elapsed = t - rate.updatedAt;
+  const units = elapsed >= COMMAND_RATE_FULL_REFILL_MS ? COMMAND_RATE_CAPACITY_UNITS : Math.min(COMMAND_RATE_CAPACITY_UNITS, rate.tokenUnits + elapsed * COMMAND_RATE_UNITS_PER_MS);
+  const day = Math.floor(t / CANCEL_DAY_MS);
+  const nextDayAt = (day + 1) * CANCEL_DAY_MS;
+  must(Number.isSafeInteger(units) && Number.isSafeInteger(nextDayAt));
+  const count = control === undefined || day > control.dayIndex ? 0 : control.dayCount;
+  if (recent.length < COMMAND_RATE_WINDOW_LIMIT && units >= COMMAND_RATE_UNITS_PER_COMMAND && count < CANCEL_DAILY_LIMIT) {
+    return { outcome: 'allowed', next: { rate: { updatedAt: t, tokenUnits: units - COMMAND_RATE_UNITS_PER_COMMAND, hits: [...recent, t] }, dayIndex: day, dayCount: count + 1 } };
+  }
+  const bucketWaitMs = units < COMMAND_RATE_UNITS_PER_COMMAND ? Math.ceil((COMMAND_RATE_UNITS_PER_COMMAND - units) / COMMAND_RATE_UNITS_PER_MS) : 0;
+  const oldest = recent[0];
+  const rollingWaitMs = recent.length >= COMMAND_RATE_WINDOW_LIMIT && oldest !== undefined ? oldest + COMMAND_RATE_WINDOW_MS - t : 0;
+  const dailyWaitMs = count >= CANCEL_DAILY_LIMIT ? nextDayAt - t : 0;
+  const retryAfterSec = Math.min(CANCEL_MAX_RETRY_AFTER_SEC, Math.max(1, Math.ceil((t - now + Math.max(bucketWaitMs, rollingWaitMs, dailyWaitMs)) / 1000)));
+  return { outcome: 'rate_limited', retryAfterSec };
 }
 
 /** 中止の応答に返すstate。送出権の確定後で終端前は、配送されたか分からない。 */

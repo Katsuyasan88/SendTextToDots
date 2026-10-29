@@ -14,9 +14,13 @@ import { isHash, isUuid } from '../storage/firestore/checks.js';
 import { parseKmsState, requireKmsMarker, type KmsMutableState, type KmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
 import { AUTH_STORAGE_ROOT, KMS_SUBSCRIPTION_CONFIG_DOC } from '../storage/firestore/kms-subscription-format.js';
 import {
+  cancelControlData,
   commandDocData,
   decideAbandon,
   decideCancel,
+  decideCancelQuota,
+  parseCancelControl,
+  type CancelOutcome,
   decideDispatch,
   decideFinish,
   decidePrepare,
@@ -327,6 +331,11 @@ export class KmsRequestDeliveryStore {
     return this.#root.collection('owners').doc(ownerId);
   }
 
+  /** 取消記録の新規作成枠（送信のcontrolとは別文書）。 */
+  #cancelControlRef(ownerId: string): DocumentReference {
+    return this.#root.collection('cancelControls').doc(ownerId);
+  }
+
   /** connectが返した参照は、借用した同じinstanceのものだけを使う（別instanceは同じproject文字列でも通信・書込み前に拒否）。 */
   #own(ref: unknown): DocumentReference {
     if (typeof ref !== 'object' || ref === null || types.isProxy(ref) || (ref as { firestore?: unknown }).firestore !== this.#d.db) {
@@ -606,8 +615,12 @@ export class KmsRequestDeliveryStore {
     });
   }
 
-  /** 中止（decideCancel）。ownerの有効性だけを確かめ、購読markerは読まない（壊れた購読が中止を妨げない）。 */
-  cancel(ownerId: string, commandKey: string, operation: KmsDeliveryOperation): Promise<CancelDecision | 'denied'> {
+  /**
+   * 中止（decideCancel）。ownerの有効性だけを確かめ、購読markerは読まない（壊れた購読が中止を妨げない）。保持期限内の記録は従来どおりで、
+   * 取消作成枠を読まない・書かない。記録が無い/保持期限後の時だけ枠を同じtransactionで追加readし、最新時刻で保持判定と枠をやり直して、
+   * 許可ならtombstoneと枠を同じcommitへcreate/setする。枠超過はwrite 0のrate_limited。
+   */
+  cancel(ownerId: string, commandKey: string, operation: KmsDeliveryOperation): Promise<CancelOutcome | 'denied'> {
     let captured: Captured;
     let ownerRef: DocumentReference;
     try {
@@ -618,22 +631,39 @@ export class KmsRequestDeliveryStore {
     } catch (error) {
       return Promise.reject(fixed(error));
     }
-    return this.#run('cancel', captured, async (tx): Promise<CancelDecision | 'denied'> => {
+    return this.#run('cancel', captured, async (tx): Promise<CancelOutcome | 'denied'> => {
       const [command, control, owner] = await this.#read(tx, captured, [this.#commandRef(commandKey), this.#controlRef(ownerId), ownerRef]);
-      const now = liveNow(this.#d.clock, captured);
+      let now = liveNow(this.#d.clock, captured);
       const current = parseCommandDoc(command!.data(), ownerId);
       if (!this.#d.connect.ownerDocActive(owner!.data(), now)) return 'denied';
-      const decision = decideCancel(usable(current, now), ownerId, now);
-      if (decision.kind === 'observed') return decision;
-      liveNow(this.#d.clock, captured);
       const commandRef = this.#commandRef(commandKey);
-      if (decision.kind === 'tombstone') {
-        if (current === undefined) tx.create(commandRef, commandDocData(decision.doc));
-        else tx.set(commandRef, commandDocData(decision.doc));
-      } else {
+      /** 保持期限内の記録への取消（枠の非依存）。 */
+      const existing = (live: CommandDoc): CancelDecision => {
+        const decision = decideCancel(live, ownerId, now);
+        if (decision.kind === 'observed') return decision;
+        liveNow(this.#d.clock, captured);
         tx.set(commandRef, commandDocData(decision.doc));
-        this.#release(tx, ownerId, commandKey, control!.data());
-      }
+        if (decision.kind === 'cancelled') this.#release(tx, ownerId, commandKey, control!.data());
+        return decision;
+      };
+      const live = usable(current, now);
+      if (live !== undefined) return existing(live);
+      // 新規/保持期限後の作成: 枠を追加readしてから（全writeより先）、最新時刻でownerと保持をやり直す。
+      const quotaRef = this.#cancelControlRef(ownerId);
+      const [quotaSnapshot] = (await this.#read(tx, captured, [quotaRef])) as [DocumentSnapshot];
+      now = liveNow(this.#d.clock, captured);
+      if (!this.#d.connect.ownerDocActive(owner!.data(), now)) return 'denied';
+      const again = usable(current, now);
+      if (again !== undefined) return existing(again);
+      // 欠落snapshotだけが未導入の初期状態。存在するのにdataが無い等は空枠へ読み替えず保存状態の不正（503・write 0）。
+      const quota = decideCancelQuota(parseCancelControl(quotaSnapshot.exists ? (quotaSnapshot.data() ?? null) : undefined, ownerId), now);
+      if (quota.outcome === 'rate_limited') return { kind: 'rate_limited', retryAfterSec: quota.retryAfterSec };
+      const decision = decideCancel(undefined, ownerId, now);
+      liveNow(this.#d.clock, captured);
+      if (current === undefined) tx.create(commandRef, commandDocData(decision.doc));
+      else tx.set(commandRef, commandDocData(decision.doc));
+      if (quotaSnapshot.exists) tx.set(quotaRef, cancelControlData(ownerId, quota.next));
+      else tx.create(quotaRef, cancelControlData(ownerId, quota.next));
       return decision;
     });
   }

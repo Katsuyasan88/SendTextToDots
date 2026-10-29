@@ -296,6 +296,45 @@ function approval(method, uid, person, { body } = {}) {
 
 const APPROVE = '{"approve":true}';
 
+test('T105 C08 API gateway: 取消の429（Retry-After・no-store・body）をそのまま返し、backendへ一回だけ（自動再送0）、外部の期限headerは作り直す', async () => {
+  const config = configFor('https://connect.sttd-http.example.com');
+  const backend = createApiBackendServe({ transportAuthority: API_BACKEND_HOST, logicalAuthority: new URL(API_PUBLIC).host, clock: { now: () => Date.now() }, cors: applyConsoleCors });
+  const seen = [];
+  const { port: backendPort } = await listen((req, res) => {
+    void backend.serve(req, res, (rq, rs) => {
+      seen.push([rq.method, rq.url, rq.headers.host]);
+      rs.writeHead(429, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'retry-after': '6' });
+      rs.end(JSON.stringify({ error: { code: 'rate_limited', retryable: true } }));
+    });
+  });
+  const iam = iamFetcher();
+  const gateway = createGatewayRuntime({
+    role: 'api',
+    config,
+    env: { K_SERVICE: 'sendtexttodotsapi', K_REVISION: 'sendtexttodotsapi-00001-abc', K_CONFIGURATION: 'sendtexttodotsapi' },
+    clock: { now: () => Date.now() },
+    fetcher: iam.fetcher,
+    transport: (options, onResponse) => http.request(options, onResponse),
+    connectTo: { host: '127.0.0.1', port: backendPort },
+  });
+  const { port } = await listen((req, res) => void gateway.handle(req, res));
+  const commandId = randomUUID();
+  const res = await new Promise((resolve, reject) => {
+    const rq = http.request({ host: '127.0.0.1', port, method: 'POST', path: `/v2/commands/${commandId}/cancel`, headers: { Host: new URL(API_PUBLIC).host, Authorization: 'Bearer token.user.a', 'Content-Length': '0', 'X-STTD-Gateway-Deadline': '1' } }, (r) => {
+      const chunks = [];
+      r.on('data', (c) => chunks.push(c));
+      r.on('end', () => resolve({ status: r.statusCode, headers: r.headers, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    rq.on('error', reject);
+    rq.end();
+  });
+  assert.equal(res.status, 429, res.body);
+  assert.deepEqual([res.headers['retry-after'], res.headers['cache-control'], JSON.parse(res.body).error.code], ['6', 'no-store', 'rate_limited']);
+  // 偽の期限header（過去）はgatewayが除去・再作成したので、backendは受け付けて一回だけ処理した。
+  assert.deepEqual(seen, [['POST', `/v2/commands/${commandId}/cancel`, new URL(API_PUBLIC).host]]);
+  assert.ok(!res.body.includes(API_BACKEND_HOST));
+});
+
 test('MCP: 元の公開URLでauthorize→login→承認GET/POST→元cookie/CSRFのconsent→resumeのcode、Grantとsource binding', async () => {
   const person = await rt.enrollPerson('uid-gateway-a');
   const flow = await startFlow();

@@ -4,6 +4,7 @@ English | [日本語](API.md)
 
 This is the contract of source 0.3.0. The send API is the `/v2/commands` family, `schemaVersion` of requests and Events is the integer 2, and the event name is `text.submitted`. Arbitrary text passed by the source for each send (within the limits, lifetime and authentication conditions below) is delivered as is to the destination the user has subscribed. Direction, preset tasks, saved shortcuts and similar metadata are not part of the contract. The v1 contract of 0.2.0 and earlier is incompatible; old routes, old schemas and old event names are rejected ([INSTALL_EN.md](INSTALL_EN.md#compatibility-of-030)). The implementation (`src/commands/input.ts`, `src/policy.ts`, `src/delivery/`, `src/events/contract.ts`) is the source of truth for the values.
 
+
 ## 1. Overview
 
 - Send API (Functions): an authenticated source sends one text, and during the processing of that request the service delivers it once over signed HTTPS to the user's valid subscription. There is no queue, automatic resend or storage of the text.
@@ -58,6 +59,38 @@ Access permission: a new POST (including a repeated POST of the same ID) is acce
 Deadlines: the processing budget is the shorter of 20 seconds from receipt and the original lifetime, external HTTP takes at most 10 seconds, and the Functions timeout is 30 seconds.
 
 The local send screen `/console` sends the text the user typed into its empty input to the API through the local helper in the same five-field form (there is no direction or preset selection). It also shows the connection state and disconnects through the existing `/v1/web/disconnect` after an explicit confirmation. The helper forwards the user's Bearer token to the fixed API/MCP origins, without forwarding the browser's Origin, cookies, or local nonce. The API CORS still allows only the three routes above from the configured MCP origin (allowed headers: authorization, content-type, idempotency-key; `Retry-After` exposed; no wildcard or credential cookies). There is no need to add localhost to the Cloud service's allowed origins. Old v1 routes with an Origin and other origins get a fixed 403; requests without an Origin proceed to normal processing without CORS headers (v1 is 404).
+
+<a id="cancel-creation-limits-design"></a>
+<a id="cancel-creation-limits"></a>
+### Limits on creating cancellation records
+
+These limits are implemented in this source. Existing deployments enforce them only after this source is deployed.
+
+`POST /v2/commands/{commandId}/cancel` requires the authenticated user's active owner. Cancellation remains available under that condition when send access or the source is suspended. The following quotas apply only when creating a cancellation record for a missing ID or recreating one after its 24-hour retention deadline. Expiry of the text's 60-second delivery lifetime alone does not make it a new creation.
+
+| Quota | Limit per owner |
+| --- | --- |
+| Short term | 10 in the preceding 60 seconds, `(decision time − 60 seconds, decision time]` |
+| Burst | Capacity 3, continuously replenished at one unit per 6 seconds; initial capacity is also 3 |
+| Daily | 100 from UTC 00:00 inclusive to the next UTC 00:00 exclusive |
+
+All quotas must allow the creation. They are independent of send and encryption quotas, and shared across the same owner's devices, connections and entry points. Signing in, reconnecting or restarting a process does not reset them. The daily quota is not a rolling 24-hour quota: an arbitrary 24 hours crossing a UTC date boundary can contain up to 200 creations.
+
+Cancelling an existing command within retention, repeating cancellation of an existing cancellation record, and observing a terminal state consume none of this quota and retain their existing behavior when it is exhausted. This applies to plaintext and encrypted commands. Concurrent cancellations of the same ID create and charge for the record only once.
+
+| Condition | HTTP response |
+| --- | --- |
+| New cancellation record committed | `200`, with `commandId` and `state: "cancelled"` in the existing format |
+| Existing record within retention | Existing `200` and state; `delivery_unknown` while dispatch holds the send right, or the stored terminal state once completed |
+| Creation quota exceeded | `429`, `{"error":{"code":"rate_limited","retryable":true}}`, and `Retry-After: <seconds>` |
+| Invalid stored state, database failure, deadline expiry or unknown commit outcome | `503`, `{"error":{"code":"temporarily_unavailable","retryable":true}}` |
+| Identity verification fails / owner missing or revoked | Existing `401 authentication_required` / `403 connection_revoked`, both with `retryable: false` |
+
+`Retry-After` is an integer delay in seconds: take the longest wait among the quotas, round up to seconds and clamp to 1–86400. A backward clock does not replenish quota; its time debt is included in the wait. Competing requests or clock anomalies mean acceptance after that delay is not guaranteed. Immediately after three creations from an empty quota, the fourth has `Retry-After: 6`. At exactly UTC 12:00:00 after 100 daily creations, it is `Retry-After: 43200`. When more than one quota blocks, use the longer wait. JSON responses, `Cache-Control: no-store` and CORS exposure of `Retry-After` for an allowed origin remain unchanged.
+
+A `429` request creates no cancellation record, updates no quota and returns no successful cancellation state. A rejected cancellation arriving before the original POST therefore does not prevent that POST from delivering. A `503` can follow an unknown commit outcome: do not infer failure or absence of a record; look up the same ID. A `404` lookup is not a reservation preventing delivery either. To request cancellation again, wait and use the same ID. Do not automatically resend the text or replace its ID.
+
+These limits bound cancellation-record creations, not authentication and database-read costs of rejected requests, processing of existing cancellations, physical storage when TTL is delayed or unconfigured, aggregate creations across owners, or total billing. Existing 24-hour logical retention and the absence of a guaranteed physical deletion time remain unchanged.
 
 <a id="encryption-key"></a>
 ### Fetching your own public key (payload encryption, off by default)

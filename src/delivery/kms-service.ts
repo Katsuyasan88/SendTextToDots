@@ -518,7 +518,7 @@ export class KmsRequestDeliveryService {
     if (until === undefined) return unavailable();
     if (this.#parentStopped(parent, until)) return unavailable();
     const commandKey = this.#d.store.commandKey(ownerId, commandId);
-    let decision: CancelDecision | 'denied';
+    let decision: import('./contract.js').CancelOutcome | 'denied';
     // parentがあれば要求固有の結合signal（finallyで解除）。この中断は同IDのinflight中止へは伝えない（中止はcancelの確定で行う）。
     const joined = parent === null ? null : this.#controller(parent);
     try {
@@ -532,6 +532,8 @@ export class KmsRequestDeliveryService {
       joined?.release();
     }
     if (decision === 'denied') return errorResponse(403, 'connection_revoked');
+    // 取消記録の作成枠超過（何も書いていない）。成功log・doc参照・inflightの中止の前に、既存のerror応答で返す。
+    if (decision.kind === 'rate_limited') return errorResponse(429, 'rate_limited', true, { 'Retry-After': String(decision.retryAfterSec) });
     this.#log({ event: 'delivery.cancel', outcome: decision.kind });
     const state = cancelView(decision.doc, this.#d.clock.now());
     // 準備中の中止は開封中でも同じprocessの処理を止める。送出権の確定の後は「中止要求/結果不明」で、同じprocessの送出だけを
