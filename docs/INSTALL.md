@@ -2,7 +2,7 @@
 
 [English](INSTALL_EN.md) | 日本語
 
-この手順は、自分のGoogle Cloud / Firebaseへ0.3.0を新規導入するための構成と作業順です。第三者projectでこの手順を一通り実行した検証は未完了です。[LIMITATIONS.md](LIMITATIONS.md)の確認範囲を超えて、配置成功・本番運用を保証するものではありません。Cloudコマンドは資源・費用・権限を変更するので、対象projectと予算を確認してから実行してください。
+この手順は、自分のGoogle Cloud / Firebaseへ現在の0.4.0を新規導入するための構成と作業順です（0.3.0の配置からの更新は末尾の互換性を参照）。第三者projectでこの手順を一通り実行した検証は未完了です。[LIMITATIONS.md](LIMITATIONS.md)の確認範囲を超えて、配置成功・本番運用を保証するものではありません。Cloudコマンドは資源・費用・権限を変更するので、対象projectと予算を確認してから実行してください。
 
 ## 1. 用意するもの
 
@@ -234,9 +234,10 @@ MCPのCPU/memory/instance数は上記の開始例であり、負荷試験済み�
 ## 互換性
 ### 0.3.0の互換性
 
-0.3.0は新規導入専用です。
+0.2.0以前の配置から0.3.0以降（現在の0.4.0を含む）へは、移行せず新規導入として配置します。
 
-- 送信API・Eventsの契約が0.2.0から非互換に変わりました。送信は `/v2/commands` 系で、要求は `schemaVersion` 2・`commandId`・`text`・`createdAt`・`expiresAt` の5項目だけ、Eventsは `text.submitted`（dataは `schemaVersion` 2・`commandId`・`text`・`expiresAt` の4項目）です。0.2.0の `/v1/commands` 系route（404）、`schemaVersion` 1や `direction`・`taskId`・`taskLabel`・`revision` を含む要求（400）、旧イベント名 `shortcut.triggered` の購読（NotFound）は受け付けません。新旧の変換・別名・redirectはありません。入力元は[API.md](API.md)の新しい契約で送ってください。
+- 送信API・Eventsの契約が0.2.0から非互換に変わりました（0.3.0で導入し、0.4.0でも同じ）。送信は `/v2/commands` 系で、要求は `schemaVersion` 2・`commandId`・`text`・`createdAt`・`expiresAt` の5項目だけ、Eventsは `text.submitted`（dataは `schemaVersion` 2・`commandId`・`text`・`expiresAt` の4項目）です。0.2.0の `/v1/commands` 系route（404）、`schemaVersion` 1や `direction`・`taskId`・`taskLabel`・`revision` を含む要求（400）、旧イベント名 `shortcut.triggered` の購読（NotFound）は受け付けません。新旧の変換・別名・redirectはありません。入力元は[API.md](API.md)の新しい契約で送ってください。
 - 保存形式の識別子（上の保存root・`sttdkms1`・markerのversion・command状態の文書形式）とOAuth scope・`/v1/web/*`のrouteは0.2.0から変えていません（旧接続画面`/connect`は0.3.0で廃止）。ただし、これは0.2.0で保存したGrant・購読・command状態をそのまま引き継げる保証ではありません。0.2.0の配置を0.3.0へ置き換える移行手順・自動移行は提供せず、確認もしていません。既存の保存データ・購読を流用せず、新しい導入（別の保存namespace・接続・購読）として0.3.0を配置してください。
 - 利用許可（`accessPolicy: explicit-allow-v1`）を含むこのsourceは、利用者を管理CLIで明示登録するまで誰も使えません。利用許可の無い以前の0.3.0配置からこのsourceへ更新すると、以前の同意で作ったGrant・購読は新しい送信・購読に使えないため、許可した本人がOAuthの同意と購読をやり直します。利用許可の無い版へ戻すと制限も無くなるため、自動では戻さないでください（[CONFIGURATION](CONFIGURATION.md#access-admin)）。
 - 0.2.0より前の版とは、OAuth scope名・Firestoreの保存root・KMS封緘の形式（prefix・format・AAD）も異なり、互換性がありません。それらの版で保存したGrant・購読・command状態・markerは読まず、旧scopeのtokenも受け付けません。
+- 0.3.0の配置を0.4.0へ更新する場合: 10分の期限を持たない以前の版のコード接続は使えないため、新しいコードで接続し直します（Apple・Googleにはコード専用の期限はありません）。`sourceAuthorization`をcompatibleからstrictへ切り替える時は、新しい接続承認と同意が必要です。一括移行や本番動作を保証するものではありません。

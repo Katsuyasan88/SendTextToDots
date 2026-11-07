@@ -21,7 +21,7 @@
 
 期限切れデータの物理削除処理は含まれていません（[LIMITATIONS.md](LIMITATIONS.md)）。
 
-保存root・KMS封緘の形式（capsule prefix・format・AADのdomain）・OAuth scopeは0.2.0で導入した値を0.3.0でも使い、0.2.0より前の版のデータやtokenを読み替える・受け入れる経路はありません。封緘の開封はformat・domain・保存位置が一致した場合だけ成功し、所有・期限・署名・単回配送・認可の検査は変わりません。0.3.0は送信API・Eventsの契約が0.2.0と非互換で（v2・`schemaVersion` 2・`text.submitted`。旧v1・旧項目・旧イベント名は拒否）、保存形式の識別子が同じでも0.2.0のデータを引き継ぐ移行は提供・確認していないため、新規導入として配置してください（[INSTALL.md](INSTALL.md#030の互換性)）。
+保存root・KMS封緘の形式（capsule prefix・format・AADのdomain）・OAuth scopeは0.2.0で導入した値を0.3.0以降（現在の0.4.0を含む）でも使い、0.2.0より前の版のデータやtokenを読み替える・受け入れる経路はありません。封緘の開封はformat・domain・保存位置が一致した場合だけ成功し、所有・期限・署名・単回配送・認可の検査は変わりません。0.3.0以降（0.4.0を含む）は送信API・Eventsの契約が0.2.0と非互換で（v2・`schemaVersion` 2・`text.submitted`。旧v1・旧項目・旧イベント名は拒否）、保存形式の識別子が同じでも0.2.0のデータを引き継ぐ移行は提供・確認していないため、新規導入として配置してください（[INSTALL.md](INSTALL.md#030の互換性)）。
 
 ## 認可と秘密
 

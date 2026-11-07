@@ -2,7 +2,7 @@
 
 English | [日本語](API.md)
 
-This is the contract of source 0.3.0. The send API is the `/v2/commands` family, `schemaVersion` of requests and Events is the integer 2, and the event name is `text.submitted`. Arbitrary text passed by the source for each send (within the limits, lifetime and authentication conditions below) is delivered as is to the destination the user has subscribed. Direction, preset tasks, saved shortcuts and similar metadata are not part of the contract. The v1 contract of 0.2.0 and earlier is incompatible; old routes, old schemas and old event names are rejected ([INSTALL_EN.md](INSTALL_EN.md#compatibility-of-030)). The implementation (`src/commands/input.ts`, `src/policy.ts`, `src/delivery/`, `src/events/contract.ts`) is the source of truth for the values.
+This is the contract of source 0.4.0 (this v2 contract was introduced in 0.3.0 and is unchanged in 0.4.0). The send API is the `/v2/commands` family, `schemaVersion` of requests and Events is the integer 2, and the event name is `text.submitted`. Arbitrary text passed by the source for each send (within the limits, lifetime and authentication conditions below) is delivered as is to the destination the user has subscribed. Direction, preset tasks, saved shortcuts and similar metadata are not part of the contract. The v1 contract of 0.2.0 and earlier is incompatible; old routes, old schemas and old event names are rejected ([INSTALL_EN.md](INSTALL_EN.md#compatibility-of-030)). The implementation (`src/commands/input.ts`, `src/policy.ts`, `src/delivery/`, `src/events/contract.ts`) is the source of truth for the values.
 
 
 ## 1. Overview

@@ -88,7 +88,7 @@ Plans are not fixed and may change. Authentication uses the Firebase Apple provi
 
 ## Compatibility
 
-Version 0.3.0 is for new installations only; there is no automatic migration. The API and Events contract is incompatible with 0.2.0, and versions before 0.2.0 also use different storage, OAuth scopes, and sealing formats. See [compatibility details](docs/INSTALL_EN.md#compatibility-of-030) before deployment.
+The current version is 0.4.0. It keeps the v2 API and Events contract introduced in 0.3.0. Coming from 0.2.0 or earlier is a new installation with no automatic migration: the API and Events contract is incompatible with 0.2.0, and versions before 0.2.0 also use different storage, OAuth scopes, and sealing formats. When updating a 0.3.0 deployment, code connections from earlier versions without the 10-minute deadline must connect again with a new code (Apple and Google have no code-specific deadline), and switching `sourceAuthorization` from compatible to strict requires a new connection approval. This is not a bulk migration or a guarantee of production operation. See [compatibility details](docs/INSTALL_EN.md#compatibility-of-030) before deployment.
 
 ## Limitations and disclaimer
 

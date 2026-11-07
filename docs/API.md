@@ -2,7 +2,7 @@
 
 [English](API_EN.md) | 日本語
 
-source 0.3.0の契約です。送信APIは `/v2/commands` 系、要求とEventsの `schemaVersion` は整数2、イベント名は `text.submitted` です。入力元が送信ごとに渡した任意の本文（下の上限・期限・認証の条件内）を、本人が購読した送信先へそのまま届けます。方向・定型task・保存したshortcut等のmetadataは契約に含みません。0.2.0以前のv1契約とは互換性がなく、旧route・旧schema・旧イベント名は受け付けません（[INSTALL.md](INSTALL.md#030の互換性)）。値の正本は実装（`src/commands/input.ts`・`src/policy.ts`・`src/delivery/`・`src/events/contract.ts`）です。
+source 0.4.0の契約です（このv2契約は0.3.0で導入し、0.4.0でも変わりません）。送信APIは `/v2/commands` 系、要求とEventsの `schemaVersion` は整数2、イベント名は `text.submitted` です。入力元が送信ごとに渡した任意の本文（下の上限・期限・認証の条件内）を、本人が購読した送信先へそのまま届けます。方向・定型task・保存したshortcut等のmetadataは契約に含みません。0.2.0以前のv1契約とは互換性がなく、旧route・旧schema・旧イベント名は受け付けません（[INSTALL.md](INSTALL.md#030の互換性)）。値の正本は実装（`src/commands/input.ts`・`src/policy.ts`・`src/delivery/`・`src/events/contract.ts`）です。
 
 ## 1. 概要
 
