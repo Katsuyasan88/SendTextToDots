@@ -220,10 +220,23 @@ export function syntheticSdk({ restoredUser = false, token = 'synthetic-id-token
         calls.providers.push(id);
       }
     },
-    signInWithPopup: async () => {
+    // T232: 合成のGoogle provider（Google popupの結果はproviderData google.com・Appleの結果は従来どおりproviderData無し）。
+    GoogleAuthProvider: class {
+      constructor() {
+        this.google = true;
+        calls.providers.push('google.com');
+      }
+    },
+    signInWithPopup: async (_auth, provider) => {
       calls.popups += 1;
       if (calls.popupMode === 'blocked') throw Object.assign(new Error('popup blocked'), { code: 'auth/popup-blocked' });
       if (calls.popupMode === 'fail') throw new Error('synthetic sign-in failure');
+      if (calls.popupMode === 'exists') throw Object.assign(new Error('exists'), { code: 'auth/account-exists-with-different-credential' });
+      if (provider && provider.google === true && calls.popupMode !== 'wrong-provider') {
+        const g = { ...makeUser(uid, token), providerData: [{ providerId: 'google.com' }] };
+        auth.currentUser = g;
+        return { user: g };
+      }
       auth.currentUser = user;
       return { user };
     },

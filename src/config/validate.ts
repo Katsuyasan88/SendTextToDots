@@ -37,6 +37,9 @@ export const ACCESS_POLICY = 'explicit-allow-v1';
 /** 開発者向け6桁コードの有効値（省略・'off'は無効）。 */
 export const DEVELOPER_LOGIN_MODE = 'operator-code-v1';
 const API_KEYS = ['functionName', 'serviceName', 'serviceAccount', 'invoker', 'publicOrigin'] as const;
+/** 送信APIの任意の明示runtime。省略・functions-v1は既存のFunctions配置、cloud-run-v1はdirect Cloud Run（src/deployment/api.ts）。 */
+export const API_RUNTIMES = ['functions-v1', 'cloud-run-v1'] as const;
+export type ApiRuntime = (typeof API_RUNTIMES)[number];
 const CONNECT_KEYS = ['serviceName', 'serviceAccount', 'publicOrigin', 'invoker'] as const;
 const KMS_KEYS = ['environment', 'projectId', 'databaseId', 'namespace', 'cryptoKey', 'writeVersion', 'readVersions'] as const;
 const SECRET_PURPOSES = ['jwks', 'cookieKeys', 'identifierKey', 'commandDigestKey'] as const;
@@ -84,6 +87,8 @@ export interface DeploymentConfig {
     readonly serviceAccount: string;
     readonly invoker: 'private';
     readonly publicOrigin: string;
+    /** 明示した時だけ（省略はfunctions-v1と同じ既存配置）。 */
+    readonly runtime?: ApiRuntime;
   };
   readonly connect: {
     readonly serviceName: string;
@@ -241,7 +246,9 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
     requireThat(databaseId === '(default)' || DATABASE_ID.test(databaseId));
     requireThat(KMS_REGION_PATTERN.test(location));
 
-    const apiFields = dataFields(top.get('api'), API_KEYS);
+    const apiFields = dataFields(top.get('api'), API_KEYS, ['runtime']);
+    const runtime = apiFields.has('runtime') ? apiFields.get('runtime') : undefined;
+    requireThat(runtime === undefined || runtime === 'functions-v1' || runtime === 'cloud-run-v1');
     const api = {
       functionName: str(apiFields, 'functionName'),
       serviceName: str(apiFields, 'serviceName'),
@@ -249,7 +256,10 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
       invoker: str(apiFields, 'invoker'),
       publicOrigin: str(apiFields, 'publicOrigin'),
     };
-    requireThat(api.functionName === API_FUNCTION_EXPORT && api.serviceName === API_FUNCTION_EXPORT);
+    // functionNameは常に固定。serviceNameは既存配置では固定、cloud-run-v1を明示した時だけ独立した安全なCloud Run名（Functionsの名前と共用しない）。
+    requireThat(api.functionName === API_FUNCTION_EXPORT);
+    if (runtime === 'cloud-run-v1') requireThat(CLOUD_RUN_NAME.test(api.serviceName) && api.serviceName !== API_FUNCTION_EXPORT);
+    else requireThat(api.serviceName === API_FUNCTION_EXPORT);
     requireThat(api.invoker === 'private' && isServiceAccount(api.serviceAccount, projectId) && isPublicOrigin(api.publicOrigin));
 
     const connectFields = dataFields(top.get('connect'), CONNECT_KEYS);
@@ -316,6 +326,8 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
       connectServiceAccount: connect.serviceAccount,
       isServiceAccount: (value) => isServiceAccount(value, projectId),
     });
+    // direct Cloud Run APIとgateway-v1（公開API = gateway）は同時に選べない（不整合は設定error）。
+    requireThat(!(runtime === 'cloud-run-v1' && topology !== undefined));
 
     return deepFreeze({
       accessPolicy: ACCESS_POLICY,
@@ -324,7 +336,7 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
       projectNumber,
       databaseId,
       location,
-      api: api as DeploymentConfig['api'],
+      api: (runtime === undefined ? api : { ...api, runtime }) as DeploymentConfig['api'],
       connect: connect as DeploymentConfig['connect'],
       connectNamespace: connectNamespace as string,
       deliveryNamespace: deliveryNamespace as string,

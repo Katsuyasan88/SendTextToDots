@@ -10,6 +10,7 @@
 - このrepositoryのsourceだけでbuild/testできます。開発者の私有folder、Git hook、AI設定は不要です。`node_modules`・`dist`を他環境からコピーせず、lockから取得してください。TypeScriptのプラットフォーム別依存があるため`--omit=optional`は付けません。
 - 請求先が有効な、自分のGoogle Cloud projectと同じprojectのFirebase。既存の他アプリのDB・鍵・購読を流用しない新規導入にします。
 - Firebase Webアプリ、AuthenticationのApple provider、Apple Developer Program側のSign in with Apple設定。[公式のApple設定手順](https://firebase.google.com/docs/auth/web/apple)に沿いServices ID・Team ID・key等を設定し、認証redirect先をApple側に登録します。Appleの秘密鍵はこのsourceへ入れません。
+- 任意: Googleでのログインも提供する場合は、同じFirebase projectのAuthenticationでGoogle providerを明示的に有効にし、同じ許可ドメインを使います。Googleの利用者はAppleとは別のUID（同じメールアドレスでも統合しません）で、Appleの利用者と同じ方法で登録・接続します。
 - 必要なMCP Events購読に対応したDots/ChatGPTの利用資格。許可するOAuth clientは`src/oauth/cimd.ts`のChatGPT CIMD 1件です。別clientや別callback仕様へ自動対応しません。
 - 以下のCloudコマンド例は**Bash（Cloud Shell等）とGoogle Cloud CLI**用です。PowerShellへそのまま貼る構文ではありません。CLIは導入者の管理操作用で、serviceのruntime資格としては使いません。
 
@@ -209,10 +210,10 @@ MCPのCPU/memory/instance数は上記の開始例であり、負荷試験済み�
 
 [Dotsの受信テストと応答設定](DOTS_GUIDE.md)の順に、受信先Dotsへテスト用の指示文を貼り、送信した本文の一致を確認した後、運用用の指示文を貼ります。ローカル送信画面の手順3と手順6で、選択言語の文面を表示・コピーできます。コピーだけではDotsへ送信されず、本文一致や切替完了を画面が自動判定することもありません。
 
-1. 自分のパソコンでローカル送信画面を起動します（[LOCAL_CONSOLE.md](LOCAL_CONSOLE.md)）: `console.config.example.json`を`console.local.json`へコピーしてAPI/MCPのoriginとFirebase Webの公開設定を入れ、`npm run console -- --config console.local.json`を実行し、`http://localhost:8765/console`を開きます（English/日本語。ボタンを押すまで読み込みも送信もしません）。Firebaseのauthorized domainsへ`localhost`を追加します。手順1でAppleログインします。Dots/ChatGPTのMCP server登録先は**MCP originの`/mcp`**です。ローカル画面やAPI originを登録先にしません。
-2. 接続の前に、使う本人（自分を含む）を運営者が管理CLIで明示登録します（[CONFIGURATION](CONFIGURATION.md#access-admin)）。手順1のAppleログインでFirebase利用者ができるので、Firebase consoleのAuthentication等で本人のUIDを確認して登録します。未登録・停止中はOAuthのログインで「このサービスの利用が許可されていません」と表示され、送信もできません。続いてDots/ChatGPT側からOAuth接続し、同じFirebase利用者として明示同意します。手順2の「接続を確認」で接続の許可を確認すると手順3へ進みます（他の状態では次にすることを画面が案内します）。`text.submitted`の購読（受信の開始）は手順3で行い、手順4で「受信中」になることを確認します。送信画面を開くだけでは購読は作られません。 Dots/ChatGPTへの追加手順と登録先URLは、ローカル画面の手順2の「プラグインを追加・接続する」に表示されます（[LOCAL_CONSOLE](LOCAL_CONSOLE.md)）。
+1. 自分のパソコンでローカル送信画面を起動します（[LOCAL_CONSOLE.md](LOCAL_CONSOLE.md)）: `console.config.example.json`を`console.local.json`へコピーしてAPI/MCPのoriginとFirebase Webの公開設定を入れ、`npm run console -- --config console.local.json`を実行し、`http://localhost:8765/console`を開きます（English/日本語。ボタンを押すまで読み込みも送信もしません）。Firebaseのauthorized domainsへ`localhost`を追加します。手順1でAppleログイン（Googleを有効にした場合はGoogleも可）します。Dots/ChatGPTのMCP server登録先は**MCP originの`/mcp`**です。ローカル画面やAPI originを登録先にしません。
+2. 接続の前に、使う本人（自分を含む）を運営者が管理CLIで明示登録します（[CONFIGURATION](CONFIGURATION.md#access-admin)）。手順1のApple又はGoogleログインでFirebase利用者（方式ごとに別のUID）ができるので、Firebase consoleのAuthentication等で本人のUIDを確認して登録します。未登録・停止中はOAuthのログインで「このサービスの利用が許可されていません」と表示され、送信もできません。続いてDots/ChatGPT側からOAuth接続し、同じFirebase利用者として明示同意します。手順2の「接続を確認」で接続の許可を確認すると手順3へ進みます（他の状態では次にすることを画面が案内します）。`text.submitted`の購読（受信の開始）は手順3で行い、手順4で「受信中」になることを確認します。送信画面を開くだけでは購読は作られません。 Dots/ChatGPTへの追加手順と登録先URLは、ローカル画面の手順2の「プラグインを追加・接続する」に表示されます（[LOCAL_CONSOLE](LOCAL_CONSOLE.md)）。
 3. 手順3でテスト用の指示文を受信先Dotsへ貼り付け、受信を開始します。手順4で「受信状態を確認」を押し、「受信中」を確認します。手順5で固定文を送り、受信側で固定文どおりの表示を確認してから画面で一致を確認します。手順6で運用用の指示文を貼り付けると、手順7で自由な本文を送れます。STTD自身は本文を実行しません。
-4. 直接APIを使う場合は[1件送信するclient例](API.md#direct-client-example)と[sessionの条件](API.md#firebase-sessions)を参照。Apple providerで認証した同じproject/UIDのFirebase ID tokenが必要です。Web画面のtokenを表示する管理toolは同梱しません。最初の確認とその後の通常送信（手順7）にはローカル画面を使えます。
+4. 直接APIを使う場合は[1件送信するclient例](API.md#direct-client-example)と[sessionの条件](API.md#firebase-sessions)を参照。Apple又はGoogle provider（接続に使った方式）で認証した同じproject/UIDのFirebase ID tokenが必要です。Web画面のtokenを表示する管理toolは同梱しません。最初の確認とその後の通常送信（手順7）にはローカル画面を使えます。
 5. `delivered`はcallbackの2xx受領で、受信側の処理完了ではありません。結果不明なら送信前に控えた同じcommandIdで状態照会し、新IDで自動再送しません。
 6. このaccountからの送信を止めるにはローカル画面の手順2の「接続を解除」を使います（画面で確認してから実行）。認可と購読が失効し、再開はChatGPTからの再接続です。解除しても以前の受信先（既知の送信先）の記録は残るため、別の受信先で受け直す時は、プラグインの接続をAppleでやり直し、最後の許可画面で「以前の受信先設定を削除」を確認してください（コードでの接続では削除しません。アカウント・利用許可・鍵は残ります）。Cloud Runは送信画面も別の接続画面も配信しません。
 
@@ -225,7 +226,7 @@ MCPのCPU/memory/instance数は上記の開始例であり、負荷試験済み�
 | `deployment_config_unconfigured` / `deployment_config_invalid` | placeholder・configured・origin・project number・namespace・secret数値版・設定後の再build |
 | SDKの`environment_rejected` | Cloud Runのservice/revision/configuration、設定service名、拒否環境変数。ローカルserver起動や資格overrideで回避しない |
 | 起動時の秘密/marker失敗 | JWKSのalg/完全な秘密鍵、raw bytes長、各secret版の有効性/権限、選択DBのmarkerの型/完全一致 |
-| tokenが正しいように見えるのに認証失敗 | Apple provider・同project/UID・期限・失効状態と、**runtime SAのfirebaseauth.users.get** |
+| tokenが正しいように見えるのに認証失敗 | 使った方式のprovider（Apple、又はFirebaseで有効にしたGoogle）・同project/UID・期限・失効状態と、**runtime SAのfirebaseauth.users.get** |
 | browser/DotsがCloudの401/403でアプリに届かない | Cloud入口の公開到達/IAM。アプリ401と区別し、Firebase tokenをCloud IAM tokenの代わりにしない |
 | 接続済みだが送れない | `/mcp`でtext.submitted購読が有効か。別UID・Grant失効・送信先置換待ち・期限を確認 |
 | `output_exists` | 既存archive/receiptの完全性とhash。既存の内容を確認せず`.tmp`全体を削除しない |

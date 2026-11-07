@@ -35,6 +35,12 @@ import {
   isUuid,
   newCodeUid,
   newReservation,
+  codeLoginExpired,
+  validEpochMs,
+  CODE_LOGIN_LIFETIME_MS,
+  SESSION_LOCK_HOLD_MS,
+  SESSION_WRONG_CODE_LIMIT,
+  sessionLockOf,
   operationIdHashOf,
   parseReservation,
   pruneTimes,
@@ -53,6 +59,14 @@ export const RESERVATIONS = 'developerLoginCodeReservations';
 export const OPERATIONS = 'developerLoginOperations';
 export const CODE_IDENTITIES = 'developerCodeIdentities';
 export const RATE_BUCKETS = 'developerLoginRate';
+/** 接続セッション（interaction）単位の誤入力ロック（生interaction id・コードなし）。 */
+export const SESSION_LOCKS = 'developerLoginSessionLock';
+const SESSION_LOCK_KEYS = ['version', 'wrong', 'deleteAfter'] as const;
+function parseSessionLock(data: unknown): number {
+  const r = exactKeys(data, SESSION_LOCK_KEYS);
+  if (r.version !== DEVELOPER_LOGIN_VERSION || !Number.isSafeInteger(r.wrong) || (r.wrong as number) < 0 || millisOf(r.deleteAfter) === null) throw unavailable();
+  return r.wrong as number;
+}
 export const STATE = 'developerLoginState';
 const CONNECT_ROOT = 'sttdConnect';
 const PLANNED_UID_PURPOSE = 't265:dlc:planned-uid';
@@ -98,6 +112,7 @@ export type IssueOutcome = {
 };
 
 export type ConsumeOutcome =
+  | { readonly kind: 'session_locked' }
   | {
       readonly kind: 'consumed';
       readonly operationIdHash: string;
@@ -115,7 +130,8 @@ export type ClaimOutcome =
   | { readonly kind: 'active'; readonly uid: string; readonly familyId: string }
   | { readonly kind: 'ended' };
 
-export type CodeIdentityState = 'active' | 'revoked' | 'missing';
+/** 'expired'はコードでのログイン成立から10分（CODE_LOGIN_LIFETIME_MS）を過ぎたidentity。 */
+export type CodeIdentityState = 'active' | 'revoked' | 'missing' | 'expired';
 
 interface OperationRecord {
   readonly version: 1;
@@ -299,6 +315,10 @@ export class DeveloperLoginStore {
   #identityRef(hash: string): DocumentReference {
     return this.#root.collection(CODE_IDENTITIES).doc(hash);
   }
+  #sessionLockRef(hash: string): DocumentReference {
+    return this.#root.collection(SESSION_LOCKS).doc(hash);
+  }
+
   #rateRef(hash: string): DocumentReference {
     return this.#root.collection(RATE_BUCKETS).doc(hash);
   }
@@ -539,10 +559,15 @@ export class DeveloperLoginStore {
     const interactionHash = rateBucketOf(hasher, this.#scope, 'interaction', input.interactionKey);
     const sourceHash = rateBucketOf(hasher, this.#scope, 'source', input.sourceKey);
     const namespaceHash = rateBucketOf(hasher, this.#scope, 'namespace', 'failures');
+    const lockRef = this.#sessionLockRef(sessionLockOf(hasher, this.#scope, input.interactionKey));
     const outcome = await guard(() =>
       this.#d.db.runTransaction(
         async (tx) => {
           const now = clock.now();
+          // 接続セッションの誤入力ロック（時刻窓・コード再発行・再読込でresetしない）。ロック中は試行件数も消費せず照合0。
+          const lockSnapshot = await tx.get(lockRef);
+          const wrongSoFar = lockSnapshot.exists ? parseSessionLock(lockSnapshot.data()) : 0;
+          if (wrongSoFar >= SESSION_WRONG_CODE_LIMIT) return { kind: 'session_locked' as const };
           const perInteraction = await this.#bump(tx, this.#rateRef(interactionHash), now, this.#limits.attemptsPerInteraction);
           const perSource = await this.#bump(tx, this.#rateRef(sourceHash), now, this.#limits.attemptsPerSource);
           const failures = await this.#bump(tx, this.#rateRef(namespaceHash), now, this.#limits.namespaceFailures);
@@ -567,7 +592,10 @@ export class DeveloperLoginStore {
             consoleEntry.generation === reservation.consoleGeneration;
           if (!valid) {
             failures.write();
-            return { kind: 'rejected' as const };
+            const wrong = wrongSoFar + 1;
+            tx.set(lockRef, { version: DEVELOPER_LOGIN_VERSION, wrong, deleteAfter: stamp(now + SESSION_LOCK_HOLD_MS) });
+            // 3回目の誤入力の時点でロックを知らせる（以後は正しいコードでも交換0）。
+            return wrong >= SESSION_WRONG_CODE_LIMIT ? ({ kind: 'session_locked' as const }) : ({ kind: 'rejected' as const });
           }
           tx.update(this.#reservationRef(reservationId), { state: 'provisioning', boundInteractionHash: interactionHash });
           tx.update(this.#operationRef(reservation.operationIdHash), { state: 'provisioning' });
@@ -685,7 +713,8 @@ export class DeveloperLoginStore {
             createdAt: now,
             revokedAt: null,
           });
-          tx.create(accessRef, { ...access });
+          // 利用許可にもログイン成立から10分の絶対期限を同時に保存（owner・Grant・配送/購読の最終tx・MCP既存access tokenが同じ期限で止まる）。
+          tx.create(accessRef, { ...access, codeLoginExpiresAt: now + CODE_LOGIN_LIFETIME_MS });
           tx.update(opRef, { state: 'active', identityHash });
           tx.update(this.#reservationRef(operation.reservationId), { state: 'active' });
           return { kind: 'active' };
@@ -722,7 +751,15 @@ export class DeveloperLoginStore {
     const snapshot = await guard(() => this.#identityRef(identityHash).get(), this.#d.clock.now() + OPERATION_BUDGET_MS, this.#d.clock);
     if (!snapshot.exists) return { state: 'missing', familyId: null, generation: null };
     const identity = parseIdentity(snapshot.data());
-    return { state: identity.state, familyId: identity.familyId, generation: identity.currentGeneration };
+    if (identity.state !== 'active') return { state: identity.state, familyId: identity.familyId, generation: identity.currentGeneration };
+    // ログイン成立（activate時のcreatedAt）から10分の絶対期限。古いidentityも同じ起点で判定する（無期限互換を作らない）。
+    // 時計・保存時刻が判定不能（非有限・未来・負）ならfail closed（unavailable）。
+    const now = this.#d.clock.now();
+    // 時刻は安全整数・非負・Date域内だけ（不正はcodeLoginExpiredがthrow→unavailable）。別instanceの時計差（最大60秒）だけは
+    // 作成直後として扱い、それを超える未来時刻は不正。期限は常にcreatedAt＋10分で、この許容で期限を延ばさない。
+    if (!validEpochMs(now) || !validEpochMs(identity.createdAt) || identity.createdAt > now + 60_000) throw unavailable();
+    if (codeLoginExpired(identity.createdAt, now)) return { state: 'expired', familyId: identity.familyId, generation: identity.currentGeneration };
+    return { state: 'active', familyId: identity.familyId, generation: identity.currentGeneration };
   }
 
   /** 予約の保持期間（試験・文書用の固定値）。 */

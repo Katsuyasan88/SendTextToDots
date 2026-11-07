@@ -176,6 +176,7 @@ ${options.operatorFirst === true ? (options.operatorSection ?? '') : ''}
 <p id="sttd-account-text" role="status">${t('console.accountSignedOut')}</p>
 <div class="sttd-actions">
 <button type="button" id="sttd-login"${i18n('common.appleLogin')}>${t('common.appleLogin')}</button>
+<button type="button" id="sttd-login-google"${i18n('common.googleLogin')}>${t('common.googleLogin')}</button>
 <button type="button" id="sttd-switch" hidden${i18n('common.switchAccount')}>${t('common.switchAccount')}</button>
 </div>
 </div>
@@ -548,6 +549,11 @@ function render() {
   el('sttd-account-text').textContent = T(accountKey);
   el('sttd-login').hidden = signedIn;
   el('sttd-login').disabled = inactive(1) || busy() || inFlight();
+  const googleLogin = el('sttd-login-google');
+  if (googleLogin) {
+    googleLogin.hidden = signedIn;
+    googleLogin.disabled = inactive(1) || busy() || inFlight();
+  }
   el('sttd-switch').hidden = !signedIn;
   el('sttd-switch').disabled = inactive(1) || busy() || inFlight() || confirming;
   // 2 接続確認
@@ -762,7 +768,8 @@ function resumable(result, uid, want) {
   if (fb === null || typeof fb !== 'object' || fb.tenant !== undefined) return false;
   if (typeof uid !== 'string' || c.sub !== uid) return false;
   if (want === 'code') return fb.sign_in_provider === 'custom' && c.sttd_dlc === 1 && typeof c.sttd_fam === 'string' && CODE_FAMILY.test(c.sttd_fam) && CODE_UID.test(uid);
-  return fb.sign_in_provider === 'apple.com' && !CODE_UID.test(uid);
+  // 通常login（Apple・Google）の保存済み認証だけ。他provider・code UIDは復元しない。
+  return (fb.sign_in_provider === 'apple.com' || fb.sign_in_provider === 'google.com') && !CODE_UID.test(uid);
 }
 
 /** 正の遷移先panelを表示する（scroll＋focus）。失敗・古い結果・再選択では呼ばない。 */
@@ -836,7 +843,7 @@ function ensureSdk() {
     sdkLoading = loadSdkModules()
       .then(([app, authModule]) => {
         const auth = authModule.getAuth(app.initializeApp(FIREBASE));
-        sdk = { auth, OAuthProvider: authModule.OAuthProvider, signInWithPopup: authModule.signInWithPopup, signOut: authModule.signOut, signInWithCustomToken: authModule.signInWithCustomToken };
+        sdk = { auth, OAuthProvider: authModule.OAuthProvider, GoogleAuthProvider: authModule.GoogleAuthProvider, signInWithPopup: authModule.signInWithPopup, signOut: authModule.signOut, signInWithCustomToken: authModule.signInWithCustomToken };
         return sdk;
       })
       .catch((error) => {
@@ -852,8 +859,20 @@ function popupBlocked(error) {
   return code === 'auth/popup-blocked';
 }
 
-/** 明示ログイン（switchingは別account）。開始時に2以降を戻す。世代が変わった古い結果では何も解放しない。 */
-async function login(switching) {
+/** 保存済みuserの通常provider（Apple・Googleのどちらか一方だけ。曖昧・他は''）。 */
+function normalProvider(user) {
+  const ids = user && Array.isArray(user.providerData) ? user.providerData.map((p) => (p ? p.providerId : '')) : [];
+  const apple = ids.includes('apple.com');
+  const google = ids.includes('google.com');
+  return apple && !google ? 'apple.com' : google && !apple ? 'google.com' : '';
+}
+
+/**
+ * 明示ログイン（switchingは別account、providerは'apple.com'又は'google.com'）。開始時に2以降を戻す。世代が変わった古い結果では何も解放しない。
+ * 保存済みが別providerなら先にsignOutし、選んだproviderのpopupだけを開く（メール一致のlink・UID統合はしない）。
+ */
+async function login(switching, provider = 'apple.com') {
+  if (provider !== 'apple.com' && provider !== 'google.com') return;
   if (!canAct(1) || busy() || inFlight()) return;
   if (method === 'code') await chooseMethod('apple');
   const gen = ++loginGeneration;
@@ -882,16 +901,29 @@ async function login(switching) {
     if (gen !== loginGeneration) return;
     if (isCodeUser(s.auth.currentUser)) await s.signOut(s.auth);
     if (gen !== loginGeneration) return;
+    // 保存済みが選んだ方式と明らかに違う（Google選択でGoogle以外・Apple選択で保存済みGoogle）なら、それを使わずsignOutしてから開く。
+    const saved = normalProvider(s.auth.currentUser);
+    if (s.auth.currentUser && (provider === 'google.com' ? saved !== 'google.com' : saved === 'google.com')) await s.signOut(s.auth);
+    if (gen !== loginGeneration) return;
     if (!s.auth.currentUser || switching) {
       try {
-        await s.signInWithPopup(s.auth, new s.OAuthProvider('apple.com'));
+        await s.signInWithPopup(s.auth, provider === 'google.com' ? new s.GoogleAuthProvider() : new s.OAuthProvider('apple.com'));
       } catch (error) {
         if (gen !== loginGeneration) return;
         if (!s.auth.currentUser) {
-          accountKey = popupBlocked(error) ? 'wizard.loginPopupBlocked' : 'common.loginFailed';
+          const code = error && typeof error.code === 'string' ? error.code : '';
+          // 同じメールが別方式で登録済み: 既存の方式でログインする固定案内（fetchSignInMethodsForEmail・自動linkは使わない）。
+          accountKey = popupBlocked(error) ? 'wizard.loginPopupBlocked' : code === 'auth/account-exists-with-different-credential' ? 'common.googleExistsOther' : 'common.loginFailed';
           return;
         }
       }
+    }
+    if (gen !== loginGeneration) return;
+    const got = normalProvider(s.auth.currentUser);
+    if (provider === 'google.com' ? got !== 'google.com' : got === 'google.com') {
+      // 選んだ方式以外の結果は使わない（失敗した方式の代わりに別の保存済み認証を送らない）。Appleの従来判定は変えない。
+      accountKey = 'common.loginFailed';
+      return;
     }
     if (gen !== loginGeneration) return;
     const user = s.auth.currentUser;
@@ -1532,7 +1564,8 @@ async function codeSignIn(epoch, customToken) {
 globalThis.sttdConsoleCode = Object.freeze({
   chooseMethod: (next) => chooseMethod(next),
   // 方式「Apple」で共通の「続ける」を押した時だけ、既存のAppleログインを始める（選択・初期表示では通信しない）。
-  appleLogin: () => login(false),
+  appleLogin: () => login(false, 'apple.com'),
+  googleLogin: () => login(false, 'google.com'),
   // 認証済み・発行済み等の進捗の有無（方式切替時の旧plugin再追加の案内に使う）
   progressed: () => done[1] || skipped[1] || codeIssued || signedIn,
   issued: (epoch) => codeIssuedFor(epoch),
@@ -1551,8 +1584,11 @@ function start() {
     el('sttd-panel-' + n).addEventListener('click', (event) => panelCapture(n, event), true);
     el('sttd-panel-' + n).addEventListener('keydown', (event) => panelKeyCapture(n, event), true);
   }
-  el('sttd-login').onclick = () => login(false);
-  el('sttd-switch').onclick = () => login(true);
+  el('sttd-login').onclick = () => login(false, 'apple.com');
+  const googleLoginButton = el('sttd-login-google');
+  if (googleLoginButton) googleLoginButton.onclick = () => login(false, 'google.com');
+  // 別アカウントは保存済みと同じ方式で開く（Apple⇔Googleの切替は各ログインボタン）。
+  el('sttd-switch').onclick = () => login(true, normalProvider(sdk?.auth?.currentUser) || 'apple.com');
   el('sttd-refresh').onclick = () => checkConnection();
   el('sttd-disconnect').onclick = () => askDisconnect();
   el('sttd-disconnect-yes').onclick = () => disconnect();

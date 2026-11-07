@@ -35,8 +35,9 @@ export function accessDocRef(connectRoot: DocumentReference, identityHash: strin
   return connectRoot.collection(ACCESS_COLLECTION).doc(identityHash);
 }
 
-export function accessVerdictOfSnapshot(snapshot: DocumentSnapshot): AccessVerdict {
-  return accessVerdictOf(snapshot.exists, snapshot.exists ? snapshot.data() : undefined);
+/** nowはコードloginの期限判定用（渡さない呼出しでは期限付き許可をdenied＝fail closed）。 */
+export function accessVerdictOfSnapshot(snapshot: DocumentSnapshot, now?: number): AccessVerdict {
+  return accessVerdictOf(snapshot.exists, snapshot.exists ? snapshot.data() : undefined, now);
 }
 
 export function grantGenerationOfSnapshot(snapshot: DocumentSnapshot): GrantGeneration {

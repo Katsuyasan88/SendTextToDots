@@ -84,6 +84,7 @@ export const CODE_TEXT = Object.freeze({
     rejected: 'This code cannot be used to connect. Generate a new code in the console.',
     limited: 'Too many attempts. Wait a while, then generate a new code in the console.',
     failed: 'The connection could not be completed. Generate a new code in the console.',
+    locked: 'A wrong code was entered 3 times, so code entry is locked for this connection. Start a new connection from the plugin to try a code again, or sign in with Apple.',
     busy: 'Connecting…',
     continueSaved: 'Continue with the saved code sign-in',
   }),
@@ -95,6 +96,7 @@ export const CODE_TEXT = Object.freeze({
     rejected: 'このコードでは接続できません。コンソールで新しいコードを発行してください。',
     limited: '試行が多すぎます。しばらく待ってから、コンソールで新しいコードを発行してください。',
     failed: '接続を完了できませんでした。コンソールで新しいコードを発行してください。',
+    locked: 'コードを3回間違えたため、この接続ではコード入力をロックしました。コードを再度試すにはプラグインから新しく接続を始めてください。Appleでのログインは引き続き使えます。',
     busy: '接続しています…',
     continueSaved: '保存済みのコード認証で続ける',
   }),
@@ -131,6 +133,7 @@ export function renderInteractionLogin(
 <p>${t('interaction.loginGuide')}</p>
 <button type="button" id="sttd-continue" hidden>${t('common.continueSignedIn')}</button>
 <button type="button" id="sttd-apple-login" hidden>${t('common.appleLogin')}</button>
+<button type="button" id="sttd-google-login" hidden>${t('common.googleLogin')}</button>
 <button type="button" id="sttd-switch-account" hidden>${t('common.switchAccount')}</button>${codeSection}
 <p id="sttd-message" role="status"></p>`,
     { 'sttd-interaction': uid, 'sttd-csrf': csrf, 'sttd-code': codeEnabled ? 'on' : 'off' },
@@ -242,7 +245,7 @@ export function renderReceiverResetOutcome(web: FirebaseWebConfig, uid: string, 
  * 文言はbodyのdata-sttd-language（サーバーが選んだ言語）で、埋め込んだ固定辞書から引く。接続状態の表示・解除はこの画面に無い（送信画面の役割）。
  */
 export const INTERACTION_SCRIPT = `import { initializeApp } from '${SDK_BASE}firebase-app.js';
-import { getAuth, OAuthProvider, signInWithCustomToken, signInWithPopup, signOut } from '${SDK_BASE}firebase-auth.js';
+import { getAuth, GoogleAuthProvider, OAuthProvider, signInWithCustomToken, signInWithPopup, signOut } from '${SDK_BASE}firebase-auth.js';
 
 const body = document.body;
 const view = body.dataset.sttdView;
@@ -264,7 +267,7 @@ function show(id, visible) {
 }
 
 const codeOn = body.dataset.sttdCode === 'on';
-const AUTH_BUTTONS = ['sttd-continue', 'sttd-apple-login', 'sttd-switch-account', 'sttd-code-submit', 'sttd-continue-code'];
+const AUTH_BUTTONS = ['sttd-continue', 'sttd-apple-login', 'sttd-google-login', 'sttd-switch-account', 'sttd-code-submit', 'sttd-continue-code'];
 
 function signedOut(message) {
   if (message) say(message);
@@ -272,6 +275,7 @@ function signedOut(message) {
   show('sttd-switch-account', false);
   show('sttd-continue-code', false);
   show('sttd-apple-login', true);
+  show('sttd-google-login', true);
 }
 
 // 保存済みの認証の種類（Apple・開発者コード・不明）。UID・メール等は表示・記録しない。コードのUIDは接続server側で固定の接頭辞を持つ。
@@ -280,19 +284,34 @@ function savedKind(user) {
   if (user.isAnonymous) return 'unknown';
   if (typeof user.uid === 'string' && user.uid.startsWith('sttdc_')) return 'code';
   const providers = Array.isArray(user.providerData) ? user.providerData.map((entry) => (entry ? entry.providerId : undefined)) : [];
-  return providers.includes('apple.com') ? 'apple' : 'unknown';
+  // Apple・Googleのどちらか一方だけ（両方を持つ等の曖昧な認証は推測しない）。
+  const apple = providers.includes('apple.com');
+  const google = providers.includes('google.com');
+  if (apple && !google) return 'apple';
+  if (google && !apple) return 'google';
+  return 'unknown';
 }
 
 // 認証の操作は同時に1つだけ（二重クリック・別の方式との競合でloginを複数送らない）。実行中は全ての認証ボタンを止める。
 let busy = false;
+// この接続セッションでコード入力がロックされた（serverが3回誤入力でsession_locked）。以後コード送信は止めたまま（Appleは使える）。
+let codeLocked = false;
 function setBusy(value) {
   busy = value;
   for (const id of AUTH_BUTTONS) {
     const node = el(id);
     if (!node) continue;
-    const codeButton = id === 'sttd-code-submit' || id === 'sttd-continue-code';
-    node.disabled = value || (codeButton && !codeOn);
+    const codeButton = id === 'sttd-code-submit';
+    node.disabled = value || ((codeButton || id === 'sttd-continue-code') && !codeOn) || (codeButton && codeLocked);
   }
+}
+function lockCode() {
+  codeLocked = true;
+  const input = el('sttd-code-input');
+  if (input) input.disabled = true;
+  const submit = el('sttd-code-submit');
+  if (submit) submit.disabled = true;
+  say(C('locked'));
 }
 function exclusive(task, failure) {
   return async () => {
@@ -300,8 +319,9 @@ function exclusive(task, failure) {
     setBusy(true);
     try {
       await task();
-    } catch {
-      signedOut(failure);
+    } catch (error) {
+      // 固定の案内（別方式で登録済み等）だけはその文言を出す。他の失敗は呼出し側の固定文言。
+      signedOut(error instanceof LoginGuidance ? error.message : failure);
     } finally {
       setBusy(false);
     }
@@ -327,10 +347,29 @@ async function appleIdToken() {
   return tokenOf(result.user);
 }
 
-// 保存済みのAppleで続ける（Appleの時だけ）。
+// Googleでのログイン（Firebase公式GoogleAuthProviderのpopup）: 保存済みの別認証は先にsignOutし、結果がGoogleの時だけ使う。
+// 同じメールが別の方式で登録済み（account-exists-with-different-credential）は、既存の方式でログインする固定案内だけを出す
+// （fetchSignInMethodsForEmail・自動link・メール一致によるUID統合はしない）。
+class LoginGuidance extends Error {}
+async function googleIdToken() {
+  await auth.authStateReady();
+  if (auth.currentUser) await signOut(auth);
+  let result;
+  try {
+    result = await signInWithPopup(auth, new GoogleAuthProvider());
+  } catch (error) {
+    if (error && error.code === 'auth/account-exists-with-different-credential') throw new LoginGuidance(T('common.googleExistsOther'));
+    throw error;
+  }
+  if (savedKind(result.user) !== 'google') throw new Error('not_google');
+  return tokenOf(result.user);
+}
+
+// 保存済みのApple/Googleで続ける（そのどちらかの時だけ）。
 async function restoredAppleIdToken() {
   const user = auth.currentUser;
-  if (savedKind(user) !== 'apple') throw new Error('not_apple');
+  const kind = savedKind(user);
+  if (kind !== 'apple' && kind !== 'google') throw new Error('not_saved');
   return tokenOf(user);
 }
 
@@ -367,6 +406,7 @@ async function accessRefused(response) {
 // 既存の/loginへID tokenを送る（同意・購読は通常どおり）。tokenを表示・保存・URLへ入れない。他の認証操作とは排他。
 const C = (key) => (Object.hasOwn(CODE_TEXT[lang], key) ? CODE_TEXT[lang][key] : '');
 async function codeLogin() {
+  if (codeLocked) return lockCode();
   const input = el('sttd-code-input');
   const code = input.value.trim();
   if (!/^[0-9]{6}$/.test(code)) return say(C('rejected'));
@@ -379,6 +419,17 @@ async function codeLogin() {
       body: JSON.stringify({ csrf: body.dataset.sttdCsrf, code }),
     });
     input.value = '';
+    if (response.status === 403) {
+      // 403は固定error code session_lockedだけをロックとして扱う（他の403は従来どおり失敗表示）。
+      let locked = false;
+      try {
+        const err = await response.json();
+        locked = err !== null && typeof err === 'object' && err.error !== null && typeof err.error === 'object' && err.error.code === 'session_locked';
+      } catch {
+        locked = false;
+      }
+      return locked ? lockCode() : say(C('failed'));
+    }
     if (response.status !== 200) return say(C(response.status === 429 ? 'limited' : response.status === 400 ? 'rejected' : 'failed'));
     const parsed = await response.json();
     if (parsed === null || typeof parsed !== 'object' || typeof parsed.customToken !== 'string') return say(C('failed'));
@@ -398,15 +449,22 @@ async function start() {
     el('sttd-continue-code').onclick = exclusive(async () => interactionLogin(await restoredCodeIdToken()), C('failed'));
   }
   el('sttd-apple-login').onclick = exclusive(async () => interactionLogin(await appleIdToken()), T('common.loginFailed'));
+  const googleButton = el('sttd-google-login');
+  if (googleButton) googleButton.onclick = exclusive(async () => interactionLogin(await googleIdToken()), T('common.loginFailed'));
   el('sttd-switch-account').onclick = exclusive(async () => interactionLogin(await appleIdToken()), T('common.loginFailed'));
   el('sttd-continue').onclick = exclusive(async () => interactionLogin(await restoredAppleIdToken()), T('common.loginRefresh'));
   await auth.authStateReady();
   const kind = savedKind(auth.currentUser);
   if (kind === 'none') return signedOut();
-  if (kind === 'apple') {
+  if (kind === 'apple' || kind === 'google') {
+    // 保存済みApple/Googleで続ける。別の方式は明示のボタン（Apple: 別アカウント、Google: Googleでログイン）だけ。
     show('sttd-apple-login', false);
+    show('sttd-google-login', kind === 'apple');
+    // 保存Googleは方式を明示する（Appleは従来の中立文言のまま。UIDの統合はしない）。
+    el('sttd-continue').textContent = T(kind === 'google' ? 'common.continueSignedInGoogle' : 'common.continueSignedIn');
     show('sttd-continue', true);
-    show('sttd-switch-account', true);
+    show('sttd-switch-account', kind === 'apple');
+    if (kind === 'google') show('sttd-apple-login', true);
     return;
   }
   // Apple以外の保存済みの認証は、Appleとして続ける表示にしない。コードの機能がonでコードの認証なら、別の明示操作として残す。

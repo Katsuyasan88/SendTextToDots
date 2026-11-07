@@ -13,6 +13,25 @@ export const DEVELOPER_LOGIN_VERSION = 1;
 export const CODE_DIGITS = 6;
 export const CODE_SPACE = 1_000_000;
 export const CODE_AUTH_TTL_MS = 10 * 60_000;
+/**
+ * コードでのログイン成立（code identityのactivate）から、そのidentityの認可が続く絶対期限。
+ * 保存identityのcreatedAtだけを起点にし、再読込・token更新・refresh・既存access token・新規送信で延長しない。期限ちょうどは拒否。
+ * Apple/Googleのログインには適用しない。
+ */
+export const CODE_LOGIN_LIFETIME_MS = 10 * 60_000;
+/** epoch msとして有効な時刻（安全整数・非負・Dateの表現域内）。 */
+const DATE_MAX_MS = 8_640_000_000_000_000;
+export function validEpochMs(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= DATE_MAX_MS;
+}
+/**
+ * 期限ちょうど以降はtrue。時計・保存時刻・期限が有効な時刻でなければ判定不能としてthrowする（呼出し側はunavailable＝fail closed）。
+ * 期限は常にcreatedAt＋10分だけで、時計差の許容などで延ばさない。
+ */
+export function codeLoginExpired(createdAt: unknown, now: unknown): boolean {
+  if (!validEpochMs(createdAt) || createdAt <= 0 || !validEpochMs(now) || !validEpochMs(createdAt + CODE_LOGIN_LIFETIME_MS)) throw new DeveloperLoginError('unavailable');
+  return now >= createdAt + CODE_LOGIN_LIFETIME_MS;
+}
 export const RESERVATION_HOLD_MS = 24 * 60 * 60_000;
 export const MAX_CODE_CANDIDATES = 20;
 export const MAX_TRANSACTION_ATTEMPTS = 5;
@@ -179,6 +198,17 @@ export function codeIdentityHashOf(hasher: SecretHasher, scope: DeveloperLoginSc
 /** 試行bucketの短期HMAC（生IP・interaction id・コードを保存しない）。 */
 export function rateBucketOf(hasher: SecretHasher, scope: DeveloperLoginScope, kind: 'interaction' | 'source' | 'namespace', key: string): string {
   return hasher.hash(scopePurpose(scope, `rate-${kind}`), key);
+}
+
+/**
+ * 接続セッション（interaction）単位のコード誤入力ロック。同じinteractionで誤入力がこの回数に達すると、以後は正しいコードでも交換しない。
+ * 時刻窓でresetしない（interaction自体の寿命より十分長く保持）。グローバルなclient単位ではなく、そのinteractionだけを止める。
+ */
+export const SESSION_WRONG_CODE_LIMIT = 3;
+/** ロック記録の物理削除の目安（interactionの寿命を大きく超える24時間）。認可判定はcountだけで行い、TTL削除に依存しない。 */
+export const SESSION_LOCK_HOLD_MS = 24 * 60 * 60_000;
+export function sessionLockOf(hasher: SecretHasher, scope: DeveloperLoginScope, interactionKey: string): string {
+  return hasher.hash(scopePurpose(scope, 'session-lock'), interactionKey);
 }
 
 /** 鍵の指紋（定数のHMAC）。鍵の切替を検出し、24時間の予約が残る間の切替で重複防止を回避させない。 */

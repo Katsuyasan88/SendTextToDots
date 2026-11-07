@@ -87,13 +87,15 @@ export const OPERATOR_TEXT = Object.freeze({
   en: Object.freeze({
     methodTitle: 'Choose how to sign in',
     methodApple: 'Sign in with Apple (recommended)',
+    methodGoogle: 'Sign in with Google',
     methodCode: 'Sign in with a code',
     continue: 'Continue',
     descApple: 'Continue opens the Apple sign-in window.',
+    descGoogle: 'Continue opens the Google sign-in window.',
     descCode: 'Continue generates a 6-digit code for the plugin connection screen.',
     notConfigured: 'Code issuance is not configured for this deployment.',
     codeGuide:
-      'Enter the code in the plugin connection screen within 10 minutes. A code works once. After connecting, the number of texts you send is not limited.',
+      'Enter the code in the plugin connection screen within 10 minutes. A code works once. A code sign-in stops working 10 minutes after it succeeds; then generate a new code and connect again.',
     issue: 'Generate a code',
     reissue: 'Generate a new code (ends the current code and its connection)',
     confirm: 'Check connection',
@@ -113,12 +115,14 @@ export const OPERATOR_TEXT = Object.freeze({
   ja: Object.freeze({
     methodTitle: 'ログイン方法を選ぶ',
     methodApple: 'Appleでログイン（推奨）',
+    methodGoogle: 'Googleでログイン',
     methodCode: 'コードでログイン',
     continue: '続ける',
     descApple: '「続ける」を押すとAppleのログイン画面を開きます。',
+    descGoogle: '「続ける」を押すとGoogleのログイン画面を開きます。',
     descCode: '「続ける」を押すと、プラグインの接続画面に入力する6桁のコードを発行します。',
     notConfigured: 'この配置ではコード発行が設定されていません。',
-    codeGuide: '10分以内にプラグインの接続画面へ入力してください。使用は1回です。接続後の送信回数は制限しません。',
+    codeGuide: '10分以内にプラグインの接続画面へ入力してください。使用は1回です。コードでのログインは成立から10分で使えなくなります。その後は新しいコードを発行して接続し直してください。',
     issue: 'コードを発行',
     reissue: '再発行（現在のコードと接続を終了して作り直します）',
     confirm: '接続を確認',
@@ -165,9 +169,11 @@ export function renderOperatorSection(input: {
   return `<section id="sttd-method"${data}>
 <fieldset class="sttd-method-choice"><legend id="sttd-method-legend">${t('methodTitle')}</legend>
 <label class="sttd-radio"><input type="radio" name="sttd-method" id="sttd-method-apple" value="apple" checked> <span id="sttd-method-apple-label">${t('methodApple')}</span></label>
+<label class="sttd-radio"><input type="radio" name="sttd-method" id="sttd-method-google" value="google"> <span id="sttd-method-google-label">${t('methodGoogle')}</span></label>
 <label class="sttd-radio"><input type="radio" name="sttd-method" id="sttd-method-code" value="code"> <span id="sttd-method-code-label">${t('methodCode')}</span></label>
 </fieldset>
 <p id="sttd-method-desc-apple" class="sttd-note">${t('descApple')}</p>
+<p id="sttd-method-desc-google" class="sttd-note" hidden>${t('descGoogle')}</p>
 <p id="sttd-method-desc-code" class="sttd-note" hidden>${t('descCode')}</p>
 <div class="sttd-actions"><button type="button" id="sttd-method-continue">${t('continue')}</button></div>
 <p id="sttd-method-message" role="status"></p>
@@ -216,7 +222,7 @@ let issuedOnce = false;
 let pending = false;
 
 // 静的な文言（idとkey）。表示中の結果メッセージはkeyで持ち、言語を変えたら同じkeyで描き直す（進捗・期限・コード・通信は変えない）
-const STATIC_TEXT = [['sttd-method-legend', 'methodTitle'], ['sttd-method-apple-label', 'methodApple'], ['sttd-method-code-label', 'methodCode'], ['sttd-method-desc-apple', 'descApple'], ['sttd-method-desc-code', 'descCode'], ['sttd-method-continue', 'continue'], ['sttd-switch-notice', 'switchNotice'], ['sttd-code-label', 'codeLabel'], ['sttd-code-remaining-label', 'remaining'], ['sttd-code-guide', 'codeGuide'], ['sttd-code-confirm', 'confirm'], ['sttd-code-reissue', 'reissue'], ['sttd-code-cancel', 'cancel']];
+const STATIC_TEXT = [['sttd-method-legend', 'methodTitle'], ['sttd-method-apple-label', 'methodApple'], ['sttd-method-google-label', 'methodGoogle'], ['sttd-method-code-label', 'methodCode'], ['sttd-method-desc-apple', 'descApple'], ['sttd-method-desc-google', 'descGoogle'], ['sttd-method-desc-code', 'descCode'], ['sttd-method-continue', 'continue'], ['sttd-switch-notice', 'switchNotice'], ['sttd-code-label', 'codeLabel'], ['sttd-code-remaining-label', 'remaining'], ['sttd-code-guide', 'codeGuide'], ['sttd-code-confirm', 'confirm'], ['sttd-code-reissue', 'reissue'], ['sttd-code-cancel', 'cancel']];
 let codeMessage = [];
 let methodMessage = [];
 function renderMessages() {
@@ -234,12 +240,17 @@ function show(id, visible) { const node = el(id); if (node) node.hidden = !visib
 // 選んだ方式のradio・説明・操作だけを表示する（未選択は既存のApple方式）。operator modeでは下のApple操作を出さず、共通の「続ける」1つで始める。
 let selected = 'apple';
 let last = null;
+// 通常login（本体のmethod 'apple'）のうち、本人が明示したprovider（Apple又はGoogle）。本体の状態更新でAppleへ戻さない。
+let normalKind = 'apple';
 function reflect(m) {
-  selected = m === 'code' ? 'code' : 'apple';
+  selected = m === 'code' ? 'code' : normalKind;
   el('sttd-method-apple').checked = selected === 'apple';
+  const google = el('sttd-method-google');
+  if (google) google.checked = selected === 'google';
   el('sttd-method-code').checked = selected === 'code';
   show('sttd-apple-panel', false);
   show('sttd-method-desc-apple', selected === 'apple');
+  show('sttd-method-desc-google', selected === 'google');
   show('sttd-method-desc-code', selected === 'code');
   show('sttd-code-panel', selected === 'code');
 }
@@ -380,9 +391,11 @@ async function cancelCode() {
 
 async function choose(next) {
   // 方式の切替は本体がステップ1へ戻し後続を封鎖する。旧接続の停止は本人のプラグイン削除・再導入で、ここでは停止済みと表示しない。
-  const before = chosen ?? 'apple';
+  // Googleは本体の通常login（'apple'）として選び、providerだけをここで保持する（選択だけではpopup・発行0）。
+  const before = chosen === 'code' ? 'code' : chosen === undefined || chosen === null ? 'apple' : normalKind;
   const progressed = hasProgress();
-  if (!(await bridge.chooseMethod(next))) { reflect(chosen); return false; }
+  if (!(await bridge.chooseMethod(next === 'google' ? 'apple' : next))) { reflect(chosen); return false; }
+  if (next === 'apple' || next === 'google') normalKind = next;
   if (before !== next) {
     show('sttd-switch-notice', progressed);
     hideCode();
@@ -401,6 +414,7 @@ async function proceed() {
   const m = selected;
   if (!(await choose(m))) return;
   if (m === 'apple') await bridge.appleLogin();
+  else if (m === 'google') await bridge.googleLogin();
   else if (!issuedOnce) await issue('issue');
 }
 
@@ -417,6 +431,8 @@ if (root && bridge) {
   reflect(chosen);
   // radioの選択（click/keyboard）は表示と方式の切替だけで、認証・発行・通信はしない
   el('sttd-method-apple').onclick = () => choose('apple');
+  const googleRadio = el('sttd-method-google');
+  if (googleRadio) googleRadio.onclick = () => choose('google');
   el('sttd-method-code').onclick = () => choose('code');
   el('sttd-method-continue').onclick = () => proceed();
   el('sttd-code-reissue').onclick = () => issue('reissue');

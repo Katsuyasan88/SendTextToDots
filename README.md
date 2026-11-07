@@ -12,11 +12,13 @@ This is source you deploy yourself, not a hosted service. Detailed documentation
 
 ## Recent changes
 
+- Added sign-in with Google (Firebase Google provider) next to Sign in with Apple; Apple and Google are separate accounts and are not merged by email.
+- A code sign-in now stops working 10 minutes after it succeeds (including existing MCP access tokens and token refresh); code connections from earlier versions without this deadline must connect again with a new code. Apple and Google sign-ins are not subject to this 10-minute lifetime. From the 3rd wrong code in the same OAuth connection attempt, code entry is refused with `403 session_locked` (also after a reload); to try again, start a new connection from the plugin.
 - Added optional developer sign-in with a 6-digit code issued by the local operator console. A code is valid for 10 minutes and one use; its number is reserved against reuse for at least 24 hours. Each new code connection is separate from an Apple account. The feature is off by default.
 - Updated the English/Japanese console to one sign-in choice and a common Continue button, with code controls in step 2, a required receiving check in step 4, a fixed delivery test in step 5, and free-text sends in step 7.
 - Added a small Skip action to the other steps and explicit resumption of the sign-in saved in the same browser. Resuming an existing connection does not issue a code or require the plugin to be added again. Skipped steps remain distinct from confirmed ones, and sending still requires the receiving check.
 - Fixed in-page language switching so the sign-in choices, code controls, and messages follow the selected language without restarting sign-in.
-- Added a way out of a pending destination change: when the plugin is reconnected with Apple, the final permission page offers to delete the previous receiver settings so receiving can be set up again. Code sign-in does not delete them. Deleting stops new deliveries to the previous destination; deliveries already started are not cancelled.
+- Added a way out of a pending destination change: when the plugin is reconnected with Apple, the final permission page offers to delete the previous receiver settings so receiving can be set up again. Google and code sign-in do not delete them. Deleting stops new deliveries to the previous destination; deliveries already started are not cancelled.
 - Added optional payload encryption APIs (off by default): [fetching your public key](docs/API_EN.md#encryption-key), [reissuing it](docs/API_EN.md#encryption-key-reissue), and [sending encrypted text](docs/API_EN.md#encrypted-commands). Your client encrypts the text and SendTextToDots decrypts it for delivery, so this is not end-to-end encryption. The local console does not use these APIs.
 
 See the [local console guide](docs/LOCAL_CONSOLE_EN.md) and [verification limits](docs/LIMITATIONS_EN.md). These source changes do not automatically update an existing deployment.
@@ -44,7 +46,7 @@ The owner is the user identified by the verified Firebase token. A subscription 
 | --- | --- | --- |
 | Send API | Cloud Functions 2nd gen (`sendtexttodotsapi`) | Authenticated text submission, one signed delivery attempt, status lookup, and cancellation |
 | MCP/OAuth | Cloud Run (`dist/deployment/connect.js`) | OAuth authorization (interaction pages) and Events subscriptions at `/mcp`. It serves no send screen |
-| Local send screen | Your computer (`npm run console`, `dist/console/local-server.js`) | `http://localhost:8765/console`: 7-step flow (Apple login, plugin connection, test instructions, receiving check, fixed test message, operational instructions, then your own text) and ordinary sends; relays only the pressed actions to the fixed API/MCP origins with your Bearer token. See [LOCAL_CONSOLE](docs/LOCAL_CONSOLE_EN.md) |
+| Local send screen | Your computer (`npm run console`, `dist/console/local-server.js`) | `http://localhost:8765/console`: 7-step flow (Apple or Google login, plugin connection, test instructions, receiving check, fixed test message, operational instructions, then your own text) and ordinary sends; relays only the pressed actions to the fixed API/MCP origins with your Bearer token. See [LOCAL_CONSOLE](docs/LOCAL_CONSOLE_EN.md) |
 | Storage | Firestore | User connections, OAuth authorizations, subscriptions sealed with KMS, and command status without message text |
 | Keys | Cloud KMS and Secret Manager | Sealing keys and separate signing, cookie, identifier, and digest secrets |
 
@@ -54,7 +56,7 @@ See [API](docs/API_EN.md), [configuration](docs/CONFIGURATION_EN.md), and [secur
 
 - Node.js 22.23.4 and npm 10.9.9 are the tested local versions. Use a newer patch of the same 22 line (the package declares `>=22.2.0 <23`, the requirement of the APIs used, not a verification of every 22.x); early 22.x releases lack APIs this project uses. See [INSTALL](docs/INSTALL_EN.md) for version limits.
 - Your own Google Cloud project with billing enabled and Firebase in the same project, plus Firestore, Cloud KMS, Secret Manager, Cloud Functions, Cloud Build, and Cloud Run resources described in [INSTALL](docs/INSTALL_EN.md).
-- Firebase Authentication with the Apple provider, configured through Sign in with Apple and the Apple Developer Program; add the MCP origin's host to authorized domains.
+- Firebase Authentication with the Apple provider, configured through Sign in with Apple and the Apple Developer Program; add the MCP origin's host to authorized domains. Optionally enable the Google provider as well to offer Sign in with Google.
 - Access to a receiving Dots/ChatGPT client that supports the required Events subscription. The allowed OAuth client is fixed to the ChatGPT CIMD in `src/oauth/cimd.ts`; arbitrary clients are not supported without source changes.
 
 External service eligibility, agreements, permissions, and costs are your responsibility. This repository does not set an overall spending cap or guarantee operation within a free tier.
@@ -66,7 +68,7 @@ External service eligibility, agreements, permissions, and costs are your respon
 3. Follow the ordered [installation guide](docs/INSTALL_EN.md) to choose service URLs, prepare Cloud resources, assign runtime permissions (including `firebaseauth.users.get`), register secrets, and create the KMS subscription marker. Edit the single deployment configuration, `src/config/deployment.ts`, using [CONFIGURATION](docs/CONFIGURATION_EN.md).
 4. Run `npm run build`, then `npm run package` to create API ZIP and MCP Cloud Build source archives offline. Packaging does not deploy anything. Repeating unchanged packaging stops with `output_exists`; see [INSTALL](docs/INSTALL_EN.md) for verifying existing archives.
 5. Deploy the API to Cloud Functions 2nd gen and the MCP/OAuth service to Cloud Run using the archive deployment examples and origin/IAM checks in [INSTALL](docs/INSTALL_EN.md). These include Functions entry settings and the MCP Dockerfile → Cloud Build → Cloud Run sequence. No provisioning, deployment, or shutdown tool is bundled; the procedure still requires your Cloud permissions and has not been verified end-to-end in a third-party project.
-6. Copy `console.config.example.json` to `console.local.json`, fill in your API/MCP origins and public Firebase Web configuration, and run `npm run console -- --config console.local.json`. Open `http://localhost:8765/console` (English and Japanese). Nothing is loaded or sent until you press a button. Follow the 7 steps: sign in with Apple, add the plugin and confirm the connection (connect the MCP server from Dots/ChatGPT through OAuth), paste the test instructions into Dots and start receiving (subscribe to `text.submitted`), check that it shows "Receiving", send the fixed test message and confirm the match in Dots, paste the operational instructions, then send your own text. See [LOCAL_CONSOLE](docs/LOCAL_CONSOLE_EN.md).
+6. Copy `console.config.example.json` to `console.local.json`, fill in your API/MCP origins and public Firebase Web configuration, and run `npm run console -- --config console.local.json`. Open `http://localhost:8765/console` (English and Japanese). Nothing is loaded or sent until you press a button. Follow the 7 steps: sign in with Apple (or Google, if enabled), add the plugin and confirm the connection (connect the MCP server from Dots/ChatGPT through OAuth), paste the test instructions into Dots and start receiving (subscribe to `text.submitted`), check that it shows "Receiving", send the fixed test message and confirm the match in Dots, paste the operational instructions, then send your own text. See [LOCAL_CONSOLE](docs/LOCAL_CONSOLE_EN.md).
    Only people the operator has explicitly registered with the admin CLI can use the service, including yourself ([CONFIGURATION](docs/CONFIGURATION_EN.md#access-admin)). After the sign-in in step 1, confirm the UID, register it, and then connect.
 7. After the setup, use step 7 of the same screen for ordinary sends, or the API example below. "Disconnect" in step 2 revokes the authorization and subscription after a confirmation.
 
@@ -76,16 +78,13 @@ The distributed configuration is unset (`configured: false`). If built and deplo
 
 ## Sending from your app or script
 
-Use the [one-message Node.js example and API contract](docs/API_EN.md#direct-client-example). Supply a current Firebase ID token for the same project and Apple-authenticated user connected to Dots. The example sends one real message per run; keep its commandId to look up an uncertain result.
+Use the [one-message Node.js example and API contract](docs/API_EN.md#direct-client-example). Supply a current Firebase ID token for the same project and the same Apple- or Google-authenticated user connected to Dots. The example sends one real message per run; keep its commandId to look up an uncertain result.
 
-Firebase ID tokens last about an hour. A sender that uses a Firebase client session should obtain a current token through the SDK; it does not normally require a manual Apple sign-in every hour. The API example consumes a supplied token and does not manage sign-in or refresh. See [sessions and automation limits](docs/API_EN.md#firebase-sessions).
+Firebase ID tokens last about an hour. A sender that uses a Firebase client session should obtain a current token through the SDK; it does not normally require a manual Apple or Google sign-in every hour. The API example consumes a supplied token and does not manage sign-in or refresh. See [sessions and automation limits](docs/API_EN.md#firebase-sessions).
 
 ## Roadmap
 
-Planned areas of development include:
-
-- **Google sign-in:** another sign-in option alongside Apple.
-Google sign-in is not available yet. The design, order and release dates are not fixed, and plans may change. Authentication uses the Firebase Apple provider by default; a deployment can also enable the optional developer 6-digit code (see below; off by default). Using the service with Apple also requires explicit registration by the operator. See the [current authentication and session limits](docs/API_EN.md#firebase-sessions).
+Plans are not fixed and may change. Authentication uses the Firebase Apple provider, the Google provider when the operator explicitly enables it in Firebase, and the optional developer 6-digit code (see below; off by default). Using the service also requires explicit registration by the operator. See the [current authentication and session limits](docs/API_EN.md#firebase-sessions).
 
 ## Compatibility
 
@@ -99,7 +98,7 @@ Version 0.3.0 is for new installations only; there is no automatic migration. Th
 - The local console sends plaintext only (`POST /v2/commands`). Stopping it stops only the helper on your computer: the Cloud services remain available and the Dots subscription stays. Use "Disconnect" in step 2 to revoke the authorization and subscription; stopping the Cloud services is your own operation.
 - Production reliability, load, cost, multiple entry points sharing one UID, and immediate processing of each message are not guaranteed. The receiver may batch messages. Draft Events changes may affect compatibility.
 - Only users the operator has explicitly registered with the admin CLI can use the service, including yourself. After a stop or re-registration, earlier Grants and subscriptions can no longer be used for new sends or subscriptions; consent through OAuth and subscribe again. Status lookups, cancellation and disconnecting keep working while stopped ([CONFIGURATION](docs/CONFIGURATION_EN.md#access-admin)).
-- Authentication supports Firebase's Apple provider and, only when the deployment explicitly enables it (`developerLogin: 'operator-code-v1'`), the developer 6-digit code accounts. There is no authentication bypass or arbitrary endpoint, credential, emulator, or HTTP configuration override.
+- Authentication supports Firebase's Apple provider, Firebase's Google provider when the operator enables it in Firebase Authentication (a separate UID from Apple; accounts are not merged by email), and, only when the deployment explicitly enables it (`developerLogin: 'operator-code-v1'`), the developer 6-digit code accounts. There is no authentication bypass or arbitrary endpoint, credential, emulator, or HTTP configuration override.
 - Message text is not persisted by this service. Expired stored metadata is made unusable, but physical deletion and full account deletion are not implemented. Receiver retention and processing follow that service's terms. Physical erasure from RAM, SDKs, and the OS is not guaranteed.
 - MIT licenses this source; it does not sublicense external services or SDKs. See [SECURITY](docs/SECURITY_EN.md) and [LIMITATIONS](docs/LIMITATIONS_EN.md).
 
@@ -131,7 +130,7 @@ Read the [security policy and reporting channel status](SECURITY.md) and [techni
 
 ## Developer 6-digit code (optional, off by default)
 
-In the operator mode of a console you deploy yourself, you can connect with a 6-digit code instead of Apple. A code works once within 10 minutes of issue, and the same number is not issued again for at least 24 hours. Each code creates a new account, and the number of texts sent after connecting is not limited. See [Local console](docs/LOCAL_CONSOLE_EN.md), [Configuration](docs/CONFIGURATION_EN.md), and [Security](docs/SECURITY_EN.md).
+In the operator mode of a console you deploy yourself, you can connect with a 6-digit code instead of Apple or Google. An unused code works once within 10 minutes of issue, and the same number is not issued again for at least 24 hours. After a code sign-in succeeds, that account and its connection (Grant) can be used for 10 more minutes; then issue a new code and connect again. Each code creates a new account, and the number of texts sent after connecting is not limited. See [Local console](docs/LOCAL_CONSOLE_EN.md), [Configuration](docs/CONFIGURATION_EN.md), and [Security](docs/SECURITY_EN.md).
 
 To connect with a code, first enable the feature and start the console in operator mode using the [configuration and startup instructions](docs/LOCAL_CONSOLE_EN.md#connecting-with-a-developer-6-digit-code-operator-mode). The normal `npm run console` does not issue codes.
 
@@ -139,4 +138,4 @@ To connect with a code, first enable the feature and start the console in operat
 2. Follow the plugin-addition instructions in step 2 to add SendTextToDots as a custom MCP server. Enter the 6-digit code in the plugin connection screen within 10 minutes, then complete consent.
 3. Return to the console and press **Check connection**. Continue with steps 3 and 4 to start and check receiving before sending.
 
-Code entry is limited in 10-minute windows: at most **5 attempts per sign-in interaction** and **5 per source**. After **5 failed attempts across the deployment's code-login namespace**, further attempts, including correct codes, are refused until that shared window resets. This can temporarily prevent other users of the same deployment from connecting. These are code-entry limits; ordinary API sending limits still apply after connecting. See [Security](docs/SECURITY_EN.md#developer-6-digit-code).
+Code entry is limited in 10-minute windows: at most **5 attempts per sign-in interaction** and **5 per source**. After **5 failed attempts across the deployment's code-login namespace**, further attempts, including correct codes, are refused until that shared window resets. This can temporarily prevent other users of the same deployment from connecting; these limits answer `429 rate_limited`. Separately, from the 3rd wrong code in the same OAuth connection attempt, code entry is answered with `403 session_locked`; this lock does not end with the window or a reload, and trying again needs a new connection from the plugin (removing the plugin is not required). These are code-entry limits; ordinary API sending limits still apply after connecting. See [Security](docs/SECURITY_EN.md#developer-6-digit-code).

@@ -1177,7 +1177,8 @@ test('V05 L6 owner / authorization / time / rate with the production decisions: 
         case 'tok.unlinked.sig':
           return decoded('apple.com', { sub: 'uid-unlinked' });
         case 'tok.google.sig':
-          return decoded('google.com');
+          // T232: google.comは許可providerになったため、「許可外providerの拒否」の意味は許可外のpasswordで確かめる（Google受入はdeveloper-login G1）。
+          return decoded('password');
         case 'tok.project.sig':
           return decoded('apple.com', { aud: 'other-project-x', iss: 'https://securetoken.google.com/other-project-x' });
         case 'tok.revoked.sig':

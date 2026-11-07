@@ -217,7 +217,8 @@ test('L3 rendering: every page carries html lang, title and body in the selected
 test('L7 OAuth access refusal: the login script shows the not-permitted message only for the fixed 403 access_denied (other 403 / malformed / other failures keep the existing message); the consent refusal page is a fixed bilingual notice without forms, CSRF or identifiers', async () => {
   const IMPORTS = [
     `import { initializeApp } from 'https://www.gstatic.com/firebasejs/13.0.0/firebase-app.js';`,
-    `import { getAuth, OAuthProvider, signInWithCustomToken, signInWithPopup, signOut } from 'https://www.gstatic.com/firebasejs/13.0.0/firebase-auth.js';`,
+    // T232: Googleログインのため固定SDKからGoogleAuthProviderも読む（SDKの版・入口は同じ）。
+    `import { getAuth, GoogleAuthProvider, OAuthProvider, signInWithCustomToken, signInWithPopup, signOut } from 'https://www.gstatic.com/firebasejs/13.0.0/firebase-auth.js';`,
   ];
   for (const line of IMPORTS) assert.ok(INTERACTION_SCRIPT.includes(line), 'the fixed SDK imports are present');
   const source = IMPORTS.reduce((text, line) => text.replace(line, ''), INTERACTION_SCRIPT);

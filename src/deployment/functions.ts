@@ -40,6 +40,11 @@ import { loadDeploymentConfig } from '../config/validate.js';
 
 /** 検証済みの配置設定（不正ならここで固定errorを投げ、以後のmetadata作成もしない）。 */
 const M = loadDeploymentConfig();
+/**
+ * このFunctions entryが受ける構成（api.runtime省略又はfunctions-v1・direct）か。cloud-run-v1（direct Cloud Run entry用）やgateway-v1
+ * （gateway/backend専用）の誤設定は、export・options・discoveryを変えずに、SDK・秘密・新しい外部要求の前の固定config失敗にする。
+ */
+const ENTRY_MATCHES = (M.api.runtime === undefined || M.api.runtime === 'functions-v1') && M.topology === undefined;
 
 const REQUEST_BUDGET_MS = 20_000;
 const START_BUDGET_MS = 20_000;
@@ -149,6 +154,19 @@ function startShared(): Promise<SharedStart> {
   initPromise = new Promise<SharedStart>((resolve) => {
     settle = resolve;
   });
+  // 入口と構成の取り違え（cloud-run-v1・gateway-v1）: signal登録・SDK・秘密の前に固定のconfig失敗（全要求は固定503）。
+  if (!ENTRY_MATCHES) {
+    settle({ app: undefined, cleanupFailed: false });
+    if (!startFailureRecorded) {
+      startFailureRecorded = true;
+      try {
+        process.stderr.write('{"event":"sttd_api.start_failed","stage":"config","code":"config_invalid"}\n');
+      } catch {
+        // 記録の失敗は結果を変えない。
+      }
+    }
+    return initPromise;
+  }
   const controller = new AbortController();
   startup = controller;
   try {

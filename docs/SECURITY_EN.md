@@ -7,7 +7,7 @@ This is not a public privacy policy. Installers must check storage locations, lo
 ## Data handling
 
 - The text (`text`) and event bytes are handled only in RAM while the send API processes the request; they are not stored in or written to the DB, queues, logs or responses. Only the command state without the text and a keyed digest are written to the DB. Buffers created by the service are zero-filled after processing, but physical erasure from RAM, SDKs and the OS is not guaranteed.
-- Identity verification uses Firebase Authentication (Apple provider) only, and the verified UID is bound to an internal owner. Names, e-mail addresses, Apple raw IDs and tokens are not stored by this service (Firebase/Apple keep their own account information separately).
+- Identity verification uses Firebase Authentication with the Apple provider, the Google provider when the operator enables it in Firebase, and developer code accounts only where enabled; the verified UID is bound to an internal owner. Apple and Google are separate UIDs and are not merged by e-mail. Names, e-mail addresses, Apple/Google raw IDs and tokens are not stored by this service (Firebase/Apple/Google keep their own account information separately).
 - The text is delivered to the subscription destination (for example ChatGPT); retention and processing after that follow the terms of the receiving service.
 
 | Data | Location | Retention design |
@@ -84,9 +84,10 @@ The current version provides key storage and protection, [fetching your own publ
 ## Developer 6-digit code
 
 - Codes are cryptographically random 000000–999999 and authenticate once, within 10 minutes of issue. After use or cancellation the same number is not issued for at least 24 hours from issue (longer while deletion is delayed). Plain codes are never stored in the database or logs; reservations are identified by an HMAC under a key derived, per purpose, from the deployment secret (identifierKey).
-- Six digits are weak against guessing, so attempts are reserved and counted before comparison (per interaction, per source, and namespace-wide); the namespace limit cannot be bypassed by changing IP or interaction. The limit can also let a third party temporarily block use.
-- Each code creates a new internal account (dedicated UID) and is never linked to an Apple account automatically. Access is granted only to the one UID planned by the operator for that issuance.
-- API and MCP share one identity check that never accepts a token merely because the provider is custom: it checks the marker, the dedicated UID, the stored identity state/family, and the access generation. Reissue or cancel revokes only that family and never affects Apple or other consoles.
+- Six digits are weak against guessing, so attempts are reserved and counted before comparison (per interaction, per source, and namespace-wide); the namespace limit cannot be bypassed by changing IP or interaction. These 10-minute limits answer `429 rate_limited` and can also let a third party temporarily block use. Separately, from the 3rd wrong code in the same OAuth interaction, that interaction refuses code entry with `403 session_locked` (even a correct code; not reset by the window or a reload); trying again needs a new connection. Apple and Google sign-in are not affected by this lock.
+- A code sign-in can be used for 10 minutes after it succeeds: after that the account and its Grant are refused for new sends, subscriptions, connection checks, token refreshes and existing MCP access tokens (not extended by reloads or refreshes). Code connections from earlier versions without this deadline need a new code. Apple and Google sign-in have no such lifetime.
+- Each code creates a new internal account (dedicated UID) and is never linked to an Apple or Google account automatically. Access is granted only to the one UID planned by the operator for that issuance.
+- API and MCP share one identity check that never accepts a token merely because the provider is custom: it checks the marker, the dedicated UID, the stored identity state/family, and the access generation. Reissue or cancel revokes only that family and never affects Apple, Google or other consoles.
 - The 6 digits alone never yield console credentials or the right to reissue (the 32-byte claim secret held in the issuing helper's memory is required).
 - A Firebase create/sign failure, lost response, or deadline never returns a code to unused. A connection that commits late, after the deadline, is revoked.
 

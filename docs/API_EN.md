@@ -12,7 +12,7 @@ This is the contract of source 0.3.0. The send API is the `/v2/commands` family,
 
 ## 2. Send API
 
-`POST /v2/commands`. Required headers: `Authorization: Bearer <Firebase ID token>` (Apple provider), `Content-Type: application/json`, `Idempotency-Key: <commandId>`.
+`POST /v2/commands`. Required headers: `Authorization: Bearer <Firebase ID token>` (Apple or Google provider), `Content-Type: application/json`, `Idempotency-Key: <commandId>`.
 
 ```json
 {
@@ -216,9 +216,9 @@ The eventId is a UUIDv8 derived from the identifier key and an HMAC of owner/com
 
 ## Firebase sessions and automated senders
 
-Authentication currently accepts Firebase Authentication with the Apple provider (and, only on deployments that set `developerLogin: 'operator-code-v1'`, developer 6-digit code accounts), for the same Firebase project and UID as the user's Dots connection. Any app or script can be the input source if it meets this API contract; a particular phone, watch or source app is not required. The receiving MCP OAuth connection is separate from the sender's Firebase session.
+Authentication currently accepts Firebase Authentication with the Apple or Google provider (and, only on deployments that set `developerLogin: 'operator-code-v1'`, developer 6-digit code accounts), for the same Firebase project and UID as the user's Dots connection (ID tokens of the same project without a tenant only; Apple and Google are separate UIDs even with the same email and are not merged; Google requires enabling the provider and authorized domains in Firebase). A code sign-in is refused for new sends, subscriptions, connection checks, token refreshes and requests with an existing MCP access token 10 minutes after it succeeded (the remaining ID token lifetime or a reload does not extend it; Apple/Google are not affected). Code connections from earlier versions that lack this deadline can no longer be used; connect again with a new code. Any app or script can be the input source if it meets this API contract; a particular phone, watch or source app is not required. The receiving MCP OAuth connection is separate from the sender's Firebase session.
 
-Firebase ID tokens expire after about one hour. An app using a Firebase client session should obtain a current token with the SDK before sending. In the local send screen, each authenticated action calls `user.getIdToken()`, which can refresh an expired or soon-to-expire token. This does not normally require manual Apple sign-in every hour. Signing out, revocation or another authentication problem can still require signing in again. See [Firebase session lifetimes](https://firebase.google.com/docs/auth/admin/manage-sessions) and [getIdToken](https://firebase.google.com/docs/reference/js/auth.user.md#usergetidtoken).
+Firebase ID tokens expire after about one hour. An app using a Firebase client session should obtain a current token with the SDK before sending. In the local send screen, each authenticated action calls `user.getIdToken()`, which can refresh an expired or soon-to-expire token. This does not normally require manual Apple or Google sign-in every hour. Signing out, revocation or another authentication problem can still require signing in again. See [Firebase session lifetimes](https://firebase.google.com/docs/auth/admin/manage-sessions) and [getIdToken](https://firebase.google.com/docs/reference/js/auth.user.md#usergetidtoken).
 
 The Node.js example below uses the supplied ID token only; it performs no sign-in or token refresh. A long-running or unattended sender must provide its own supported authentication/session handling. This repository does not bundle a headless Apple sign-in flow, a token-export tool, a sender daemon, a long-lived send-only key or automatic resend. Use SDK session APIs instead of extracting a refresh token from the browser. A Firebase Web API key identifies the Firebase configuration and cannot replace a user's ID token.
 
@@ -226,7 +226,7 @@ The Node.js example below uses the supplied ID token only; it performs no sign-i
 
 ## Direct client example
 
-After deployment and subscription, save this example as a local `.mjs` file and run it with Node.js 22. Set `STTD_API_ORIGIN` to your deployed HTTPS API origin and `STTD_FIREBASE_ID_TOKEN` to a current Firebase ID token authenticated with the Apple provider. These variables are for this client example, not server configuration. Keep tokens out of source control and shared logs. Running it sends one real message and may incur service costs.
+After deployment and subscription, save this example as a local `.mjs` file and run it with Node.js 22. Set `STTD_API_ORIGIN` to your deployed HTTPS API origin and `STTD_FIREBASE_ID_TOKEN` to a current Firebase ID token authenticated with the Apple or Google provider (the same UID connected to Dots). These variables are for this client example, not server configuration. Keep tokens out of source control and shared logs. Running it sends one real message and may incur service costs.
 ```js
 // Node.js 22; set STTD_API_ORIGIN and STTD_FIREBASE_ID_TOKEN locally.
 const origin = process.env.STTD_API_ORIGIN;
@@ -260,7 +260,7 @@ The ID is printed before sending so it remains available if the request or respo
 
 ## Code entry on the plugin connection screen (developer 6-digit code)
 
-Only on deployments where the feature is enabled, the OAuth interaction login screen shows "Connect with a code". `POST /interaction/{uid}/code` (same origin, interaction cookie and CSRF required, JSON `{"csrf","code"}` up to 1 KiB) returns a custom token in the same-origin response only on success; the page signs in with the Firebase SDK and sends the ID token to the existing `/login` (consent and subscription as usual). Unknown, expired, used, and cancelled codes all return the same `400 code_rejected`; attempt limits return `429`; a create/sign failure returns `503 code_failed` (generate a new code in the console); other failures return `503`. With the feature off it is `404`. API/MCP Bearer credentials remain Firebase ID tokens, and the code does not limit how many texts you send.
+Only on deployments where the feature is enabled, the OAuth interaction login screen shows "Connect with a code". `POST /interaction/{uid}/code` (same origin, interaction cookie and CSRF required, JSON `{"csrf","code"}` up to 1 KiB) returns a custom token in the same-origin response only on success; the page signs in with the Firebase SDK and sends the ID token to the existing `/login` (consent and subscription as usual). Unknown, expired, used, and cancelled codes all return the same `400 code_rejected`; the 10-minute attempt limits (5 per interaction and 5 per source, and 5 failures across the deployment's code-login namespace) return `429 rate_limited`. Separately, from the 3rd wrong code in the same OAuth interaction, the response is `403 session_locked` (even for a correct code, and also after a reload or when the rate window ends); to try a code again, start a new connection from the plugin (removing the plugin is not required). Apple and Google sign-in are not affected by this lock. A create/sign failure returns `503 code_failed` (generate a new code in the console); other failures return `503`. With the feature off it is `404`. API/MCP Bearer credentials remain Firebase ID tokens, and the code does not limit how many texts you send.
 
 ## Trusted source proof (strict deployments only, in development)
 

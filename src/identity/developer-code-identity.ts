@@ -71,6 +71,8 @@ export type ExchangeOutcome =
   | { readonly kind: 'token'; readonly customToken: string }
   | { readonly kind: 'rejected' }
   | { readonly kind: 'rate_limited' }
+  /** 同じ接続セッションでコードを3回誤入力した（以後は正しいコードでも交換しない。新しい接続セッションでだけ再開）。 */
+  | { readonly kind: 'session_locked' }
   | { readonly kind: 'failed' }
   | { readonly kind: 'unavailable' };
 

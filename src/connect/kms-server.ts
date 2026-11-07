@@ -1229,7 +1229,8 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       if (admission.kind !== 'admitted') throw apiErrors.forbidden();
       const { ownerId } = admission;
       // login方法は検証済みのID tokenから決めた値だけ（開発者向けコードはserverが判定したmethod）。clientの申告は使わない。
-      const loginMethod = verified.method === 'developer_code' ? 'developer_code' : 'apple';
+      // 検証済みID tokenのproviderだけで決める（clientの申告は使わない）。GoogleはApple扱いしない（受信先reset確認はAppleだけ）。
+      const loginMethod = verified.method === 'developer_code' ? 'developer_code' : verified.method === 'google' ? 'google' : 'apple';
       const bound = await guarded(() => storage.bindInteraction(uid, body.csrf, ownerId, verified.authTimeSec, admission.accessGeneration, loginMethod));
       if (bound === 'other_owner') throw new ApiError(409, 'owner_mismatch');
       if (bound === 'denied') throw accessDenied();
@@ -1289,6 +1290,9 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
           return;
         case 'rate_limited':
           throw new ApiError(429, 'rate_limited');
+        case 'session_locked':
+          // 同じ接続セッションでの3回誤入力（再読込・再発行・時刻窓で解除しない）。Apple等の明示ログインは引き続き可能。
+          throw new ApiError(403, 'session_locked');
         case 'rejected':
           throw new ApiError(400, 'code_rejected');
         case 'failed':

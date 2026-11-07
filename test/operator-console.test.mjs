@@ -520,6 +520,64 @@ test('B8 after the code sign-in step 2 uses the normal connection check only (re
   assert.equal(apple.el('sttd-switch-notice').hidden, false, 'reinstall notice after an Apple sign-in');
 });
 
+test('T232-OG1 operator mode: Google is an explicit choice; selecting loads nothing, Continue opens only the Google popup and signs in', async () => {
+  const ui = await runConsoleWithOperator({ onOperator: async () => issuedJson() });
+  await ui.click('sttd-method-google');
+  assert.deepEqual([ui.base.calls.loads, ui.base.calls.popups, ui.fetches.length], [0, 0, 0], 'selecting alone does nothing');
+  assert.equal(ui.el('sttd-method-desc-google').hidden, false);
+  assert.equal(ui.el('sttd-method-desc-apple').hidden, true);
+  await ui.click('sttd-method-continue');
+  assert.equal(ui.base.calls.popups, 1);
+  assert.deepEqual(ui.base.calls.providers, ['google.com'], 'only the Google provider, never Apple');
+  assert.equal(ui.fetches.filter((f) => f.url.startsWith('/v1/operator/')).length, 0, 'no code issued');
+  assert.equal(ui.stepState(2), 'current', 'signed in with Google moves on');
+  assert.equal(ui.el('sttd-method-google').checked, true, 'the Google choice is not replaced by Apple after state updates');
+});
+
+test('T232-OG2 Google chosen: a non-Google popup result is not adopted; account collision shows the fixed guidance', async () => {
+  const wrong = await runConsoleWithOperator({ onOperator: async () => issuedJson() });
+  wrong.base.calls.popupMode = 'wrong-provider';
+  await wrong.click('sttd-method-google');
+  await wrong.click('sttd-method-continue');
+  assert.equal(wrong.stepState(2), 'locked', 'an Apple/unknown result for a Google choice is not used');
+  const exists = await runConsoleWithOperator({ onOperator: async () => issuedJson() });
+  exists.base.calls.popupMode = 'exists';
+  await exists.click('sttd-method-google');
+  await exists.click('sttd-method-continue');
+  assert.equal(exists.stepState(2), 'locked');
+  assert.match(exists.el('sttd-account-text').textContent, /already registered with a different sign-in method/);
+});
+
+test('T232-OG3 a saved Google session is restored with the explicit resume (no popup, no sign-out) and is not replaced by Apple', async () => {
+  const ui = await runConsoleWithOperator({ onOperator: async () => issuedJson() });
+  ui.base.auth.currentUser = {
+    uid: 'synthetic-google-uid',
+    providerData: [{ providerId: 'google.com' }],
+    async getIdToken() { return 'synthetic-google-id-token'; },
+    async getIdTokenResult() { return { claims: { aud: WEB.projectId, iss: `https://securetoken.google.com/${WEB.projectId}`, sub: 'synthetic-google-uid', firebase: { sign_in_provider: 'google.com' } } }; },
+  };
+  await ui.click('sttd-method-google');
+  await ui.click('sttd-skip-1');
+  assert.deepEqual([ui.base.calls.popups, ui.base.calls.signOuts, ui.base.calls.providers], [0, 0, []]);
+  assert.equal(ui.stepState(2), 'current', 'the saved Google sign-in continues');
+  assert.equal(ui.el('sttd-method-google').checked, true);
+});
+
+test('T232-OG4 a slow Google sign-in result that arrives after switching to the code method is not adopted', async () => {
+  const ui = await runConsoleWithOperator({ onOperator: async (action) => (action === 'issue' ? issuedJson() : activeJson()) });
+  ui.base.calls.tokenGate = gate();
+  await ui.click('sttd-method-google');
+  ui.el('sttd-method-continue').click();
+  await settle();
+  await settle();
+  await ui.click('sttd-method-code');
+  ui.base.calls.tokenGate.release();
+  await settle();
+  await settle();
+  assert.equal(ui.base.calls.popups, 1);
+  assert.equal(ui.stepState(2), 'locked', 'the stale Google result does not unlock step 2');
+});
+
 test('B6 Apple with Continue starts the existing Apple sign-in; selecting alone loads nothing', async () => {
   const ui = await runConsoleWithOperator({ onOperator: async () => issuedJson() });
   await ui.click('sttd-method-code');

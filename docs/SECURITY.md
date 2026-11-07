@@ -7,7 +7,7 @@
 ## データの扱い
 
 - 本文（`text`）・event bytesは送信APIの要求処理中のRAMだけで扱い、DB・キュー・ログ・応答へ保存・出力しません。DBへ書くのは本文を含まないcommand状態と鍵付きdigestだけです。自分で作ったBufferは処理後に0埋めしますが、RAM・SDK・OS内の物理消去は保証しません。
-- 本人確認はFirebase Authentication（Apple provider）だけで、検証済みUIDを内部ownerへ結びます。氏名・メール・Apple raw ID・tokenを独自に保存しません（Firebase/Apple自身のaccount情報は別に存在します）。
+- 本人確認はFirebase AuthenticationのApple provider、運営者がFirebaseで有効にした場合のGoogle provider、有効にした配置だけの開発者向けコードの利用単位で、検証済みUIDを内部ownerへ結びます。AppleとGoogleは別のUIDで、メールアドレスでは統合しません。氏名・メール・Apple/Googleのraw ID・tokenを独自に保存しません（Firebase/Apple/Google自身のaccount情報は別に存在します）。
 - 本文は購読先（例: ChatGPT）へ届き、その後の保持・処理は受信側サービスの条件に従います。
 
 | データ | 場所 | 保持の設計 |
@@ -84,9 +84,10 @@ callbackの検証・配送・CIMD取得は共通の送出部品を使います�
 ## 開発者向け6桁コード
 
 - コードは暗号学的乱数の000000〜999999で、発行から10分未満・1回だけ認証に使えます。使用・取消後も発行から少なくとも24時間（削除遅延中はそれ以上）同じ番号を発行しません。平文コードはDB・記録に保存せず、予約は配置秘密（identifierKey）から用途分離して導いた鍵のHMACで識別します。
-- 6桁は総当たりに弱いため、試行は照合前に予約して数え（interaction・送信元・namespace全体）、全体上限はIPやinteractionを変えても回避できません。上限は第三者による一時的な利用妨害も起こし得ます。
-- コードごとに新しい内部利用単位（専用UID）を作り、Appleの利用単位へ自動で紐付けません。運営者がその発行で予定したUID1件だけに利用許可を与えます。
-- API/MCPは共通の本人確認で、custom providerであることだけでは受理せず、認証marker・専用UID・保存identityのstate/family・利用許可の世代を確かめます。再発行・取消はそのfamilyだけを失効させ、Appleや別コンソールへ波及しません。
+- 6桁は総当たりに弱いため、試行は照合前に予約して数え（interaction・送信元・namespace全体）、全体上限はIPやinteractionを変えても回避できません。これらの10分の上限は`429 rate_limited`で応答し、第三者による一時的な利用妨害も起こし得ます。これとは別に、同じOAuth interactionで3回目の誤入力の時点から、そのinteractionのコード入力を`403 session_locked`で拒否します（正しいコードでも同じで、集計枠の終了や再読込では解除しません）。もう一度試すには新しい接続が必要です。Apple・Googleのログインはこのロックの影響を受けません。
+- コードでのログインは成立から10分だけ使えます。その後はその利用単位とGrantでの新しい送信・購読・接続確認・token更新・既存MCP access tokenでの要求を拒否します（再読込や更新では延びません）。この期限を持たない以前の版のコード接続は、新しいコードが必要です。Apple・Googleのログインにはこの期限はありません。
+- コードごとに新しい内部利用単位（専用UID）を作り、AppleやGoogleの利用単位へ自動で紐付けません。運営者がその発行で予定したUID1件だけに利用許可を与えます。
+- API/MCPは共通の本人確認で、custom providerであることだけでは受理せず、認証marker・専用UID・保存identityのstate/family・利用許可の世代を確かめます。再発行・取消はそのfamilyだけを失効させ、Apple・Google・別コンソールへ波及しません。
 - 6桁だけではコンソール用の資格や再発行権を得られません（発行元helperのメモリにある32byteの照会secretが必要）。
 - Firebaseの作成/署名の失敗・応答消失・期限超過でコードを未使用へ戻しません。期限後に遅れて確定した接続は失効させます。
 

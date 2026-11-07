@@ -21,7 +21,7 @@ import { hashesEqual, newOpaqueValue, type SecretHasher } from '../secrets.js';
 import type { AssertionReplayStore } from '../stores.js';
 import type { VerifiedIdentity } from '../identity/firebase.js';
 import { accessDocRef, accessVerdictOfSnapshot, AccessUnavailableError, grantGenerationOfSnapshot } from '../access/firestore.js';
-import { accessVerdictOf, ACCESS_UNAVAILABLE, grantGenerationOf, grantUseVerdict, ownerIdentityHash, type AccessVerdict } from '../access/policy.js';
+import { accessVerdictOf, ACCESS_UNAVAILABLE, codeLoginWithin, grantGenerationOf, grantUseVerdict, ownerIdentityHash, type AccessVerdict } from '../access/policy.js';
 import { ownerReceiverGeneration, receiverResetWrites, receiverSettingsPresent, receiverSnapshotMaterial, RECEIVER_GENERATION_FIELD, ReceiverResetUnavailableError } from '../storage/firestore/receiver-reset.js';
 import type { KmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
 
@@ -158,7 +158,7 @@ export interface ReceiverSubscriptions {
 export type BindOutcome = 'ok' | 'rejected' | 'other_owner';
 
 /** interactionのlogin方法（検証済みのID tokenから決めた値だけ。clientの申告は使わない）。 */
-export type InteractionLoginMethod = 'apple' | 'developer_code';
+export type InteractionLoginMethod = 'apple' | 'developer_code' | 'google';
 
 export interface ConsentRecord {
   readonly ownerId: string;
@@ -198,6 +198,12 @@ export { AccessUnavailableError };
  * 検証済みidentityの接続保存用HMAC（identities/{hash}・access/{hash}の位置）。開発者向けコードの確定（developer-code-identity.ts）が
  * 予定UID1件の利用許可を同じ位置へ作るために使う。
  */
+/** 開発者向けコード専用UIDの形（identity/developer-login.tsのCODE_UID_PATTERNと同じ）。旧コード接続の判別だけに使う。 */
+const CODE_UID_FORM = /^sttdc_[A-Za-z0-9_-]{32}$/;
+export function isLegacyCodeUid(uid: unknown): boolean {
+  return typeof uid === 'string' && CODE_UID_FORM.test(uid);
+}
+
 export function connectIdentityHash(hasher: SecretHasher, namespace: string, identity: Pick<VerifiedIdentity, 'projectId' | 'uid'>): string {
   return hasher.hash(`t256:${namespace}:identity`, `${identity.projectId}\0${identity.uid}`);
 }
@@ -544,7 +550,12 @@ export class ConnectStorage {
       data !== undefined &&
       data.revokedAt === null &&
       typeof data.lastActiveAt === 'number' &&
-      now - data.lastActiveAt < this.#d.ownerInactivityMs
+      now - data.lastActiveAt < this.#d.ownerInactivityMs &&
+      // 明示kindは'normal'だけ。期限とkindの両方を持つ・未知kindは不正（fail closed）。
+      (!Object.hasOwn(data, 'loginKind') || (data.loginKind === 'normal' && !Object.hasOwn(data, 'codeLoginExpiresAt'))) &&
+      // コードloginのownerはログイン成立から10分の絶対期限（isOwnerActive＝MCPの既存access token・ownerDocActive＝配送/購読の最終txの共通判定）。
+      // 期限fieldが形違い・時刻不正ならfail closed。Apple/Googleのownerは期限fieldを持たない。
+      codeLoginWithin(Object.hasOwn(data, 'codeLoginExpiresAt') ? (data.codeLoginExpiresAt ?? 0) : undefined, now)
     );
   }
 
@@ -560,7 +571,7 @@ export class ConnectStorage {
   async #accessForOwner(tx: Transaction, ownerData: unknown): Promise<AccessVerdict> {
     const identityHash = ownerIdentityHash(ownerData);
     if (identityHash === null) return ACCESS_UNAVAILABLE;
-    return accessVerdictOfSnapshot(await tx.get(this.#accessRef(identityHash)));
+    return accessVerdictOfSnapshot(await tx.get(this.#accessRef(identityHash)), this.#d.clock.now());
   }
 
   /**
@@ -576,10 +587,15 @@ export class ConnectStorage {
     const sealedUid = await this.#seal(this.#ownerUidPurpose(candidateId), identity.uid, { kind: 'owner-uid', ownerId: candidateId });
     return this.#d.db.runTransaction(async (tx): Promise<OwnerAdmission> => {
       // 利用許可（運営者の明示登録）を同じtransactionで読む。欠落・disabledはowner作成・活動更新の前に拒否、不正・障害は一時障害。
-      const access = accessVerdictOfSnapshot(await tx.get(accessRef));
+      const access = accessVerdictOfSnapshot(await tx.get(accessRef), this.#d.clock.now());
       const mapped = (await tx.get(identityRef)).data() as { ownerId?: unknown } | undefined;
       if (access.kind === 'unavailable') throw new AccessUnavailableError();
       if (access.kind === 'denied') return { kind: 'denied' };
+      // 期限属性の無い旧コード接続（この版より前にactivateされたcode identityの許可）は受けない。新しいコードで接続し直す（新しい10分を足して復活させない）。
+      // code UIDの判定は検証済みidentity（サーバー側のID token検証の結果）だけで行う。
+      if (access.codeLoginExpiresAt === undefined && (identity.method === 'developer_code' || isLegacyCodeUid(identity.uid))) return { kind: 'denied' };
+      // コードloginの許可の絶対期限をowner文書へ写す（以後の要求はowner文書だけで同じ期限を判定できる。延長・削除しない）。
+      const codeExpiry = access.codeLoginExpiresAt !== undefined ? { codeLoginExpiresAt: access.codeLoginExpiresAt } : {};
       if (mapped !== undefined) {
         if (typeof mapped.ownerId !== 'string') return { kind: 'inactive' };
         const ownerRef = this.#ownerRef(mapped.ownerId);
@@ -589,7 +605,10 @@ export class ConnectStorage {
         if (!this.#activeOwner(owner, now)) return { kind: 'inactive' };
         // 許可は検証済みidentityのhashへ結ぶ。owner文書のidentityHashが同じ対応を指さなければ付け替えず一時障害。
         if (ownerIdentityHash(owner) !== identityRef.id) throw new AccessUnavailableError();
-        tx.update(ownerRef, { lastActiveAt: now });
+        // 既存ownerの期限は付け替え・延長しない（無い時だけ許可の期限を写す）。通常login（Apple/Google）の既存ownerは明示kindを付ける。
+        const marked = owner !== undefined && (Object.hasOwn(owner, 'codeLoginExpiresAt') || Object.hasOwn(owner, 'loginKind'));
+        const mark = marked ? {} : access.codeLoginExpiresAt !== undefined ? codeExpiry : { loginKind: 'normal' };
+        tx.update(ownerRef, { lastActiveAt: now, ...mark });
         return { kind: 'admitted', ownerId: mapped.ownerId, accessGeneration: access.generation };
       }
       const now = this.#d.clock.now();
@@ -601,6 +620,8 @@ export class ConnectStorage {
         createdAt: now,
         lastActiveAt: now,
         revokedAt: null,
+        // コードloginは期限、通常login（Apple/Google）は明示kind（要求ごとの封緘UID開封を不要にする。判別できるownerだけを作る）。
+        ...(access.codeLoginExpiresAt !== undefined ? codeExpiry : { loginKind: 'normal' }),
       });
       return { kind: 'admitted', ownerId, accessGeneration: access.generation };
     });
@@ -619,7 +640,7 @@ export class ConnectStorage {
    */
   async accessDisplay(identity: VerifiedIdentity): Promise<AccessDisplay> {
     try {
-      return accessVerdictOfSnapshot(await this.#accessRef(this.#identityRef(identity).id).get()).kind;
+      return accessVerdictOfSnapshot(await this.#accessRef(this.#identityRef(identity).id).get(), this.#d.clock.now()).kind;
     } catch {
       return 'unavailable';
     }
@@ -652,9 +673,31 @@ export class ConnectStorage {
     return verdict.kind === 'allowed';
   }
 
+  /**
+   * ownerがいま新規利用できるか（MCPの既存opaque access tokenの要求ごとの解決・OAuth交換/refreshの共通入口）。
+   * コードloginの期限付きownerはowner文書の期限で判定する。期限属性の無いownerは、サーバーが保存した封緘UIDを（transactionの外で、
+   * 既存の封緘portで）開封し、code UID形なら期限の無い旧コード接続として拒否する（新しいコードで接続し直す）。Apple/Googleの既存ownerは維持する。
+   * 開封できない・判別不能は非成功（false）。結果のcacheは持たない。
+   */
   async isOwnerActive(ownerId: string): Promise<boolean> {
     if (typeof ownerId !== 'string' || ownerId.length === 0) return false;
-    return this.#activeOwner((await this.#ownerRef(ownerId).get()).data(), this.#d.clock.now());
+    const data = (await this.#ownerRef(ownerId).get()).data();
+    if (!this.#activeOwner(data, this.#d.clock.now())) return false;
+    if (Object.hasOwn(data!, 'codeLoginExpiresAt') || data!.loginKind === 'normal') return true;
+    // 期限もkindも無い（この版より前に作られた）ownerだけ、保存UIDで旧コード接続かを判別する。
+    return !(await this.#legacyCodeOwner(ownerId, data!));
+  }
+
+  /** 期限属性の無いowner文書が旧コード接続か（封緘UIDを開封してcode UID形か）。開封できない・形不正は判別不能としてtrue（拒否側）。 */
+  async #legacyCodeOwner(ownerId: string, data: Record<string, unknown>): Promise<boolean> {
+    if (typeof data.sealedUid !== 'string') return true;
+    let uid: string;
+    try {
+      uid = await this.#unseal(this.#ownerUidPurpose(ownerId), data.sealedUid, { kind: 'owner-uid', ownerId });
+    } catch {
+      return true;
+    }
+    return typeof uid !== 'string' || uid.length === 0 || isLegacyCodeUid(uid);
   }
 
   async touchOwner(ownerId: string): Promise<void> {
@@ -722,7 +765,8 @@ export class ConnectStorage {
     ownerId: string,
   ): 'allowed' | 'denied' | 'unavailable' {
     try {
-      return grantUseVerdict(accessVerdictOf(access.exists, access.data), grantGenerationOf(meta.exists, meta.data), ownerId).kind;
+      // コードloginの許可は判定時刻でも期限を確かめる（期限後の送出・購読開始を防ぐ）。
+      return grantUseVerdict(accessVerdictOf(access.exists, access.data, this.#d.clock.now()), grantGenerationOf(meta.exists, meta.data), ownerId).kind;
     } catch {
       return 'unavailable';
     }
@@ -731,7 +775,7 @@ export class ConnectStorage {
   /** transactionで読んだ許可recordのdataだけからの利用許可（Grantを伴わない判定）。不正はunavailable。 */
   accessUseDecision(access: { readonly exists: boolean; readonly data: unknown }): 'allowed' | 'denied' | 'unavailable' {
     try {
-      return accessVerdictOf(access.exists, access.data).kind;
+      return accessVerdictOf(access.exists, access.data, this.#d.clock.now()).kind;
     } catch {
       return 'unavailable';
     }
@@ -796,7 +840,8 @@ export class ConnectStorage {
       if (access.kind === 'unavailable') throw new AccessUnavailableError();
       if (access.kind === 'denied' || access.generation !== accessGeneration) return 'denied';
       // login方法は、受信先設定の削除の確認を出すか（Appleだけ）にだけ使う。指定が無い時は保存しない（確認を出さない側）。
-      tx.update(ref, { ownerId, authTimeSec, accessGeneration, state: 'authenticated', ...(loginMethod === 'apple' || loginMethod === 'developer_code' ? { loginMethod } : {}) });
+      // GoogleはApple扱いしない（受信先reset確認0の通常同意）。
+      tx.update(ref, { ownerId, authTimeSec, accessGeneration, state: 'authenticated', ...(loginMethod === 'apple' || loginMethod === 'developer_code' || loginMethod === 'google' ? { loginMethod } : {}) });
       return 'ok';
     });
   }

@@ -11,27 +11,29 @@ const IDS = ['sttd-message', 'sttd-continue', 'sttd-apple-login', 'sttd-switch-a
 const appleUser = (n = 1) => ({ uid: `synthetic-apple-${n}`, isAnonymous: false, providerData: [{ providerId: 'apple.com' }], getIdToken: async () => `apple-token-${n}` });
 const codeUser = () => ({ uid: 'sttdc_synthetic', isAnonymous: false, providerData: [], getIdToken: async () => 'code-token' });
 
-async function page({ saved = null, code = 'off', popup = async () => appleUser(2), customUser = codeUser() } = {}) {
-  const nodes = Object.fromEntries(IDS.map((id) => [id, { hidden: id !== 'sttd-message' && id !== 'sttd-code-input', disabled: false, textContent: '', value: '', onclick: null }]));
-  const calls = { popup: [], signOut: 0, posts: [], custom: 0 };
+async function page({ saved = null, code = 'off', popup = async () => appleUser(2), customUser = codeUser(), google = false, codeResponse = null, lang = 'en' } = {}) {
+  const ids = google ? [...IDS, 'sttd-google-login'] : IDS;
+  const nodes = Object.fromEntries(ids.map((id) => [id, { hidden: id !== 'sttd-message' && id !== 'sttd-code-input', disabled: false, textContent: '', value: '', onclick: null }]));
+  const calls = { popup: [], signOut: 0, posts: [], custom: 0, codePosts: 0 };
   const auth = { currentUser: saved, authStateReady: async () => {} };
   const fake = {
     initializeApp: () => ({}),
     getAuth: () => auth,
     OAuthProvider: function OAuthProvider(id) { this.providerId = id; },
+    GoogleAuthProvider: function GoogleAuthProvider() { this.providerId = 'google.com'; },
     signInWithPopup: async (_a, provider) => { calls.popup.push(provider.providerId); const user = await popup(); auth.currentUser = user; return { user }; },
     signInWithCustomToken: async () => { calls.custom += 1; auth.currentUser = customUser; return { user: customUser }; },
     signOut: async () => { calls.signOut += 1; auth.currentUser = null; },
   };
-  const document = { body: { dataset: { sttdView: 'interaction-login', sttdFirebase: '{}', sttdLanguage: 'en', sttdInteraction: 'synthetic-interaction', sttdCsrf: 'synthetic-csrf', sttdCode: code } }, getElementById: (id) => nodes[id] ?? null };
+  const document = { body: { dataset: { sttdView: 'interaction-login', sttdFirebase: '{}', sttdLanguage: lang, sttdInteraction: 'synthetic-interaction', sttdCsrf: 'synthetic-csrf', sttdCode: code } }, getElementById: (id) => nodes[id] ?? null };
   const fetch = async (url, init) => {
     if (String(url).endsWith('/login')) { calls.posts.push(JSON.parse(init.body).idToken); return { status: 204 }; }
-    if (String(url).endsWith('/code')) return { status: 200, json: async () => ({ customToken: 'synthetic-custom-token' }) };
+    if (String(url).endsWith('/code')) { calls.codePosts += 1; return codeResponse ?? { status: 200, json: async () => ({ customToken: 'synthetic-custom-token' }) }; }
     return { status: 500 };
   };
   const location = { reload: () => {} };
-  const run = new AsyncFunction('initializeApp', 'getAuth', 'OAuthProvider', 'signInWithCustomToken', 'signInWithPopup', 'signOut', 'document', 'fetch', 'location', SOURCE);
-  await run(fake.initializeApp, fake.getAuth, fake.OAuthProvider, fake.signInWithCustomToken, fake.signInWithPopup, fake.signOut, document, fetch, location);
+  const run = new AsyncFunction('initializeApp', 'getAuth', 'GoogleAuthProvider', 'OAuthProvider', 'signInWithCustomToken', 'signInWithPopup', 'signOut', 'document', 'fetch', 'location', SOURCE);
+  await run(fake.initializeApp, fake.getAuth, fake.GoogleAuthProvider, fake.OAuthProvider, fake.signInWithCustomToken, fake.signInWithPopup, fake.signOut, document, fetch, location);
   return { nodes, calls, auth };
 }
 const visible = (n) => Object.entries(n).filter(([id, v]) => id !== 'sttd-message' && id !== 'sttd-code-input' && !v.hidden).map(([id]) => id).sort();
@@ -130,5 +132,71 @@ test('the page has a hidden, separately labelled saved-code button, disabled whe
   const off = pages.renderInteractionLogin(web, 'synthetic-uid', 'Client', 'csrf', 'en', false);
   assert.match(on, /<button type="button" id="sttd-continue-code" hidden>Continue with the saved code sign-in<\/button>/);
   assert.match(off, /<button type="button" id="sttd-continue-code" hidden disabled>/);
-  assert.match(on, /id="sttd-continue" hidden>Continue with the signed-in Apple account</);
+  // T232: 保存済みApple/Googleの両方を続けるため、続けるボタンの文言はprovider中立（意味は同じ「ログイン中のアカウントで続ける」）。
+  assert.match(on, /id="sttd-continue" hidden>Continue with the signed-in account</);
+});
+
+// ---------- T232: Google・コード入力ロック（Google nodeを持つ版の合成DOMだけ） ----------
+const googleUser = (n = 1) => ({ uid: `synthetic-google-${n}`, isAnonymous: false, providerData: [{ providerId: 'google.com' }], getIdToken: async () => `google-token-${n}` });
+
+test('T232-G1 saved Google session: continue is shown (no Apple switch), continuing posts that Google token once without a popup', async () => {
+  const p = await page({ saved: googleUser(1), google: true });
+  assert.deepEqual(visible(p.nodes), ['sttd-apple-login', 'sttd-continue']);
+  await p.nodes['sttd-continue'].onclick();
+  assert.deepEqual([p.calls.posts, p.calls.popup], [['google-token-1'], []]);
+});
+
+test('T234-G4 saved Google names Google on continue in both languages; saved Apple keeps the neutral label; unchanged login paths', async () => {
+  const en = await page({ saved: googleUser(1), google: true });
+  assert.equal(en.nodes['sttd-continue'].textContent, 'Continue with the account signed in with Google');
+  const ja = await page({ saved: googleUser(1), google: true, lang: 'ja' });
+  assert.equal(ja.nodes['sttd-continue'].textContent, 'Googleでログイン中のアカウントで続ける');
+  await ja.nodes['sttd-continue'].onclick();
+  assert.deepEqual([ja.calls.posts, ja.calls.popup], [['google-token-1'], []]);
+  const apple = await page({ saved: appleUser(1), google: true, lang: 'ja' });
+  assert.equal(apple.nodes['sttd-continue'].textContent, 'ログイン中のアカウントで続ける');
+  assert.deepEqual(visible(apple.nodes), ['sttd-continue', 'sttd-google-login', 'sttd-switch-account']);
+  // 案内は方式を限定しない（Apple/Googleどちらでも、送信元と同じ方式・同じ本人）
+  const web = { apiKey: 'synthetic-api-key', authDomain: 'synthetic-project.firebaseapp.com', projectId: 'synthetic-project' };
+  assert.match(pages.renderInteractionLogin(web, 'synthetic-uid', 'Client', 'csrf', 'ja', false), /同じ方法（AppleまたはGoogle）・同じアカウント/);
+  assert.match(pages.renderInteractionLogin(web, 'synthetic-uid', 'Client', 'csrf', 'en', false), /same method \(Apple or Google\) and the same account/);
+  const none = await page({ google: true, lang: 'ja' });
+  assert.equal(none.nodes['sttd-continue'].hidden, true);
+  assert.ok(visible(none.nodes).includes('sttd-google-login'));
+});
+
+test('T232-G2 Google button opens only the google.com popup and posts the Google token; a non-Google result is not used', async () => {
+  const p = await page({ google: true, popup: async () => googleUser(3) });
+  assert.ok(visible(p.nodes).includes('sttd-google-login'));
+  await p.nodes['sttd-google-login'].onclick();
+  assert.deepEqual([p.calls.popup, p.calls.posts], [['google.com'], ['google-token-3']]);
+  const q = await page({ google: true, popup: async () => appleUser(4) });
+  await q.nodes['sttd-google-login'].onclick();
+  assert.deepEqual(q.calls.posts, []);
+});
+
+test('T232-G3 account-exists-with-different-credential shows the fixed guidance (no link, no lookup, no post)', async () => {
+  const p = await page({ google: true, popup: async () => { throw Object.assign(new Error('x'), { code: 'auth/account-exists-with-different-credential' }); } });
+  await p.nodes['sttd-google-login'].onclick();
+  assert.equal(p.calls.posts.length, 0);
+  assert.match(p.nodes['sttd-message'].textContent, /already registered with a different sign-in method/);
+});
+
+test('T232-L1 code lock: a 403 session_locked locks code entry (message, submit/input disabled, no more code POSTs); Apple stays available', async () => {
+  const p = await page({ code: 'on', google: true, codeResponse: { status: 403, json: async () => ({ error: { code: 'session_locked' } }) } });
+  p.nodes['sttd-code-input'].value = '123456';
+  await p.nodes['sttd-code-submit'].onclick();
+  assert.match(p.nodes['sttd-message'].textContent, /locked/);
+  assert.equal(p.nodes['sttd-code-submit'].disabled, true);
+  assert.equal(p.nodes['sttd-code-input'].disabled, true);
+  const before = p.calls.codePosts;
+  p.nodes['sttd-code-input'].value = '654321';
+  await p.nodes['sttd-code-submit'].onclick();
+  assert.equal(p.calls.codePosts, before);
+  assert.equal(p.nodes['sttd-apple-login'].disabled, false);
+  // 他の403（session_locked以外）はロックにしない
+  const q = await page({ code: 'on', codeResponse: { status: 403, json: async () => ({ error: { code: 'forbidden' } }) } });
+  q.nodes['sttd-code-input'].value = '123456';
+  await q.nodes['sttd-code-submit'].onclick();
+  assert.equal(q.nodes['sttd-code-submit'].disabled, false);
 });

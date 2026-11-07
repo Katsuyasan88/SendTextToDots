@@ -228,7 +228,8 @@ const contexts = [main.ctx];
 const ownerPath = (ownerId) => `sttdConnect/${NS}/owners/${ownerId}`;
 async function newOwner(env = main, extra = {}) {
   const ownerId = randomUUID();
-  await env.db.doc(ownerPath(ownerId)).set({ identityHash: 'f'.repeat(64), sealedUid: 'sealed', createdAt: clockState.value, lastActiveAt: clockState.value, revokedAt: null, ...extra });
+  // T232: 現行buildが作る通常login（Apple/Google）ownerの形（明示kind）。期限もkindも無い旧ownerは封緘UIDで判別される（developer-login R1群）。
+  await env.db.doc(ownerPath(ownerId)).set({ identityHash: 'f'.repeat(64), sealedUid: 'sealed', createdAt: clockState.value, lastActiveAt: clockState.value, revokedAt: null, loginKind: 'normal', ...extra });
   return ownerId;
 }
 /** 固定SDKの公開APIで、slotの中からGrantとopaque access tokenを発行する（AS payloadはKMS portで封緘）。 */

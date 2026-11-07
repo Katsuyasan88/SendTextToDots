@@ -252,6 +252,32 @@ const appRecord = (now, overrides = {}) => ({
   ...overrides,
 });
 
+test('T232 本物のMCP resolver: 期限付きcode ownerは期限内だけ解決、期限もkindも無い旧code ownerの既存opaque tokenは拒否（新しい10分は付かない）', async () => {
+  const { createResolverRuntime } = await import('./fixtures/source-runtime.mjs');
+  const { connectIdentityHash } = await import('../dist/connect/firestore.js');
+  const r = createResolverRuntime({ strict: false });
+  try {
+    const identity = { projectId: 'demo-sttd-source-runtime', uid: `sttdc_${'A'.repeat(32)}`, authTimeSec: 1, method: 'developer_code' };
+    const accessPath = `sttdConnect/${r.NS}/access/${connectIdentityHash(r.hasher, r.NS, identity)}`;
+    r.db.docs.set(accessPath, { version: 1, state: 'active', generation: globalThis.crypto.randomUUID(), updatedAt: Date.now(), codeLoginExpiresAt: Date.now() + 600_000 });
+    const admitted = await r.ctx.run(r.op(), () => r.connect.resolveOwner(identity));
+    assert.equal(admitted.kind, 'admitted');
+    const issued = await r.issue(admitted.ownerId);
+    assert.equal((await r.resolve(issued.value))?.ownerId, admitted.ownerId, 'control: within the deadline the real resolver resolves');
+    // この版より前の形（owner文書に期限もkindも無い）へ: 保存済みの封緘UIDがcode形なので、既存opaque tokenは拒否
+    const ownerPath = `sttdConnect/${r.NS}/owners/${admitted.ownerId}`;
+    const { codeLoginExpiresAt, ...legacy } = r.db.docs.get(ownerPath);
+    assert.ok(typeof codeLoginExpiresAt === 'number');
+    r.db.docs.set(ownerPath, legacy);
+    assert.equal(await r.resolve(issued.value), null, 'legacy code owner is refused by the real resolver');
+    // 期限付きでも期限後は拒否（owner文書の期限を過去へ）
+    r.db.docs.set(ownerPath, { ...legacy, codeLoginExpiresAt: Date.now() - 1 });
+    assert.equal(await r.resolve(issued.value), null, 'expired code owner is refused');
+  } finally {
+    r.dispose();
+  }
+});
+
 test('実MCP resolver（本物のoidc-provider）: bound Grantだけ解決し、旧Grant・停止・世代違い・削除はnull、互換は従来どおり', async () => {
   const { createResolverRuntime } = await import('./fixtures/source-runtime.mjs');
   const r = createResolverRuntime({ strict: true });

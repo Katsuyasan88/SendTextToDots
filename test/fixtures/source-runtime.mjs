@@ -156,7 +156,8 @@ export function createResolverRuntime({ strict = true } = {}) {
     resolve: (token) => resolver(token, op()),
     addOwner() {
       const ownerId = randomUUID();
-      db.docs.set(`${root}/owners/${ownerId}`, { identityHash: 'f'.repeat(64), sealedUid: 'sealed', createdAt: Date.now(), lastActiveAt: Date.now(), revokedAt: null });
+      // T232: 現行buildが作る通常login ownerの形（明示kind）。期限もkindも無い旧ownerは封緘UIDで判別される。
+      db.docs.set(`${root}/owners/${ownerId}`, { identityHash: 'f'.repeat(64), sealedUid: 'sealed', createdAt: Date.now(), lastActiveAt: Date.now(), revokedAt: null, loginKind: 'normal' });
       return ownerId;
     },
     /** 公開SDK APIでslotの中からGrantとopaque access tokenを保存する。 */

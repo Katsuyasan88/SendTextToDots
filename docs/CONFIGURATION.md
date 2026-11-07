@@ -4,7 +4,7 @@
 
 設定の正本は `src/config/deployment.ts` の1 fileだけです。配置前に編集してbuildします。実行時にHTTP・環境変数・引数から設定を選んだり上書きしたりする口はありません（MCPのlisten portと、Firebase Web API keyの値を読む環境変数を除く）。
 
-下の表は配置値の意味と条件をまとめたものです。入力元は汎用のアプリやスクリプトで、入力元のログイン/session管理とserver配置設定は別です（[API](API.md#firebase-sessions)）。本人認証は現在Apple providerのFirebaseだけに対応します。入力元のtokenや実ユーザー識別子を配置設定へ入れないでください。
+下の表は配置値の意味と条件をまとめたものです。入力元は汎用のアプリやスクリプトで、入力元のログイン/session管理とserver配置設定は別です（[API](API.md#firebase-sessions)）。本人認証は現在Apple・Google providerのFirebase（配置で有効にした場合は開発者向けコードも）に対応します。Googleを使う配置は、Firebase AuthenticationでGoogle providerを有効にし、許可ドメインを設定してください。入力元のtokenや実ユーザー識別子を配置設定へ入れないでください。
 
 ## 検証
 
@@ -27,6 +27,7 @@ Functions entryはimport時（discovery時）に、MCP entryと各起動口はen
 | `databaseId` | `(default)` 又は名前付きFirestore database ID |
 | `location` | 単一region（例 `us-central1`）。Functionsのregion、KMS key ringの地域に使う。`global`・multi-regionは不可 |
 | `api.functionName`・`api.serviceName` | どちらも `sendtexttodotsapi`（Functionsのexport名はESMの静的名のため固定。変える場合は `src/deployment/functions.ts` のexport名と `src/config/validate.ts` の `API_FUNCTION_EXPORT` も変える） |
+| `api.runtime`（任意） | 省略又は `functions-v1` は上記のFunctions配置。`cloud-run-v1` を明示した時だけ、`dist/deployment/api.js`（direct Cloud Runのentry。`PORT`・`K_SERVICE`＝`api.serviceName`・公開originのHostを検査）を使い、`api.serviceName` は `sendtexttodotsapi` 以外の独立したCloud Run名にする（`functionName` は固定のまま）。`topology` の `gateway-v1` とは併用できない。Functions entry（`functions.ts`）は省略・`functions-v1` かつdirectの時だけ起動し、`cloud-run-v1` や `gateway-v1` の設定ではSDK・秘密の前に固定のconfig失敗（全要求503）になる。direct Cloud Run entryは通常の送信APIの置換ではない |
 | `api.serviceAccount` | `<name>@<projectId>.iam.gserviceaccount.com`。API専用 |
 | `api.invoker`・`connect.invoker` | `private` だけ。外部到達はIAMで別に付与する（アプリ層の本人確認・OAuth・署名は常に必須） |
 | `api.publicOrigin` | APIの公開origin `https://<host>`（path・port・末尾slashなし。IP・localhost・予約TLDは不可） |
@@ -52,7 +53,7 @@ UUIDは例えば `node -e "console.log(crypto.randomUUID())"` で作れます（
 
 ## 利用者の明示登録（管理CLI）
 
-本人1名で使う場合も、使う人ごとに運営者が利用許可を登録します。初回ログイン・Apple認証の成功・既存のowner/Grant/購読だけでは使えません。許可は既存DBの `sttdConnect/{connectNamespace}/access/{identityHash}`（UIDの平文は保存しない）に置き、active/disabledと世代を持ちます。停止（disabled）や再登録で世代が変わると、それより前の同意で作ったGrant・購読からは新しい送信・購読・token交換ができず、本人のOAuth再同意と再購読が必要です。状態の照会・取消・購読解除・接続解除は停止中も使えます。
+本人1名で使う場合も、使う人ごとに運営者が利用許可を登録します。初回ログイン・Apple又はGoogle認証の成功・既存のowner/Grant/購読だけでは使えません。許可は既存DBの `sttdConnect/{connectNamespace}/access/{identityHash}`（UIDの平文は保存しない）に置き、active/disabledと世代を持ちます。停止（disabled）や再登録で世代が変わると、それより前の同意で作ったGrant・購読からは新しい送信・購読・token交換ができず、本人のOAuth再同意と再購読が必要です。状態の照会・取消・購読解除・接続解除は停止中も使えます。
 
 登録・停止は運営者のパソコンやCloud Shellで、buildした同じ配置設定に対して明示的に実行します（`npm run build`の後）。対象のFirebase UIDは正規のFirebase利用者管理（Firebase consoleのAuthentication等）で本人のものを確認し、標準入力から1行1件だけ渡します（引数・履歴・fileへ書かない）。UIDは1〜128文字のUnicodeをそのまま使い、前後の空白の除去・置換・正規化をしません。不正なUTF-8・改行や制御文字・行/段落区切り（U+2028/U+2029）・BOM・孤立surrogate・余分な行・長すぎる値は`invalid_input`です。
 
@@ -136,7 +137,7 @@ operator modeの設定ファイル（例: `operator.local.json`、commitしな�
 
 helperは既定のADCで動き、custom tokenの署名はFirebase Adminの`serviceAccountId`へ渡した`signingServiceAccount`だけを使います（ADCやmetadata serverから署名先を推測しません。自分のGoogleユーザーのADCにはservice accountのemailが無いためです）。helperを動かす資格に、そのservice accountへの`iam.serviceAccounts.signBlob`（例: Service Account Token Creator）が必要です。service accountの鍵JSONは配布しないでください。
 
-初期値（小規模な自己配置向け）: コード10分・予約は発行から24時間以上、発行候補20個・DB transaction最大5回・全体15秒。同時有効コードはnamespace 5・発行元1、発行は発行元3回/時・namespace 20回/時、入力はinteraction 5回・送信元5回・namespace全体の失敗5回/10分。onにする配置では、接続serverのservice accountにFirebaseユーザー作成とcustom token署名の権限が要ります（送信APIは照合の読取りだけ）。operator helperの資格もユーザー情報の署名・該当collectionの読み書き・identifierKeyの読取りに限ってください。TTLを使う場合は`developerLoginCodeReservations.deleteAfter`等へ配置側で設定します（認証期限の判定にはTTLを使いません）。
+初期値（小規模な自己配置向け）: コード10分・予約は発行から24時間以上、発行候補20個・DB transaction最大5回・全体15秒。同時有効コードはnamespace 5・発行元1、発行は発行元3回/時・namespace 20回/時、入力はinteraction 5回・送信元5回・namespace全体の失敗5回/10分（`429 rate_limited`）。これとは別に、同じOAuth interactionでの3回の誤入力でそのinteractionのコード入力をロックします（`403 session_locked`。集計枠の終了や再読込では解除されず、新しい接続が必要）。コードでのログインは成立から10分だけ使えます（Apple・Googleには適用しません）。onにする配置では、接続serverのservice accountにFirebaseユーザー作成とcustom token署名の権限が要ります（送信APIは照合の読取りだけ）。operator helperの資格もユーザー情報の署名・該当collectionの読み書き・identifierKeyの読取りに限ってください。TTLを使う場合は`developerLoginCodeReservations.deleteAfter`等へ配置側で設定します（認証期限の判定にはTTLを使いません）。
 
 ## 許可元の認可（既定compatible、開発中）
 

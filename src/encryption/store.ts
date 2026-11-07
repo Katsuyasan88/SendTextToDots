@@ -179,7 +179,8 @@ export class EncryptionKeyStore {
    * connection_required、許可の不正・ownerの時刻不正・束縛違いは一時障害。書込み0。
    */
   async #admit(tx: Transaction, identityHash: string, live: Live): Promise<Admitted | AdmissionDenied> {
-    const access = accessVerdictOfSnapshot(await this.#get(tx, accessDocRef(this.#connect, identityHash), live));
+    // コードloginの許可は期限も確かめる（期限後の新規利用0）。
+    const access = accessVerdictOfSnapshot(await this.#get(tx, accessDocRef(this.#connect, identityHash), live), this.#now());
     if (access.kind === 'unavailable') throw new EncryptionUnavailableError();
     if (access.kind === 'denied') return { kind: 'access_denied' };
     const mapped = (await this.#get(tx, this.#connect.collection('identities').doc(identityHash), live)).data() as { ownerId?: unknown } | undefined;

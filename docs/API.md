@@ -11,7 +11,7 @@ source 0.3.0の契約です。送信APIは `/v2/commands` 系、要求とEvents�
 
 ## 2. 送信API
 
-`POST /v2/commands`。必須header: `Authorization: Bearer <Firebase ID token>`（Apple provider）、`Content-Type: application/json`、`Idempotency-Key: <commandId>`。
+`POST /v2/commands`。必須header: `Authorization: Bearer <Firebase ID token>`（Apple又はGoogle provider）、`Content-Type: application/json`、`Idempotency-Key: <commandId>`。
 
 ```json
 {
@@ -215,9 +215,9 @@ eventIdは識別子鍵＋owner/commandIdのHMACから作るUUIDv8で、同じown
 
 ## Firebaseのsessionと自動送信
 
-現在の認証はFirebase AuthenticationのApple provider（配置が`developerLogin: 'operator-code-v1'`で有効にした場合は開発者向け6桁コードの利用単位も）に対応し、Dotsを接続した本人と同じFirebase project・UIDを使います。このAPI契約を満たすアプリやスクリプトが入力元になり、特定のスマートフォン・時計・入力元アプリは必須ではありません。受信側MCPのOAuth接続と、入力元のFirebase sessionは別です。
+現在の認証はFirebase AuthenticationのApple・Google provider（配置が`developerLogin: 'operator-code-v1'`で有効にした場合は開発者向け6桁コードの利用単位も）に対応し、Dotsを接続した本人と同じFirebase project・UIDを使います（tenantなし・同じprojectのID tokenだけ。AppleとGoogleはメールが同じでも別のUIDで、統合しません。GoogleはFirebase側でprovider有効化と許可ドメインの設定が必要です）。コードでのログインは成立から10分で、新しい送信・購読・接続確認・token更新・既存MCP access tokenでの要求を拒否します（ID tokenの残り期限や再読込では延びません。Apple/Googleには適用しません）。この期限の属性を持たない旧版のコード接続は使えないため、新しいコードで接続し直してください。このAPI契約を満たすアプリやスクリプトが入力元になり、特定のスマートフォン・時計・入力元アプリは必須ではありません。受信側MCPのOAuth接続と、入力元のFirebase sessionは別です。
 
-Firebase ID tokenは約1時間で期限切れになります。Firebase clientの認証sessionを使うアプリは、送信前にSDKで有効なtokenを取得してください。ローカル送信画面では認証が必要な操作ごとに`user.getIdToken()`を呼び、期限切れまたは期限間近なら更新できます。通常は毎時間Appleへ手動で再ログインする必要はありません。サインアウト・失効・認証上の問題があれば再ログインが必要になることはあります。[Firebaseのsession寿命](https://firebase.google.com/docs/auth/admin/manage-sessions)と[getIdToken](https://firebase.google.com/docs/reference/js/auth.user.md#usergetidtoken)も参照してください。
+Firebase ID tokenは約1時間で期限切れになります。Firebase clientの認証sessionを使うアプリは、送信前にSDKで有効なtokenを取得してください。ローカル送信画面では認証が必要な操作ごとに`user.getIdToken()`を呼び、期限切れまたは期限間近なら更新できます。通常は毎時間AppleやGoogleへ手動で再ログインする必要はありません。サインアウト・失効・認証上の問題があれば再ログインが必要になることはあります。[Firebaseのsession寿命](https://firebase.google.com/docs/auth/admin/manage-sessions)と[getIdToken](https://firebase.google.com/docs/reference/js/auth.user.md#usergetidtoken)も参照してください。
 
 下のNode.js例は渡されたID tokenを使うだけで、ログインやtoken更新を行いません。長時間・無人で動く入力元は、対応する認証/session管理を自分で用意する必要があります。headlessのAppleログイン、token書出しtool、常駐送信process、長期の送信専用キー、自動再送は同梱していません。ブラウザからrefresh tokenを抽出する代わりに、SDKのsession用APIを使ってください。Firebase Web API keyは設定を識別するもので、本人のID tokenの代わりにはなりません。
 
@@ -225,7 +225,7 @@ Firebase ID tokenは約1時間で期限切れになります。Firebase client�
 
 ## 直接APIを使うclient例
 
-配置・購読後、次を手元の`.mjs`ファイルに保存し、Node.js 22で実行します。`STTD_API_ORIGIN`へ配置済みHTTPS API origin、`STTD_FIREBASE_ID_TOKEN`へApple providerで認証した有効なFirebase ID tokenを設定してください。この環境変数は例のclient用で、server設定ではありません。tokenをGitや共有ログへ残さないでください。実行すると実メッセージ1件を送り、サービス費用が生じる可能性があります。
+配置・購読後、次を手元の`.mjs`ファイルに保存し、Node.js 22で実行します。`STTD_API_ORIGIN`へ配置済みHTTPS API origin、`STTD_FIREBASE_ID_TOKEN`へApple又はGoogle providerで認証した有効なFirebase ID token（Dotsを接続したのと同じUID）を設定してください。この環境変数は例のclient用で、server設定ではありません。tokenをGitや共有ログへ残さないでください。実行すると実メッセージ1件を送り、サービス費用が生じる可能性があります。
 ```js
 // Node.js 22; set STTD_API_ORIGIN and STTD_FIREBASE_ID_TOKEN locally.
 const origin = process.env.STTD_API_ORIGIN;
@@ -259,7 +259,7 @@ console.log(response.status, await response.json());
 
 ## プラグイン接続画面のコード入力（開発者向け6桁コード）
 
-機能が有効な配置だけ、OAuth interactionのlogin画面に「コードで接続」が表示されます。`POST /interaction/{uid}/code`（同origin・interaction cookie・CSRF必須、JSON `{"csrf","code"}` 1KiBまで）は成功時だけ同originの応答でcustom tokenを返し、画面がFirebase SDKでログインして既存の`/login`へID tokenを送ります（同意・購読は通常どおり）。不存在・期限切れ・使用済み・取消は同じ`400 code_rejected`、試行上限は`429`、作成/署名の失敗は`503 code_failed`（コンソールで新しいコードを発行）、その他の障害は`503`です。機能offでは`404`です。API/MCPのBearerは従来どおりFirebase ID tokenで、送信回数はコードで制限しません。
+機能が有効な配置だけ、OAuth interactionのlogin画面に「コードで接続」が表示されます。`POST /interaction/{uid}/code`（同origin・interaction cookie・CSRF必須、JSON `{"csrf","code"}` 1KiBまで）は成功時だけ同originの応答でcustom tokenを返し、画面がFirebase SDKでログインして既存の`/login`へID tokenを送ります（同意・購読は通常どおり）。不存在・期限切れ・使用済み・取消は同じ`400 code_rejected`、10分の試行上限（interaction・接続元ごとに5回、配置全体のコード認証で失敗5回）は`429 rate_limited`です。これとは別に、同じOAuth interactionで3回目の誤入力の時点から`403 session_locked`になります（正しいコードでも同じで、再読込や集計枠の終了でも解除されません）。もう一度コードを試すにはプラグインから新しい接続を始めます（プラグインの削除は必須ではありません）。Apple・Googleのログインはこのロックの影響を受けません。作成/署名の失敗は`503 code_failed`（コンソールで新しいコードを発行）、その他の障害は`503`です。機能offでは`404`です。API/MCPのBearerは従来どおりFirebase ID tokenで、送信回数はコードで制限しません。
 
 ## 許可元の証明（strict配置だけ、開発中）
 

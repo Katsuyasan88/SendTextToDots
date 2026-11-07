@@ -120,7 +120,8 @@ const provider = createOAuthProvider({
 const resolver = createRequestScopedOAuthOwnerResolver({ provider, connect, context: ctx, resource: RESOURCE });
 
 const ownerId = randomUUID();
-docs.set(`sttdConnect/${NS}/owners/${ownerId}`, { identityHash: 'f'.repeat(64), sealedUid: 'sealed', createdAt: Date.now(), lastActiveAt: Date.now(), revokedAt: null });
+// T232: 現行buildが作る通常login ownerの形（明示kind）。期限もkindも無い旧ownerは封緘UIDで判別される（developer-login R1群）。
+docs.set(`sttdConnect/${NS}/owners/${ownerId}`, { identityHash: 'f'.repeat(64), sealedUid: 'sealed', createdAt: Date.now(), lastActiveAt: Date.now(), revokedAt: null, loginKind: 'normal' });
 
 /** 公開SDK APIでslotの中からGrantとopaque access tokenを保存し、同じslotでfindした結果のown propertyを返す。 */
 function issue(extra = {}) {

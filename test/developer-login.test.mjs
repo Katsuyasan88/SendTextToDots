@@ -15,6 +15,8 @@ import { Timestamp } from '@google-cloud/firestore';
 
 import {
   CODE_AUTH_TTL_MS,
+  CODE_LOGIN_LIFETIME_MS,
+  codeLoginExpired,
   DEVELOPER_LOGIN_LIMITS,
   DeveloperLoginError,
   RESERVATION_HOLD_MS,
@@ -29,9 +31,11 @@ import {
   transitionReservation,
 } from '../dist/identity/developer-login.js';
 import { DeveloperLoginStore } from '../dist/identity/developer-login-store.js';
-import { createCodeIdentityLookup, createDeveloperCodeExchange, createLateCodeIdentityCheck, consoleToken } from '../dist/identity/developer-code-identity.js';
+import { createCodeIdentityLookup, createDeveloperCodeExchange, createLateCodeIdentityCheck, consoleToken, developerCodeEntry } from '../dist/identity/developer-code-identity.js';
 import { DEVELOPER_LOGIN_MODE, validateDeploymentConfig } from '../dist/config/validate.js';
 import { createFirebaseAdminVerifier, IdentityError } from '../dist/identity/firebase.js';
+import { accessVerdictOf, codeLoginWithin, nextAccessRecord, parseAccessRecord } from '../dist/access/policy.js';
+import { CODE_TEXT, INTERACTION_SCRIPT, renderInteractionLogin } from '../dist/connect/pages.js';
 import { ConnectStorage, connectIdentityHash } from '../dist/connect/firestore.js';
 import * as runtimeModule from '../dist/events/kms-subscription-runtime.js';
 import { createConnectKmsSealingPort } from '../dist/connect/kms-port.js';
@@ -591,6 +595,331 @@ test('A5 lookup outage is unavailable (not accepted)', async () => {
   await assert.rejects(verifier.verifyIdToken('t'), (e) => e.code === 'unavailable');
 });
 
+// ================= L: コードでのログイン成立から10分の絶対期限 =================
+
+async function activeCodeLogin(options = {}) {
+  const { store, clock, db } = makeStore({ codes: [options.code ?? 700], ...options });
+  const claimSecret = claim();
+  const issued = await store.issue({ claimSecret });
+  const auth = fakeAuth();
+  const outcome = await exchangeFor(store, auth, clock).exchange({ code: issued.code, interactionKey: 'i', sourceKey: 's' });
+  assert.equal(outcome.kind, 'token');
+  const tokens = new Map();
+  const verifier = createFirebaseAdminVerifier({ auth: fakeAdminVerify(tokens), projectId: PROJECT, codeIdentities: createCodeIdentityLookup(store) });
+  const good = idTokenFor(outcome.customToken, tokens);
+  return { store, clock, db, auth, verifier, good, tokens, outcome, claimSecret, operationId: issued.operationId, activatedAt: clock.t };
+}
+
+test('L1 code login: active until just before 10 minutes after activation; exactly 10 minutes and later are refused (expired)', async () => {
+  const { clock, verifier, good, activatedAt } = await activeCodeLogin();
+  clock.t = activatedAt + CODE_LOGIN_LIFETIME_MS - 1;
+  assert.equal((await verifier.verifyIdToken(good.id)).method, 'developer_code');
+  clock.t = activatedAt + CODE_LOGIN_LIFETIME_MS;
+  await assert.rejects(verifier.verifyIdToken(good.id), (e) => e instanceof IdentityError && e.code === 'expired');
+  clock.t = activatedAt + 60 * 60_000; // ID tokenの1時間の中でも拒否
+  await assert.rejects(verifier.verifyIdToken(good.id), (e) => e.code === 'expired');
+});
+
+test('L2 refresh / exchange recheck (accountStatus) and a newly signed ID token after 10 minutes are refused; nothing extends the deadline', async () => {
+  const { clock, verifier, good, tokens, outcome, activatedAt } = await activeCodeLogin({ code: 701 });
+  clock.t = activatedAt + 5 * 60_000;
+  assert.equal(await verifier.accountStatus(good.uid, 0), 'active');
+  // 途中で新しいID token（token更新・再読込相当・auth_timeが新しい）を使っても期限の起点は変わらない
+  const fresh = idTokenFor(outcome.customToken, tokens, { auth_time: Math.floor(clock.t / 1000) });
+  assert.equal((await verifier.verifyIdToken(fresh.id)).method, 'developer_code');
+  clock.t = activatedAt + CODE_LOGIN_LIFETIME_MS;
+  assert.equal(await verifier.accountStatus(good.uid, Math.floor(clock.t / 1000)), 'revoked');
+  await assert.rejects(verifier.verifyIdToken(fresh.id), (e) => e.code === 'expired');
+});
+
+test('L3 issuer console token (claim) ends after 10 minutes, so a new custom token cannot be minted for the same identity', async () => {
+  const { store, clock, auth, claimSecret, operationId, activatedAt } = await activeCodeLogin({ code: 702 });
+  assert.equal((await consoleToken(store, auth, { claimSecret, operationId }, clock)).kind, 'active');
+  const signedBefore = auth.calls.sign;
+  clock.t = activatedAt + CODE_LOGIN_LIFETIME_MS;
+  assert.deepEqual(await consoleToken(store, auth, { claimSecret, operationId }, clock), { kind: 'ended' });
+  assert.equal(auth.calls.sign, signedBefore);
+});
+
+test('L4 an old code identity (created long ago) is judged from its stored createdAt: no indefinite compatibility', async () => {
+  const { clock, verifier, good, activatedAt } = await activeCodeLogin({ code: 703 });
+  clock.t = activatedAt + 30 * 24 * 60 * 60_000;
+  await assert.rejects(verifier.verifyIdToken(good.id), (e) => e.code === 'expired');
+  assert.equal(await verifier.accountStatus(good.uid, 0), 'revoked');
+});
+
+test('L5 fail closed: invalid clock or an implausible stored createdAt is unavailable (never active)', async () => {
+  const { store, clock, verifier, good, db, activatedAt } = await activeCodeLogin({ code: 704 });
+  clock.t = Number.NaN;
+  await assert.rejects(verifier.verifyIdToken(good.id), (e) => e.code === 'unavailable');
+  clock.t = activatedAt + 1000;
+  const path = [...db.docs.keys()].find((p) => p.includes('/developerCodeIdentities/'));
+  const entry = db.docs.get(path);
+  db.docs.set(path, { ...entry, data: { ...entry.data, createdAt: activatedAt + 10 * 60 * 60_000 } }); // 10時間未来
+  await assert.rejects(verifier.verifyIdToken(good.id), (e) => e.code === 'unavailable');
+  db.docs.set(path, { ...entry, data: { ...entry.data, createdAt: activatedAt + 30_000 } }); // 時計差60秒以内は作成直後として扱う
+  assert.equal((await verifier.verifyIdToken(good.id)).method, 'developer_code');
+  assert.ok(store);
+});
+
+test('L6 Apple login is not subject to the 10 minute code lifetime', async () => {
+  const { clock, verifier, tokens, activatedAt } = await activeCodeLogin({ code: 705 });
+  clock.t = activatedAt + 2 * CODE_LOGIN_LIFETIME_MS;
+  const apple = `id.${randomBytes(4).toString('hex')}`;
+  tokens.set(apple, { aud: PROJECT, iss: `https://securetoken.google.com/${PROJECT}`, sub: 'AppleUid0123456789abcdef', auth_time: 1, firebase: { sign_in_provider: 'apple.com' } });
+  assert.equal((await verifier.verifyIdToken(apple)).uid, 'AppleUid0123456789abcdef');
+  assert.equal(await verifier.accountStatus('AppleUid0123456789abcdef', 0), 'active');
+});
+
+test('L7 revoked stays revoked (not reported as expired) and expiry does not resurrect a revoked identity', async () => {
+  const { store, clock, verifier, good, claimSecret, operationId, activatedAt } = await activeCodeLogin({ code: 706 });
+  assert.equal(await store.cancel({ claimSecret, operationId }), 'revoked');
+  await assert.rejects(verifier.verifyIdToken(good.id), (e) => e.code === 'revoked');
+  clock.t = activatedAt + CODE_LOGIN_LIFETIME_MS;
+  await assert.rejects(verifier.verifyIdToken(good.id), (e) => e.code === 'revoked');
+});
+
+// ================= M: 期限をowner・許可・配送/購読の最終判定・MCP既存access tokenへ通す =================
+
+test('M1 access record: code activation stores codeLoginExpiresAt; verdict denies at exactly 10 minutes, without now (fail closed) and keeps the deadline through admin transitions', async () => {
+  const { db, clock, activatedAt } = await activeCodeLogin({ code: 710 });
+  const path = [...db.docs.keys()].find((p) => /\/access\/[^/]+$/.test(p));
+  const data = db.docs.get(path).data;
+  assert.equal(data.codeLoginExpiresAt, activatedAt + CODE_LOGIN_LIFETIME_MS);
+  assert.equal(accessVerdictOf(true, data, activatedAt + CODE_LOGIN_LIFETIME_MS - 1).kind, 'allowed');
+  assert.equal(accessVerdictOf(true, data, activatedAt + CODE_LOGIN_LIFETIME_MS).kind, 'denied');
+  assert.equal(accessVerdictOf(true, data).kind, 'denied');
+  assert.equal(accessVerdictOf(true, data, Number.NaN).kind, 'denied');
+  assert.equal(accessVerdictOf(true, { ...data, codeLoginExpiresAt: 'x' }, clock.t).kind, 'unavailable');
+  assert.equal(accessVerdictOf(true, { ...data, extra: 1 }, clock.t).kind, 'unavailable');
+  // Apple/Google（期限fieldなし）の許可はnowの有無に関わらず従来どおり
+  const plain = { version: data.version, state: 'active', generation: data.generation, updatedAt: data.updatedAt };
+  assert.equal(accessVerdictOf(true, plain).kind, 'allowed');
+  // 停止→再許可でも期限を外さない・延ばさない
+  const disabled = nextAccessRecord(parseAccessRecord(data), 'disabled', clock.t, globalThis.crypto.randomUUID());
+  const again = nextAccessRecord(disabled, 'active', clock.t + 1, globalThis.crypto.randomUUID());
+  assert.equal(again.codeLoginExpiresAt, data.codeLoginExpiresAt);
+});
+
+test('M2 code owner: isOwnerActive (MCP existing access token path), ownerDocActive (delivery/subscription final tx) and grant/access decisions stop at 10 minutes; Apple owner unaffected', async () => {
+  const { db, clock, verifier, good, activatedAt } = await activeCodeLogin({ code: 720 });
+  const storage = connectStorage(db, clock);
+  const admission = await storage.resolveOwner(await verifier.verifyIdToken(good.id));
+  assert.equal(admission.kind, 'admitted');
+  const ownerPath = [...db.docs.keys()].find((p) => p.endsWith(`/owners/${admission.ownerId}`));
+  assert.equal(db.docs.get(ownerPath).data.codeLoginExpiresAt, activatedAt + CODE_LOGIN_LIFETIME_MS);
+  const accessPath = [...db.docs.keys()].find((p) => /\/access\/[^/]+$/.test(p));
+  clock.t = activatedAt + CODE_LOGIN_LIFETIME_MS - 1;
+  assert.equal(await storage.isOwnerActive(admission.ownerId), true);
+  assert.equal(storage.ownerDocActive(db.docs.get(ownerPath).data, clock.t), true);
+  assert.equal(storage.accessUseDecision({ exists: true, data: db.docs.get(accessPath).data }), 'allowed');
+  clock.t = activatedAt + CODE_LOGIN_LIFETIME_MS;
+  assert.equal(await storage.isOwnerActive(admission.ownerId), false);
+  assert.equal(storage.ownerDocActive(db.docs.get(ownerPath).data, clock.t), false);
+  assert.equal(storage.accessUseDecision({ exists: true, data: db.docs.get(accessPath).data }), 'denied');
+  // 形違いの期限はfail closed
+  assert.equal(storage.ownerDocActive({ ...db.docs.get(ownerPath).data, codeLoginExpiresAt: null }, activatedAt + 1), false);
+  // Apple ownerは期限fieldを持たず、従来どおり
+  assert.equal(storage.ownerDocActive({ identityHash: 'x', sealedUid: 's', createdAt: activatedAt, lastActiveAt: activatedAt, revokedAt: null }, activatedAt + 60 * 60_000), true);
+});
+
+test('M3 re-admission of an existing code owner never extends or removes its deadline', async () => {
+  const { db, clock, verifier, good, activatedAt } = await activeCodeLogin({ code: 730 });
+  const storage = connectStorage(db, clock);
+  const first = await storage.resolveOwner(await verifier.verifyIdToken(good.id));
+  clock.t = activatedAt + 5 * 60_000;
+  const second = await storage.resolveOwner(await verifier.verifyIdToken(good.id));
+  assert.equal(second.ownerId, first.ownerId);
+  const ownerPath = [...db.docs.keys()].find((p) => p.endsWith(`/owners/${first.ownerId}`));
+  assert.equal(db.docs.get(ownerPath).data.codeLoginExpiresAt, activatedAt + CODE_LOGIN_LIFETIME_MS);
+  clock.t = activatedAt + CODE_LOGIN_LIFETIME_MS;
+  assert.equal((await storage.resolveOwner({ projectId: PROJECT, uid: good.uid, authTimeSec: 1, method: 'developer_code' })).kind, 'denied');
+});
+
+test('G1 Google: google.com with same project / no tenant is accepted as method google; other providers, tenant, foreign project and code-UID spoofing are refused', async () => {
+  const tokens = new Map();
+  const verifier = createFirebaseAdminVerifier({ auth: fakeAdminVerify(tokens), projectId: PROJECT });
+  const base = { aud: PROJECT, iss: `https://securetoken.google.com/${PROJECT}`, sub: 'GoogleUid0123456789abcdef', auth_time: 1, firebase: { sign_in_provider: 'google.com' } };
+  tokens.set('g', base);
+  const ok = await verifier.verifyIdToken('g');
+  assert.deepEqual([ok.uid, ok.method], ['GoogleUid0123456789abcdef', 'google']);
+  const reject = async (decoded, code) => {
+    const id = `g.${randomBytes(4).toString('hex')}`;
+    tokens.set(id, decoded);
+    await assert.rejects(verifier.verifyIdToken(id), (e) => e instanceof IdentityError && e.code === code);
+  };
+  await reject({ ...base, firebase: { sign_in_provider: 'google.com', tenant: 't1' } }, 'wrong_project');
+  await reject({ ...base, aud: 'other-project' }, 'wrong_project');
+  await reject({ ...base, iss: 'https://securetoken.google.com/other-project' }, 'wrong_project');
+  await reject({ ...base, firebase: { sign_in_provider: 'oidc.google' } }, 'wrong_provider');
+  await reject({ ...base, firebase: { sign_in_provider: 'password' } }, 'wrong_provider');
+  await reject({ ...base, firebase: { sign_in_provider: 'anonymous' } }, 'wrong_provider');
+  await reject({ ...base, sub: `sttdc_${randomBytes(24).toString('base64url')}` }, 'wrong_provider');
+  // Googleにはコードloginの10分期限を適用しない（期限はcode identityだけ）
+  assert.equal(await verifier.accountStatus('GoogleUid0123456789abcdef', 0), 'active');
+});
+
+test('G2 interaction page: Google button / GoogleAuthProvider popup / fixed guidance for account-exists-with-different-credential without fetchSignInMethodsForEmail; code lock UI disables submit', () => {
+  assert.match(INTERACTION_SCRIPT, /new GoogleAuthProvider\(\)/);
+  assert.match(INTERACTION_SCRIPT, /auth\/account-exists-with-different-credential/);
+  assert.doesNotMatch(INTERACTION_SCRIPT, /fetchSignInMethodsForEmail\(|linkWithCredential\(|linkWithPopup\(/);
+  assert.match(INTERACTION_SCRIPT, /if \(google && !apple\) return 'google'/);
+  assert.match(INTERACTION_SCRIPT, /err\.error\.code === 'session_locked'/);
+  assert.match(INTERACTION_SCRIPT, /\(codeButton && codeLocked\)/);
+  for (const lang of ['en', 'ja']) {
+    const html = renderInteractionLogin({ apiKey: 'k', authDomain: 'example.invalid', projectId: PROJECT }, 'u'.repeat(20), 'client', 'c'.repeat(43), lang, true);
+    assert.match(html, /id="sttd-google-login"/);
+  }
+  assert.ok(CODE_TEXT.en.locked.length > 0 && CODE_TEXT.ja.locked.length > 0);
+});
+
+// ================= R1: 期限属性の無い旧コード接続はfail closed・時計の厳密化 =================
+
+/** この版より前の形（許可recordとowner文書に期限fieldが無い）を合成で作る。実DB移行・取消0。 */
+async function legacyCodeOwner(code) {
+  const { db, clock, verifier, good, store } = await activeCodeLogin({ code });
+  const storage = connectStorage(db, clock);
+  const admission = await storage.resolveOwner(await verifier.verifyIdToken(good.id));
+  const strip = (pred) => {
+    const path = [...db.docs.keys()].find(pred);
+    const entry = db.docs.get(path);
+    const { codeLoginExpiresAt, ...rest } = entry.data;
+    db.docs.set(path, { ...entry, data: rest });
+    return codeLoginExpiresAt;
+  };
+  strip((p) => /\/access\/[^/]+$/.test(p));
+  strip((p) => p.endsWith(`/owners/${admission.ownerId}`));
+  return { db, clock, storage, verifier, good, store, ownerId: admission.ownerId };
+}
+
+test('R1-1 legacy code owner without the deadline attribute: isOwnerActive (opaque MCP token / OAuth exchange / refresh entry) is refused even inside 10 minutes; no new 10 minutes is added', async () => {
+  const { storage, ownerId, db } = await legacyCodeOwner(740);
+  assert.equal(await storage.isOwnerActive(ownerId), false);
+  const ownerPath = [...db.docs.keys()].find((p) => p.endsWith(`/owners/${ownerId}`));
+  assert.equal(Object.hasOwn(db.docs.get(ownerPath).data, 'codeLoginExpiresAt'), false);
+});
+
+test('R1-2 legacy code identity cannot be admitted again (login/admission refused), even with a valid-looking verified code identity', async () => {
+  const { storage, good } = await legacyCodeOwner(741);
+  assert.equal((await storage.resolveOwner({ projectId: PROJECT, uid: good.uid, authTimeSec: 1, method: 'developer_code' })).kind, 'denied');
+  // methodを偽ってもcode UID形は旧コード接続として拒否
+  assert.equal((await storage.resolveOwner({ projectId: PROJECT, uid: good.uid, authTimeSec: 1 })).kind, 'denied');
+});
+
+test('R1-3 legacy Apple/Google owners (no deadline attribute) keep working; an owner whose sealed UID cannot be opened is not active (fail closed)', async () => {
+  const db = new FakeDb();
+  const clock = clockAt();
+  const storage = connectStorage(db, clock);
+  for (const [uid, method] of [['AppleUid0123456789abcdef', undefined], ['GoogleUid0123456789abcdef', 'google']]) {
+    const h = connectIdentityHash(connectHasher, NAMESPACE, { projectId: PROJECT, uid });
+    db.docs.set(`sttdConnect/${NAMESPACE}/access/${h}`, { data: { version: 1, state: 'active', generation: globalThis.crypto.randomUUID(), updatedAt: clock.t }, version: 1 });
+    const a = await storage.resolveOwner({ projectId: PROJECT, uid, authTimeSec: 1, ...(method ? { method } : {}) });
+    assert.equal(a.kind, 'admitted', uid);
+    const ownerPath = [...db.docs.keys()].find((p) => p.endsWith(`/owners/${a.ownerId}`));
+    assert.equal(db.docs.get(ownerPath).data.loginKind, 'normal', `${uid} new normal owner is marked`);
+    clock.t += 60 * 60_000;
+    assert.equal(await storage.isOwnerActive(a.ownerId), true, uid);
+    // この版より前の形（期限もkindも無い）にした旧通常owner: 保存UIDを開封してcode UID形でなければ維持
+    const entry = db.docs.get(ownerPath);
+    const { loginKind, ...legacy } = entry.data;
+    db.docs.set(ownerPath, { ...entry, data: legacy });
+    assert.equal(await storage.isOwnerActive(a.ownerId), true, `${uid} legacy normal owner kept`);
+    // 開封結果が判別不能（空）なら非成功
+    db.docs.set(ownerPath, { ...entry, data: { ...legacy, sealedUid: 'sealed:' } });
+    assert.equal(await storage.isOwnerActive(a.ownerId), false, `${uid} undeterminable`);
+    // 未知kind・期限とkindの併存は不正
+    db.docs.set(ownerPath, { ...entry, data: { ...entry.data, loginKind: 'admin' } });
+    assert.equal(await storage.isOwnerActive(a.ownerId), false, `${uid} unknown kind`);
+    db.docs.set(ownerPath, { ...entry, data: { ...entry.data, codeLoginExpiresAt: clock.t + 60_000 } });
+    assert.equal(await storage.isOwnerActive(a.ownerId), false, `${uid} kind and deadline together`);
+  }
+});
+
+test('R1-4 clock / deadline inputs: negative, fractional, unsafe, NaN, Infinity and out-of-Date-range are refused (fail closed)', () => {
+  const exp = Date.UTC(2026, 10, 6);
+  for (const now of [-1, 1.5, Number.MAX_SAFE_INTEGER + 2, Number.NaN, Number.POSITIVE_INFINITY, 8_640_000_000_000_001, '1', null, undefined]) assert.equal(codeLoginWithin(exp, now), false, String(now));
+  for (const bad of [0, -5, 1.5, 8_640_000_000_000_001, Number.NaN, '1', null]) assert.equal(codeLoginWithin(bad, exp - 1), false, String(bad));
+  assert.equal(codeLoginWithin(exp, exp - 1), true);
+  assert.equal(codeLoginWithin(exp, exp), false);
+  assert.equal(codeLoginWithin(undefined, Number.NaN), true); // 期限を持たないApple/Googleは時計に依存しない
+  for (const [c, n] of [[T0, Number.NaN], [T0, -1], [T0, 1.5], [-1, T0], [1.5, T0], [8_640_000_000_000_000, T0], [T0, Number.POSITIVE_INFINITY]]) assert.throws(() => codeLoginExpired(c, n), DeveloperLoginError);
+  assert.equal(codeLoginExpired(T0, T0 + CODE_LOGIN_LIFETIME_MS - 1), false);
+  assert.equal(codeLoginExpired(T0, T0 + CODE_LOGIN_LIFETIME_MS), true);
+});
+
+test('R1-5 identityState: fractional / negative / non-finite clock is unavailable (never active)', async () => {
+  const { clock, verifier, good, activatedAt } = await activeCodeLogin({ code: 742 });
+  for (const t of [activatedAt + 0.5, -1, Number.POSITIVE_INFINITY]) {
+    clock.t = t;
+    await assert.rejects(verifier.verifyIdToken(good.id), (e) => e.code === 'unavailable', String(t));
+  }
+});
+
+// ================= K: 接続セッション（interaction）の3回誤入力ロック =================
+
+const wrongCodeFor = (code) => (code === '999999' ? '999998' : '999999');
+
+test('K1 one or two wrong codes then the correct code on the 2nd/3rd try succeeds', async () => {
+  for (const wrongs of [1, 2]) {
+    const { store } = makeStore({ codes: [800 + wrongs], limits: WIDE });
+    const issued = await store.issue({ claimSecret: claim() });
+    for (let i = 0; i < wrongs; i += 1) assert.equal((await store.consume({ code: wrongCodeFor(issued.code), interactionKey: `ki-${wrongs}`, sourceKey: `s${i}` })).kind, 'rejected');
+    assert.equal((await store.consume({ code: issued.code, interactionKey: `ki-${wrongs}`, sourceKey: 'sx' })).kind, 'consumed');
+  }
+});
+
+test('K2 three wrong codes lock the session: the 3rd failure reports session_locked and a correct 4th code exchanges nothing', async () => {
+  const { store } = makeStore({ codes: [810], limits: WIDE });
+  const issued = await store.issue({ claimSecret: claim() });
+  const bad = wrongCodeFor(issued.code);
+  assert.equal((await store.consume({ code: bad, interactionKey: 'k2', sourceKey: 'a' })).kind, 'rejected');
+  assert.equal((await store.consume({ code: bad, interactionKey: 'k2', sourceKey: 'b' })).kind, 'rejected');
+  assert.equal((await store.consume({ code: bad, interactionKey: 'k2', sourceKey: 'c' })).kind, 'session_locked');
+  assert.equal((await store.consume({ code: issued.code, interactionKey: 'k2', sourceKey: 'd' })).kind, 'session_locked');
+  // 正しいコードは消費されていない（別の接続セッションでは使える）
+  assert.equal((await store.consume({ code: issued.code, interactionKey: 'k2-new-session', sourceKey: 'e' })).kind, 'consumed');
+});
+
+test('K3 four parallel wrong attempts on one session cannot exceed the limit; afterwards the correct code is refused', async () => {
+  const { store } = makeStore({ codes: [820], limits: WIDE });
+  const issued = await store.issue({ claimSecret: claim() });
+  const results = await Promise.allSettled([0, 1, 2, 3].map((i) => store.consume({ code: wrongCodeFor(issued.code), interactionKey: 'k3', sourceKey: `p${i}` })));
+  const kinds = results.map((r) => (r.status === 'fulfilled' ? r.value.kind : 'error'));
+  assert.ok(kinds.every((k) => ['rejected', 'session_locked', 'error'].includes(k)), kinds.join(','));
+  assert.ok(kinds.filter((k) => k === 'rejected').length <= 2, kinds.join(','));
+  assert.equal((await store.consume({ code: issued.code, interactionKey: 'k3', sourceKey: 'q' })).kind, 'session_locked');
+});
+
+test('K4 the lock survives the rate window, page reloads (same interaction key) and code reissue', async () => {
+  const { store, clock } = makeStore({ codes: [830, 831], limits: WIDE });
+  const consoleSecret = claim();
+  const first = await store.issue({ claimSecret: consoleSecret });
+  for (const s of ['a', 'b', 'c']) await store.consume({ code: wrongCodeFor(first.code), interactionKey: 'k4', sourceKey: s });
+  clock.t += DEVELOPER_LOGIN_LIMITS.attemptWindowMs + 60_000; // 時刻窓を跨ぐ
+  const reissued = await store.issue({ claimSecret: consoleSecret, previousOperationId: first.operationId }); // コード再発行
+  assert.equal((await store.consume({ code: reissued.code, interactionKey: 'k4', sourceKey: 'd' })).kind, 'session_locked');
+});
+
+test('K5 other sessions are independent (no global lock for everyone)', async () => {
+  const { store } = makeStore({ codes: [840], limits: WIDE });
+  const issued = await store.issue({ claimSecret: claim() });
+  for (const s of ['a', 'b', 'c']) await store.consume({ code: wrongCodeFor(issued.code), interactionKey: 'k5-locked', sourceKey: s });
+  assert.equal((await store.consume({ code: issued.code, interactionKey: 'k5-other', sourceKey: 'z' })).kind, 'consumed');
+});
+
+test('K6 invalid Origin / CSRF never reaches the exchange, so it does not count towards the lock', async () => {
+  let calls = 0;
+  const exchange = { exchange: async () => { calls += 1; return { kind: 'rejected' }; } };
+  const req = (origin, bodyText) => Object.assign((async function* () { yield Buffer.from(bodyText); })(), { headers: { origin, 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(bodyText)) } });
+  const body = JSON.stringify({ csrf: 'x'.repeat(43), code: '123456' });
+  const ports = (csrfOk) => ({ exchange, origin: 'https://issuer.example', checkInteraction: async () => undefined, csrfAccepts: async () => csrfOk, sourceKey: 's' });
+  for (let i = 0; i < 5; i += 1) {
+    assert.equal((await developerCodeEntry(req('https://issuer.example', body), 'k6', ports(false))).kind, 'link_unavailable');
+    assert.equal((await developerCodeEntry(req('https://evil.example', body), 'k6', ports(true))).kind, 'forbidden');
+  }
+  assert.equal(calls, 0);
+});
+
 // ================= F: 接続flow・再発行 =================
 
 function connectStorage(db, clock) {
@@ -645,8 +974,8 @@ test('F1 issue -> exchange -> one new identity -> owner admitted with access gen
   assert.notEqual(verifiedB.uid, verifiedA.uid);
   assert.equal((await storage.resolveOwner(verifiedB)).kind, 'admitted');
 
-  // 予約の物理削除（24時間後）は接続に影響しない。
-  clock.t += RESERVATION_HOLD_MS + 1;
+  // 予約の物理削除は接続に影響しない（T232: コードでのログインは成立から10分で失効するため、削除はその10分内で確かめる。L群が期限を別に検証）。
+  clock.t += 60_000;
   db.delete(store.reservationIdOf(a.code));
   assert.equal((await verifier.verifyIdToken(idA.id)).uid, idA.uid);
 

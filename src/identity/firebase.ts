@@ -1,9 +1,10 @@
-// Firebase Authentication（Apple providerのみ）のID token検証portと、firebase-adminのAuthを使う実adapter（Appの所有はSDK起動口）。
-// 製品の検証は verifyIdToken(token, checkRevoked=true) に任せ、その後にSendTextToDotsの条件（同じproject・apple.com・tenantなし）を足す。
+// Firebase Authentication（Apple・Google provider、任意で開発者向けコード）のID token検証portと、firebase-adminのAuthを使う実adapter（Appの所有はSDK起動口）。
+// 製品の検証は verifyIdToken(token, checkRevoked=true) に任せ、その後にSendTextToDotsの条件（同じproject・apple.com/google.com・tenantなし）を足す。
 // 未検証のJWT decodeやUIDの自己申告を本人確認に使わない（下のclassifyだけが、SDKが拒否した後の分類にpayloadを読む）。
 // 失敗は固定のcodeだけで、元の例外・token・uidを持たせない。
 
 export const APPLE_PROVIDER_ID = 'apple.com';
+export const GOOGLE_PROVIDER_ID = 'google.com';
 const ISSUER_PREFIX = 'https://securetoken.google.com/';
 const PROJECT_ID_PATTERN = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
 
@@ -30,8 +31,8 @@ export interface VerifiedIdentity {
   readonly uid: string;
   /** Firebaseへの認証時刻（epoch秒）。 */
   readonly authTimeSec: number;
-  /** 開発者向けコード由来の利用単位だけ'developer_code'（Appleは省略）。 */
-  readonly method?: 'developer_code';
+  /** 開発者向けコード由来は'developer_code'、Googleは'google'（Appleは省略＝従来どおり）。 */
+  readonly method?: 'developer_code' | 'google';
 }
 
 /**
@@ -39,7 +40,8 @@ export interface VerifiedIdentity {
  * 認証marker・専用UID形・保存されたcode identityのstate/familyを確かめる。
  */
 export interface CodeIdentityCheck {
-  status(uid: string, familyId: string | null): Promise<'active' | 'revoked' | 'missing'>;
+  /** 'expired'はコードでのログイン成立から10分を過ぎたidentity（tokenの残り期限・refreshに関わらず新しい操作を止める）。 */
+  status(uid: string, familyId: string | null): Promise<'active' | 'revoked' | 'missing' | 'expired'>;
   /** 任意。falseの間は機能offと同じ（起動口が秘密の読込み後に照合を結ぶまで）。 */
   enabled?(): boolean;
 }
@@ -108,14 +110,14 @@ function classify(error: unknown, idToken: string, projectId: string): IdentityF
   }
 }
 
-async function codeStatus(codeIdentities: CodeIdentityCheck, uid: string, familyId: string | null): Promise<'active' | 'revoked' | 'missing'> {
+async function codeStatus(codeIdentities: CodeIdentityCheck, uid: string, familyId: string | null): Promise<'active' | 'revoked' | 'missing' | 'expired'> {
   let status: unknown;
   try {
     status = await codeIdentities.status(uid, familyId);
   } catch {
     throw new IdentityError('unavailable');
   }
-  if (status !== 'active' && status !== 'revoked' && status !== 'missing') throw new IdentityError('unavailable');
+  if (status !== 'active' && status !== 'revoked' && status !== 'missing' && status !== 'expired') throw new IdentityError('unavailable');
   return status;
 }
 
@@ -156,13 +158,18 @@ export function createFirebaseAdminVerifier(deps: {
         }
         const status = await codeStatus(codeIdentities, sub, family);
         if (status === 'missing') throw new IdentityError('deleted');
+        if (status === 'expired') throw new IdentityError('expired'); // ログイン成立から10分（ID tokenの1時間・refreshでは延長しない）
         if (status !== 'active') throw new IdentityError('revoked');
         return Object.freeze({ projectId, uid: sub, authTimeSec: authTime, method: 'developer_code' as const });
       }
-      if (firebase?.sign_in_provider !== APPLE_PROVIDER_ID) throw new IdentityError('wrong_provider');
+      const provider = firebase?.sign_in_provider;
+      // Apple・Googleだけ（generic OIDC/SAML・anonymous・password等は受けない）。署名・issuer・audience・失効はSDK、project/tenantは上で確認済み。
+      if (provider !== APPLE_PROVIDER_ID && provider !== GOOGLE_PROVIDER_ID) throw new IdentityError('wrong_provider');
       const subject = subjectChecked();
-      // code専用UIDの形はAppleとして受けない（rollback時に旧code identityをApple相当で通さない）。
+      // code専用UIDの形はApple/Googleとして受けない（rollback時に旧code identityを通常loginとして通さない）。
       if (CODE_UID.test(subject.sub)) throw new IdentityError('wrong_provider');
+      // コードloginの10分期限はApple/Googleへ適用しない。メール一致等によるUID統合はしない（Firebase UIDだけを本人とする）。
+      if (provider === GOOGLE_PROVIDER_ID) return Object.freeze({ projectId, uid: subject.sub, authTimeSec: subject.authTime, method: 'google' as const });
       return Object.freeze({ projectId, uid: subject.sub, authTimeSec: subject.authTime });
     },
     async accountStatus(uid, sinceSec) {
@@ -171,7 +178,7 @@ export function createFirebaseAdminVerifier(deps: {
         if (!codeEnabled(codeIdentities)) return 'revoked';
         const status = await codeStatus(codeIdentities, uid, null);
         if (status === 'missing') return 'deleted';
-        if (status !== 'active') return 'revoked';
+        if (status !== 'active') return 'revoked'; // 'expired'（10分経過）もMCP交換・refreshを止める
       }
       let user: Awaited<ReturnType<AdminAuthLike['getUser']>>;
       try {

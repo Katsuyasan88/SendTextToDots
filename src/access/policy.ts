@@ -51,11 +51,16 @@ export interface AccessRecord {
   readonly state: AccessState;
   readonly generation: string;
   readonly updatedAt: number;
+  /**
+   * 開発者向けコードでのログイン成立（code identityのactivate）から10分の絶対期限（epoch ms）。code activationが許可recordと同時に保存する。
+   * これ以降は新規利用（login・交換・refresh・送信・購読・MCPの既存access token）を許さない。Apple/Googleの許可recordには無い。
+   */
+  readonly codeLoginExpiresAt?: number;
 }
 
-/** 新規利用の可否。allowedだけが世代を持つ。 */
+/** 新規利用の可否。allowedだけが世代を持つ（コードloginの許可は期限も持つ）。 */
 export type AccessVerdict =
-  | { readonly kind: 'allowed'; readonly generation: string }
+  | { readonly kind: 'allowed'; readonly generation: string; readonly codeLoginExpiresAt?: number }
   | { readonly kind: 'denied' }
   | { readonly kind: 'unavailable' };
 
@@ -98,7 +103,9 @@ export function parseAccessRecord(value: unknown): AccessRecord {
   const data = plainData(value);
   if (data === null) throw new AccessRecordError();
   const keys = Reflect.ownKeys(data);
-  if (keys.length !== RECORD_KEYS.length || !keys.every((key) => typeof key === 'string' && (RECORD_KEYS as readonly string[]).includes(key))) {
+  const coded = Object.hasOwn(data, 'codeLoginExpiresAt');
+  const expected: readonly string[] = coded ? [...RECORD_KEYS, 'codeLoginExpiresAt'] : RECORD_KEYS;
+  if (keys.length !== expected.length || !keys.every((key) => typeof key === 'string' && expected.includes(key))) {
     throw new AccessRecordError();
   }
   const version = ownValue(data, 'version');
@@ -109,11 +116,33 @@ export function parseAccessRecord(value: unknown): AccessRecord {
   if (state !== 'active' && state !== 'disabled') throw new AccessRecordError();
   if (!isAccessGeneration(generation)) throw new AccessRecordError();
   if (typeof updatedAt !== 'number' || !Number.isSafeInteger(updatedAt) || updatedAt < 0) throw new AccessRecordError();
-  return Object.freeze({ version: ACCESS_RECORD_VERSION, state, generation, updatedAt });
+  if (!coded) return Object.freeze({ version: ACCESS_RECORD_VERSION, state, generation, updatedAt });
+  const codeLoginExpiresAt = ownValue(data, 'codeLoginExpiresAt');
+  if (!isExpiry(codeLoginExpiresAt)) throw new AccessRecordError();
+  return Object.freeze({ version: ACCESS_RECORD_VERSION, state, generation, updatedAt, codeLoginExpiresAt });
 }
 
-/** 許可recordの有無とdataから新規利用の可否を決める（不正は一時障害）。 */
-export function accessVerdictOf(exists: boolean, data: unknown): AccessVerdict {
+/** epoch msとして有効な時刻（安全整数・非負・Dateの表現域内）。小数・負・NaN・Infinity・unsafe integerは不可。 */
+export const DATE_MAX_MS = 8_640_000_000_000_000;
+export function isEpochMs(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= DATE_MAX_MS;
+}
+const isExpiry = (value: unknown): value is number => isEpochMs(value) && value > 0;
+
+/**
+ * コードloginの期限内か（期限ちょうど以降・時刻不正・期限の形違いはfalse＝fail closed）。期限を持たない（Apple/Google）は常にtrue。
+ * Firestore TTL等の物理削除ではなく、この時刻比較で認可を止める。
+ */
+export function codeLoginWithin(expiresAt: unknown, now: unknown): boolean {
+  if (expiresAt === undefined) return true;
+  return isExpiry(expiresAt) && isEpochMs(now) && now < expiresAt;
+}
+
+/**
+ * 許可recordの有無とdataから新規利用の可否を決める（不正は一時障害）。コードloginの許可は期限（nowと比較）も確かめ、
+ * nowを渡さない呼出しでは期限付き許可をdenied（fail closed）にする。
+ */
+export function accessVerdictOf(exists: boolean, data: unknown, now?: number): AccessVerdict {
   if (!exists) return ACCESS_DENIED;
   let record: AccessRecord;
   try {
@@ -121,7 +150,10 @@ export function accessVerdictOf(exists: boolean, data: unknown): AccessVerdict {
   } catch {
     return ACCESS_UNAVAILABLE;
   }
-  return record.state === 'active' ? Object.freeze({ kind: 'allowed' as const, generation: record.generation }) : ACCESS_DENIED;
+  if (record.state !== 'active') return ACCESS_DENIED;
+  if (record.codeLoginExpiresAt === undefined) return Object.freeze({ kind: 'allowed' as const, generation: record.generation });
+  if (!codeLoginWithin(record.codeLoginExpiresAt, now)) return ACCESS_DENIED;
+  return Object.freeze({ kind: 'allowed' as const, generation: record.generation, codeLoginExpiresAt: record.codeLoginExpiresAt });
 }
 
 /** owner文書のidentityHash（無い・形違いはnull）。 */
@@ -187,5 +219,9 @@ export function nextAccessRecord(current: AccessRecord | null, desired: AccessSt
   // 欠落は既に利用不許可なので、停止で新しいrecordを作らない。
   if (current === null ? desired === 'disabled' : current.state === desired) return null;
   if (current !== null && current.generation === newGeneration) throw new AccessRecordError();
+  // コードloginの期限は管理操作（停止→再許可）でも外さない・延ばさない（無期限化しない）。
+  if (current?.codeLoginExpiresAt !== undefined) {
+    return Object.freeze({ version: ACCESS_RECORD_VERSION, state: desired, generation: newGeneration, updatedAt: now, codeLoginExpiresAt: current.codeLoginExpiresAt });
+  }
   return Object.freeze({ version: ACCESS_RECORD_VERSION, state: desired, generation: newGeneration, updatedAt: now });
 }

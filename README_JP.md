@@ -12,11 +12,13 @@ SendTextToDotsは自分で配置して使う中継サービスです。認証済
 
 ## 今回の変更
 
+- Sign in with Appleに加えて、Googleでのログイン（FirebaseのGoogle provider）を追加しました。AppleとGoogleは別のアカウント（別UID）で、メールアドレスでは統合しません。
+- コードでのログインは、成立から10分で使えなくなります（既存のMCP access tokenとtoken更新を含む）。この期限を持たない以前の版のコード接続は、新しいコードで接続し直す必要があります。Apple・Googleのログインはこの10分の対象外です。同じOAuth接続の手続きでコードを3回誤入力した時点から、コード入力は`403 session_locked`で拒否されます（再読込でも解除されません）。もう一度試すには、プラグインから新しい接続を始めてください。
 - ローカルのoperatorコンソールで発行する、任意の開発者向け6桁コード接続を追加しました。コードは10分以内に1回だけ利用でき、同じ番号は少なくとも24時間再発行しません。新しいコード接続はAppleアカウントと別の利用単位です。機能は既定offです。
 - 英語/日本語のコンソールを、ログイン方式の選択と共通の「続ける」に整理しました。コード操作は手順2、必須の受信確認は手順4、固定文の配送テストは手順5、自由文の送信は手順7にあります。
 - ほかの手順の右上に控えめな「スキップ」を追加し、同じブラウザに保存されたログインから明示的に再開できるようにしました。既存接続の再開ではコード発行やプラグインの追加し直しは不要です。スキップは確認済みと区別し、送信には受信状態の確認が必要です。
 - 画面内の言語切替で、ログイン方式・コード操作・結果メッセージも選択言語に切り替わるよう修正しました。認証のやり直しは発生しません。
-- 送信先変更の確認待ちから戻れるようにしました。プラグインの接続をAppleでやり直すと、最後の許可画面で以前の受信先設定の削除を確認でき、受信を設定し直せます。コードでの接続では削除しません。削除で止まるのは以前の受信先への新しい配送で、既に始まった配送は取り消しません。
+- 送信先変更の確認待ちから戻れるようにしました。プラグインの接続をAppleでやり直すと、最後の許可画面で以前の受信先設定の削除を確認でき、受信を設定し直せます。Googleやコードでの接続では削除しません。削除で止まるのは以前の受信先への新しい配送で、既に始まった配送は取り消しません。
 - 任意の本文暗号化API（既定off）を追加しました: [公開鍵の取得](docs/API.md#encryption-key)・[鍵の再発行](docs/API.md#encryption-key-reissue)・[暗号化した本文の送信](docs/API.md#encrypted-commands)。入力元のclientが暗号化し、SendTextToDotsが復号して配送する方式で、E2E暗号化ではありません。ローカル送信画面はこれらのAPIを使いません。
 
 詳しくは[ローカル送信画面](docs/LOCAL_CONSOLE.md)と[検証範囲](docs/LIMITATIONS.md)を参照してください。sourceの変更概要で、既存の配置環境を自動更新するものではありません。
@@ -44,7 +46,7 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 | --- | --- | --- |
 | 送信API | Cloud Functions 第2世代（`sendtexttodotsapi`） | 認証済み本文の受付、署名付き配送1回、状態照会、中止 |
 | MCP/OAuth | Cloud Run（`dist/deployment/connect.js`） | OAuth認可（interaction画面）と`/mcp`でのEvents購読。送信画面は配信しない |
-| ローカル送信画面 | 自分のパソコン（`npm run console`、`dist/console/local-server.js`） | `http://localhost:8765/console`。7手順の画面（Appleログイン・プラグイン接続の確認・テスト用指示文・受信状態の確認・固定文の送信テスト・運用用指示文、その後の自由送信）と通常送信。押した操作だけを固定のAPI/MCP originへBearer tokenつきで中継する。[LOCAL_CONSOLE](docs/LOCAL_CONSOLE.md) |
+| ローカル送信画面 | 自分のパソコン（`npm run console`、`dist/console/local-server.js`） | `http://localhost:8765/console`。7手順の画面（Apple又はGoogleでのログイン・プラグイン接続の確認・テスト用指示文・受信状態の確認・固定文の送信テスト・運用用指示文、その後の自由送信）と通常送信。押した操作だけを固定のAPI/MCP originへBearer tokenつきで中継する。[LOCAL_CONSOLE](docs/LOCAL_CONSOLE.md) |
 | 保存 | Firestore | 利用者の接続、OAuth認可、KMS封緘した購読、本文を含まないcommand状態 |
 | 鍵 | Cloud KMS・Secret Manager | 封緘鍵と、署名・cookie・識別子・digest用に分離した秘密 |
 
@@ -54,7 +56,7 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 
 - ローカルの確認版はNode.js 22.23.4・npm 10.9.9です。同じ22系列の新しいpatchを使ってください（packageの宣言は使用APIに必要な`>=22.2.0 <23`で、全22.xの検証済みではありません）。初期22.xには使用APIがないため、[INSTALL](docs/INSTALL.md)の版の条件を確認してください。
 - 請求先が有効な自分のGoogle Cloud projectと、同じprojectのFirebase。[INSTALL](docs/INSTALL.md)記載のFirestore・Cloud KMS・Secret Manager・Cloud Functions・Cloud Build・Cloud Run資源。
-- Firebase AuthenticationのApple provider。Sign in with AppleとApple Developer Program側の設定、authorized domainへのMCP originのhostの追加。
+- Firebase AuthenticationのApple provider。Sign in with AppleとApple Developer Program側の設定、authorized domainへのMCP originのhostの追加。Googleでのログインも提供する場合は、Google providerも明示的に有効にします。
 - 必要なEvents購読に対応したDots/ChatGPTの利用資格。許可するOAuth clientは`src/oauth/cimd.ts`のChatGPT CIMDに固定され、任意clientにはソース変更なしでは対応しません。
 
 外部サービスの利用資格・契約・権限・費用は導入者の責任です。このリポジトリは全体の費用上限を設定せず、無料枠内での稼働も保証しません。
@@ -66,7 +68,7 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 3. [導入手順](docs/INSTALL.md)に従い、service URLを決定し、Cloud資源・service account・runtime権限（`firebaseauth.users.get`を含む）・秘密・KMS購読markerを用意。[CONFIGURATION](docs/CONFIGURATION.md)を参照し、唯一の配置設定`src/config/deployment.ts`を編集します。
 4. `npm run build`後、`npm run package`でAPI ZIPとMCP Cloud Build source archiveをoffline作成。包装だけでは配置されません。同じ内容での再包装は`output_exists`で停止します。既存archiveの確認方法は[INSTALL](docs/INSTALL.md)を参照してください。
 5. [INSTALL](docs/INSTALL.md)のarchive配置例・origin/IAM確認に従い、APIをCloud Functions 第2世代、MCP/OAuthをDockerfile → Cloud Build → Cloud Runの順で配置します。Cloud資源作成・配置・停止のtoolは同梱されません。導入者のCloud権限が必要で、第三者projectでの手順全体の実行検証は未完了です。
-6. `console.config.example.json`を`console.local.json`へコピーし、API/MCPのoriginとFirebase Webの公開設定を入れて`npm run console -- --config console.local.json`を実行、`http://localhost:8765/console`を開きます（English/日本語）。ボタンを押すまで読み込みも送信もしません。7段階に沿って、Appleログイン → プラグインの追加と接続許可の確認（Dots/ChatGPTからOAuth接続）→ テスト用指示文をDotsへ貼って受信を開始（`text.submitted`の購読）→ 受信状態の確認（「受信中」）→ 固定文を1件送ってDotsで一致を確認 → 運用用指示文を貼る → 自由な本文を送る、の順に進めます。[LOCAL_CONSOLE](docs/LOCAL_CONSOLE.md)。
+6. `console.config.example.json`を`console.local.json`へコピーし、API/MCPのoriginとFirebase Webの公開設定を入れて`npm run console -- --config console.local.json`を実行、`http://localhost:8765/console`を開きます（English/日本語）。ボタンを押すまで読み込みも送信もしません。7段階に沿って、Appleログイン（有効にした場合はGoogleも可）→ プラグインの追加と接続許可の確認（Dots/ChatGPTからOAuth接続）→ テスト用指示文をDotsへ貼って受信を開始（`text.submitted`の購読）→ 受信状態の確認（「受信中」）→ 固定文を1件送ってDotsで一致を確認 → 運用用指示文を貼る → 自由な本文を送る、の順に進めます。[LOCAL_CONSOLE](docs/LOCAL_CONSOLE.md)。
    使う本人（自分を含む）は、運営者が管理CLIで明示登録した利用者だけです（[CONFIGURATION](docs/CONFIGURATION.md#access-admin)）。手順1のログイン後にUIDを確認して登録し、それから接続します。
 7. セットアップ後は同じ画面の手順7で通常の送信を行うか、下のAPI例を使います。手順2の「接続を解除」は確認の後に認可と購読を失効させます。
 
@@ -76,16 +78,13 @@ ownerは検証済みFirebase tokenで識別する利用者です。購読はOAut
 
 ## 自分のアプリやスクリプトから送る
 
-[1件送信するNode.js例とAPI契約](docs/API.md#direct-client-example)を使えます。Dotsを接続した利用者と同じproject・Apple認証の有効なFirebase ID tokenを渡します。例は実行するたびに実メッセージを1件送るため、結果不明時の照会に使うcommandIdを控えてください。
+[1件送信するNode.js例とAPI契約](docs/API.md#direct-client-example)を使えます。Dotsを接続した利用者と同じproject・同じApple又はGoogle認証の有効なFirebase ID tokenを渡します。例は実行するたびに実メッセージを1件送るため、結果不明時の照会に使うcommandIdを控えてください。
 
-Firebase ID tokenの寿命は約1時間です。Firebase clientの認証sessionを使う入力元はSDKで有効なtokenを取得でき、通常は毎時間Appleへ手動で再ログインする必要はありません。API例自体は渡されたtokenを使うだけで、ログインや更新は行いません。[sessionと自動送信の範囲](docs/API.md#firebase-sessions)を参照してください。
+Firebase ID tokenの寿命は約1時間です。Firebase clientの認証sessionを使う入力元はSDKで有効なtokenを取得でき、通常は毎時間AppleやGoogleへ手動で再ログインする必要はありません。API例自体は渡されたtokenを使うだけで、ログインや更新は行いません。[sessionと自動送信の範囲](docs/API.md#firebase-sessions)を参照してください。
 
 ## 今後の予定
 
-今後の開発では、次の対応を検討しています。
-
-- **Googleログイン**：Appleに加えるログイン手段。
-Googleログインはまだ利用できません。方式・対応順・提供時期は未定で、計画は変更される場合があります。本人確認は既定でFirebaseのApple providerを使い、配置が明示的に有効にした場合だけ開発者向け6桁コード（下記。既定off）も使えます。Appleでの利用には運営者による明示登録も必要です。[現在の認証とsessionの制約](docs/API.md#firebase-sessions)を確認してください。
+今後の計画は未定で、変更される場合があります。本人確認はFirebaseのApple provider、運営者がFirebaseで明示的に有効にした場合のGoogle provider、配置が明示的に有効にした場合だけの開発者向け6桁コード（下記。既定off）を使います。利用には運営者による明示登録も必要です。[現在の認証とsessionの制約](docs/API.md#firebase-sessions)を確認してください。
 
 ## 互換性
 
@@ -99,7 +98,7 @@ Googleログインはまだ利用できません。方式・対応順・提供�
 - ローカル送信画面の送信は平文（`POST /v2/commands`）だけです。画面を止めても止まるのは自分のパソコンのhelperだけで、Cloud側は引き続き利用可能で、Dotsの購読も残ります。認可と購読を失効させるには手順2の「接続を解除」を使います。Cloudのサービスの停止は導入者の操作です。
 - 本番の信頼性・負荷・費用・同UIDの複数入口・1件ごとの即時処理は保証しません。受信側でまとめて処理される場合があります。Events草案の変更も互換性に影響し得ます。
 - 使えるのは運営者が管理CLIで明示登録した利用者だけです（自分も含む）。停止・再登録の後は以前のGrant・購読で新しい送信・購読ができず、OAuthの同意と購読のやり直しが必要です。状態の照会・取消・接続解除は停止中も使えます（[CONFIGURATION](docs/CONFIGURATION.md#access-admin)）。
-- 本人確認はFirebaseのApple providerと、配置が明示的に有効にした場合（`developerLogin: 'operator-code-v1'`）だけの開発者向け6桁コードの利用単位です。認証省略や任意endpoint・資格・emulator・HTTP経由の設定overrideはありません。
+- 本人確認はFirebaseのApple provider、運営者がFirebase Authenticationで有効にした場合のGoogle provider（Appleとは別UIDで、メールアドレスでは統合しません）、配置が明示的に有効にした場合（`developerLogin: 'operator-code-v1'`）だけの開発者向け6桁コードの利用単位です。認証省略や任意endpoint・資格・emulator・HTTP経由の設定overrideはありません。
 - 本serviceは本文を永続保存しません。期限切れの保存metadataは利用不可になりますが、物理削除とaccount全削除は未実装です。受信後の保持・処理は受信サービスの条件に従います。RAM・SDK・OS内の物理消去も保証しません。
 - MITが許諾するのは本sourceで、外部サービスやSDKの利用権を再許諾しません。[SECURITY](docs/SECURITY.md)と[LIMITATIONS](docs/LIMITATIONS.md)を参照してください。
 
@@ -131,7 +130,7 @@ Googleログインはまだ利用できません。方式・対応順・提供�
 
 ## 開発者向け6桁コード（任意・既定off）
 
-自分で配置したコンソールのoperator modeでは、Appleの代わりに6桁のコードで接続できます。コードは発行から10分以内に1回だけ使え、同じ番号は少なくとも24時間発行しません。コードごとに新しい利用単位になり、接続後の送信回数は制限しません。詳しくは[ローカル送信画面](docs/LOCAL_CONSOLE.md)・[設定](docs/CONFIGURATION.md)・[セキュリティ](docs/SECURITY.md)を参照してください。
+自分で配置したコンソールのoperator modeでは、AppleやGoogleの代わりに6桁のコードで接続できます。未使用のコードは発行から10分以内に1回だけ使え、同じ番号は少なくとも24時間発行しません。コードでのログインが成立した後、その利用単位と接続（Grant）を使えるのは10分間で、その後は新しいコードで接続し直します。コードごとに新しい利用単位になり、接続後の送信回数は制限しません。詳しくは[ローカル送信画面](docs/LOCAL_CONSOLE.md)・[設定](docs/CONFIGURATION.md)・[セキュリティ](docs/SECURITY.md)を参照してください。
 
 コードで接続するには、機能を有効にし、[設定・起動手順](docs/LOCAL_CONSOLE.md#開発者向け6桁コードで接続するoperator-mode)に沿ってコンソールをoperator modeで起動します。通常の`npm run console`ではコードを発行できません。
 
@@ -139,4 +138,4 @@ Googleログインはまだ利用できません。方式・対応順・提供�
 2. 手順2のプラグイン追加方法に従い、SendTextToDotsをカスタムMCPサーバーとして追加します。続いて開く接続画面で、6桁のコードを10分以内に入力し、同意します。
 3. コンソールへ戻り、**「接続を確認」**を押します。続いて手順3・4で受信を開始・確認してから送信へ進みます。
 
-コード入力は10分の集計枠ごとに、**ログイン画面ごとに5回・接続元ごとに5回**までです。**配置全体のコード認証で失敗が5回**に達すると、全体の集計枠が終了するまで正しいコードも含めて以後の試行を拒否します。同じ配置のほかの利用者も一時的に接続できなくなる場合があります。これはコード入力の上限で、接続後には通常のAPI送信制限が適用されます。[セキュリティ](docs/SECURITY.md#開発者向け6桁コード)も参照してください。
+コード入力は10分の集計枠ごとに、**ログイン画面ごとに5回・接続元ごとに5回**までです。**配置全体のコード認証で失敗が5回**に達すると、全体の集計枠が終了するまで正しいコードも含めて以後の試行を拒否します。同じ配置のほかの利用者も一時的に接続できなくなる場合があります。これらの上限は`429 rate_limited`で応答します。これとは別に、同じOAuth接続の手続きでコードを3回誤入力した時点から、コード入力は`403 session_locked`で拒否されます。このロックは集計枠の終了や再読込では解除されず、もう一度試すにはプラグインから新しい接続を始めます（プラグインの削除は必須ではありません）。これはコード入力の上限で、接続後には通常のAPI送信制限が適用されます。[セキュリティ](docs/SECURITY.md#開発者向け6桁コード)も参照してください。
