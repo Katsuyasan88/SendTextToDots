@@ -567,7 +567,19 @@ export async function createSubscriptionRuntime() {
     }
   };
   const subscriptionOf = (ownerId) => docs.get(`sttdAuth/${SUB_NS}/subscriptions/${ownerId}`)?.data;
-  return { db, docs, NS, sources, connect, sent, enroll, bind, subscribe, subscriptionOf, close: () => runtime.close?.() };
+  // 通常MCPの受信状態照会（statusFor）を、同じ実ConnectStorage（sourceを結んだstrict）・同じ合成DBで組み立てる。
+  const { createKmsConnectionSubscriptionView } = await import('../../dist/events/kms-subscription-view.js');
+  const view = createKmsConnectionSubscriptionView({ db, connect, connectNamespace: NS, resource: RESOURCE, kms: { ...baseKms, namespace: SUB_NS, transport }, clock });
+  const status = async (auth) => {
+    try {
+      return { ok: true, value: await view.statusFor(auth, op()) };
+    } catch (error) {
+      return { ok: false, kind: error?.code ?? error?.name };
+    }
+  };
+  /** 全文書の版（照会の書込み0の確認）。 */
+  const versions = () => JSON.stringify([...docs].map(([path, entry]) => [path, entry.updateTime]));
+  return { db, docs, NS, sources, connect, sent, enroll, bind, subscribe, subscriptionOf, status, versions, close: () => (view.dispose(), runtime.close?.()) };
 }
 
 /**

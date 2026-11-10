@@ -48,16 +48,19 @@ function socketPair() {
   return [a, b];
 }
 
-function build({ subscribe = async () => ({ id: 'synthetic-sub-id', refreshBefore: null }), audit, budgetMs, resolveNull = false } = {}) {
+function build({ subscribe = async () => ({ id: 'synthetic-sub-id', refreshBefore: null }), audit, budgetMs, resolveNull = false, receivingStatus, resolved, clock = { now: () => Date.now() } } = {}) {
   const errors = [];
   const calls = { subscribe: 0, unsubscribe: 0 };
+  // 照会portの呼出しは非列挙で持つ（既存のcallsの完全一致の検査を変えない）。
+  Object.defineProperty(calls, 'status', { value: [], enumerable: false });
   const entry = createRequestScopedMcpEntry(
     {
       issuer: ISSUER,
       resource: RESOURCE,
-      clock: { now: () => Date.now() },
+      clock,
       // SDKのverifyBearerTokenはexpiresAtを秒で比べる（expiresAt < Date.now() / 1000）。
-      resolveOAuthOwner: async () => (resolveNull ? null : { ownerId: OWNER, grantId: GRANT, clientId: 'synthetic-client', scopes: [STTD_SCOPE], expiresAt: Math.floor(Date.now() / 1000) + 3600 }),
+      resolveOAuthOwner: async () =>
+        resolveNull ? null : { ownerId: OWNER, grantId: GRANT, clientId: 'synthetic-client', scopes: [STTD_SCOPE], expiresAt: Math.floor(Date.now() / 1000) + 3600, ...resolved },
       subscriptions: {
         subscribe: (...args) => {
           calls.subscribe += 1;
@@ -69,6 +72,16 @@ function build({ subscribe = async () => ({ id: 'synthetic-sub-id', refreshBefor
       },
       onError: (category) => errors.push(category),
       ...(budgetMs === undefined ? {} : { budgetMs }),
+      ...(receivingStatus === undefined
+        ? {}
+        : {
+            receivingStatus: {
+              statusFor: (...args) => {
+                calls.status.push(args);
+                return receivingStatus(...args);
+              },
+            },
+          }),
     },
     audit,
   );
@@ -91,7 +104,7 @@ function reply(response) {
 }
 
 /** 1要求をmemoryのsocketで送り、statusと本文だけを返す（接続の破棄はstatus 0）。 */
-function rpc(entry, method, params) {
+function rpc(entry, method, params, extraHeaders = {}) {
   const server = createServer((req, res) => {
     entry.handle(req, res).catch(() => {});
   });
@@ -112,6 +125,7 @@ function rpc(entry, method, params) {
           'mcp-protocol-version': '2026-07-28',
           'mcp-method': method,
           'content-length': Buffer.byteLength(body),
+          ...extraHeaders,
         },
       },
       (res) => {
@@ -270,4 +284,190 @@ test('through the diagnostic sink only fixed lines are written; unknown categori
   assert.ok(!lines.join('\n').match(/synthetic|invalid|secret|owner|grant-|token|message|url/i));
   const server = readFileSync(new URL('../dist/connect/kms-server.js', import.meta.url), 'utf8');
   assert.ok(server.includes("'events.subscribed'") && server.includes("'events.subscribe_failed'"));
+});
+
+// ---------- get_receiving_status（状態照会portを渡された入口だけ） ----------
+const TOOL = 'get_receiving_status';
+const callTool = (entry, params) => rpc(entry, 'tools/call', params, { 'mcp-name': typeof params.name === 'string' ? params.name : 'x' });
+const EXPECTED_TOOL = {
+  name: TOOL,
+  inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  outputSchema: { type: 'object', properties: { state: { type: 'string', enum: ['change_pending', 'subscribed', 'expired', 'linked'] } }, required: ['state'], additionalProperties: false },
+  annotations: { title: 'Get receiving status', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+test('R01 discovery: without a status port tools/list stays empty and tools/call is not provided; with the port exactly one read-only tool', async () => {
+  const plain = build();
+  const listed = reply(await rpc(plain.entry, 'tools/list', {}));
+  assert.deepEqual(listed.result.tools, []);
+  const missing = reply(await callTool(plain.entry, { name: TOOL }));
+  assert.ok('error' in missing);
+  assert.equal(missing.error.code, -32601, 'method not found without the port');
+
+  const withPort = build({ receivingStatus: async () => 'linked' });
+  const tools = reply(await rpc(withPort.entry, 'tools/list', {})).result.tools;
+  assert.equal(tools.length, 1);
+  const [tool] = tools;
+  assert.deepEqual({ name: tool.name, inputSchema: tool.inputSchema, outputSchema: tool.outputSchema, annotations: tool.annotations }, EXPECTED_TOOL);
+  assert.equal(tool.title, 'Get receiving status');
+  assert.match(tool.description, /receiving status|ready to receive/i);
+  assert.match(tool.description, /account-level/);
+  assert.match(tool.description, /read-only/i);
+  assert.deepEqual(withPort.calls.status, [], 'listing performs no status I/O');
+  // 状態照会portは決まった形だけ（statusForのmethod）。
+  for (const receivingStatus of [{}, { statusFor: 1 }, Object.defineProperty({}, 'statusFor', { get: () => async () => 'linked' })]) {
+    assert.throws(
+      () =>
+        createRequestScopedMcpEntry({
+          issuer: ISSUER,
+          resource: RESOURCE,
+          clock: { now: () => Date.now() },
+          resolveOAuthOwner: async () => null,
+          subscriptions: { subscribe: async () => ({}), unsubscribe: async () => {} },
+          onError: () => {},
+          receivingStatus,
+        }),
+      McpRequestEntryConfigError,
+    );
+  }
+});
+
+test('R02 call: arguments omitted and {} both succeed; structured and text results carry the same single state; the port gets only the authenticated owner/Grant and the request operation', async () => {
+  for (const state of ['linked', 'subscribed', 'expired', 'change_pending']) {
+    for (const params of [{ name: TOOL }, { name: TOOL, arguments: {} }]) {
+      const built = build({ receivingStatus: async () => state });
+      const response = await callTool(built.entry, params);
+      const message = reply(response);
+      assert.ok('result' in message, `${state} ${response.body.slice(0, 300)}`);
+      const { result } = message;
+      assert.deepEqual(result.structuredContent, { state });
+      assert.equal(result.isError, false);
+      assert.deepEqual(result.content, [{ type: 'text', text: JSON.stringify({ state }) }]);
+      assert.equal(built.calls.status.length, 1);
+      const [auth, operation] = built.calls.status[0];
+      assert.deepEqual(auth, { ownerId: OWNER, grantId: GRANT });
+      assert.ok(Object.isFrozen(auth));
+      assert.deepEqual(Object.keys(operation).sort(), ['deadlineAt', 'signal']);
+      assert.ok(operation.signal instanceof AbortSignal);
+      assert.ok(!response.body.includes(OWNER) && !response.body.includes(GRANT) && !response.body.includes(TOKEN));
+    }
+  }
+});
+
+test('R03 unknown tool, extra or mistyped arguments: errors with status I/O 0', async () => {
+  const built = build({ receivingStatus: async () => 'subscribed' });
+  for (const params of [
+    { name: 'get_receiving_status_v2' },
+    { name: 'send_text' },
+    { name: TOOL, arguments: { owner: OWNER } },
+    { name: TOOL, arguments: { state: 'subscribed' } },
+    { name: TOOL, arguments: [] },
+    { name: TOOL, arguments: 'x' },
+    { name: TOOL, arguments: null },
+    { name: 1 },
+  ]) {
+    const response = await callTool(built.entry, params);
+    const message = JSON.parse(response.body || '{}');
+    assert.ok(response.status !== 200 || 'error' in message, `${JSON.stringify(params)} ${response.body.slice(0, 200)}`);
+    assert.ok(!('result' in message));
+    assert.ok(!/subscribed|linked|expired|change_pending/.test(response.body.replace(/"state"/g, '')), 'no state in the error');
+  }
+  assert.equal(built.calls.status.length, 0);
+});
+
+test('R04 port failures and request end: fixed errors without a state or internal values; revoked -> existing Forbidden access_revoked; deadline/close -> no success', async () => {
+  const leak = `${OWNER} ${GRANT} ${CALLBACK} ${SECRET}`;
+  const cases = [
+    [async () => Promise.reject(new SubscribeError({ kind: 'grant_inactive' })), (error) => assert.equal(error.data?.reason, 'access_revoked')],
+    [async () => Promise.reject(new SubscribeError({ kind: 'conflict' })), (error) => assert.equal(error.message, 'Subscription changed concurrently')],
+    [async () => Promise.reject(new Error(`synthetic ${leak}`)), (error) => assert.equal(error.message, 'Internal error')],
+    [async () => 'unlinked', (error) => assert.equal(error.message, 'Internal error')],
+    [async () => ({ state: 'subscribed' }), (error) => assert.equal(error.message, 'Internal error')],
+  ];
+  for (const [receivingStatus, check] of cases) {
+    const built = build({ receivingStatus });
+    const response = await callTool(built.entry, { name: TOOL });
+    const message = reply(response);
+    assert.ok('error' in message, response.body.slice(0, 300));
+    check(message.error);
+    assert.equal(built.calls.status.length, 1);
+    assert.ok(!response.body.includes('synthetic') && !response.body.includes(OWNER) && !response.body.includes(GRANT));
+    assert.ok(!/"state"/.test(response.body));
+  }
+  // grant_inactiveは既存のForbidden（events/subscribeと同じcode・reason）。
+  const revoked = build({ receivingStatus: async () => Promise.reject(new SubscribeError({ kind: 'grant_inactive' })) });
+  const subscribeRevoked = build({ subscribe: failing({ kind: 'grant_inactive' }) });
+  const a = reply(await callTool(revoked.entry, { name: TOOL })).error;
+  const b = reply(await rpc(subscribeRevoked.entry, 'events/subscribe', subscribeParams())).error;
+  assert.deepEqual([a.code, a.message, a.data], [b.code, b.message, b.data]);
+  // 期限: 応答を書かずに接続を終える（成功を返さない）。
+  const late = build({ receivingStatus: () => new Promise(() => {}), budgetMs: 200 });
+  assert.equal((await callTool(late.entry, { name: TOOL })).status, 0);
+  // 遅い成功: portの値が返る前に期限を過ぎたら採用しない。
+  const slow = build({ receivingStatus: () => new Promise((resolve) => setTimeout(() => resolve('subscribed'), 400)), budgetMs: 200 });
+  const slowResponse = await callTool(slow.entry, { name: TOOL });
+  assert.equal(slowResponse.status, 0);
+  // close: 進行中の照会は成功を返さず、以後は固定の503。
+  let started;
+  const reached = new Promise((resolve) => {
+    started = resolve;
+  });
+  const closing = build({
+    receivingStatus: () =>
+      new Promise((resolve) => {
+        started();
+        setTimeout(() => resolve('subscribed'), 100);
+      }),
+  });
+  const pending = callTool(closing.entry, { name: TOOL });
+  await reached;
+  await closing.entry.close();
+  const closed = await pending;
+  assert.ok(closed.status === 0 || !/"result"/.test(closed.body), `${closed.status} ${closed.body.slice(0, 200)}`);
+  assert.equal((await callTool(closing.entry, { name: TOOL })).status, 503);
+  // 未認証: SDKの401（port 0）。scope不足・別resourceはSDKのBearer検証で拒否（port 0）。
+  const unauth = build({ resolveNull: true, receivingStatus: async () => 'linked' });
+  assert.equal((await callTool(unauth.entry, { name: TOOL })).status, 401);
+  const noScope = build({ resolved: { scopes: ['openid'] }, receivingStatus: async () => 'linked' });
+  assert.equal((await callTool(noScope.entry, { name: TOOL })).status, 403);
+  const expired = build({ resolved: { expiresAt: Math.floor(Date.now() / 1000) - 10 }, receivingStatus: async () => 'linked' });
+  assert.equal((await callTool(expired.entry, { name: TOOL })).status, 401);
+  assert.deepEqual([unauth.calls.status.length, noScope.calls.status.length, expired.calls.status.length], [0, 0, 0]);
+});
+
+test('R05 access token expiry during the query: the token was valid at the start; the synthetic clock reaches exactly its expiresAt while the port is pending; the port succeeds but no state is returned', async () => {
+  // SDKのBearer検証（実時計・秒）を通る期限。入口の捕捉clockだけを合成のoffsetで進める（要求期限20秒の内側）。
+  const expiresAt = Math.floor(Date.now() / 1000) + 10;
+  const offset = { ms: 0 };
+  const clock = { now: () => Date.now() + offset.ms };
+  const resolved = { expiresAt };
+  const toExpiry = () => {
+    offset.ms = expiresAt * 1000 - Date.now();
+  };
+  // 照会中に期限と等しい時刻へ進める → portの成功値を採用しない。
+  const during = build({
+    clock,
+    resolved,
+    receivingStatus: async () => {
+      toExpiry();
+      return 'subscribed';
+    },
+  });
+  const response = await callTool(during.entry, { name: TOOL });
+  const message = reply(response);
+  assert.ok('error' in message, response.body.slice(0, 300));
+  assert.equal(message.error.message, 'Access token expired');
+  assert.equal(during.calls.status.length, 1, 'the port was called and succeeded');
+  assert.ok(!/"state"|subscribed/.test(response.body));
+  // 対照: 同じ期限のtokenで時計を進めなければ状態を返す。
+  offset.ms = 0;
+  const control = build({ clock, resolved, receivingStatus: async () => 'subscribed' });
+  assert.deepEqual(reply(await callTool(control.entry, { name: TOOL })).result.structuredContent, { state: 'subscribed' });
+  // 照会の開始前に入口の時計が期限へ達していれば、portを呼ばない（状態なし）。
+  const before = build({ clock: { now: () => expiresAt * 1000 }, resolved, receivingStatus: async () => 'subscribed' });
+  const refused = reply(await callTool(before.entry, { name: TOOL }));
+  assert.equal(refused.error?.message, 'Access token expired');
+  assert.equal(before.calls.status.length, 0);
+  // 通常のイベントは従来どおり（tokenの期限検査を追加しない）: 同じ時計でもevents/listは成功する。
+  assert.ok('result' in reply(await rpc(before.entry, 'events/list', {})));
 });

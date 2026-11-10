@@ -76,7 +76,7 @@ const borrowed = { closes: 0 };
 function fakeDb(projectId = PROJECT) {
   const docs = new Map();
   let tick = 0;
-  const stats = { transactions: 0, closures: 0, txWrites: 0, maxAttempts: [], getAll: 0 };
+  const stats = { transactions: 0, closures: 0, txWrites: 0, maxAttempts: [], getAll: 0, reads: 0, grantReads: 0 };
   const control = { holdGetAll: null, inClosure: 0 };
   function stamp() {
     tick += 1;
@@ -145,6 +145,8 @@ function fakeDb(projectId = PROJECT) {
       const tx = {
         async getAll(...refs) {
           stats.getAll += 1;
+          stats.reads += refs.length;
+          stats.grantReads += refs.filter((ref) => ref.path.includes('/oidc/')).length;
           const hold = control.holdGetAll;
           if (hold) {
             control.holdGetAll = null;
@@ -1325,4 +1327,244 @@ test('U20 receiver reset generation: a Grant of the previous receiver generation
   const ok = await subscribe(auth, input(newUrl('u20b'), newSecret()));
   assert.equal(typeof ok.value?.id, 'string');
   assert.equal(dataOf(subPath(auth.ownerId)).active.id, ok.value.id);
+});
+
+// ---------- 受信状態の照会（statusFor: 通常MCPのget_receiving_statusが使う読取り専用の入口） ----------
+// 同じfake DB・合成KMS（開封の直後に1回だけhookを呼べるtransport）で、状態・書込み0・点読み数・拒否を確かめる。
+const statusHooks = { onDecrypt: null, failDecrypt: false };
+const statusTransport = {
+  async decrypt(request, options) {
+    if (statusHooks.failDecrypt) throw new Error(`synthetic kms failure ${RESOURCE}`);
+    const result = await kms.transport.decrypt(request, options);
+    const hook = statusHooks.onDecrypt;
+    statusHooks.onDecrypt = null;
+    hook?.();
+    return result;
+  },
+};
+const statusTally = [];
+let viewModule;
+const views = [];
+async function makeView(overrides = {}) {
+  viewModule ??= await import('../dist/events/kms-subscription-view.js');
+  const view = viewModule.createKmsConnectionSubscriptionView({ db, connect, connectNamespace: NS, resource: RESOURCE, kms: { ...baseKms, namespace: SUB_NS, transport: statusTransport }, clock: clockOption, ...overrides });
+  views.push(view);
+  return view;
+}
+async function statusOf(view, auth, operation = op()) {
+  try {
+    return { ok: true, value: await view.statusFor(auth, operation) };
+  } catch (error) {
+    errors.push(error);
+    return { ok: false, code: error?.code, error };
+  }
+}
+/** 同じdataのまま文書の版だけを進める（別要求による再保存の合成）。 */
+const restamp = (path) => {
+  const entry = db.docs.get(path);
+  db.docs.set(path, { data: entry.data, updateTime: { seconds: entry.updateTime.seconds + 1_000_000, nanoseconds: 7 } });
+};
+/** 全文書の版（書込み0の証拠: 1つでも作成・更新・削除があれば変わる）。 */
+const allVersions = () => canonical([...db.docs].map(([path, entry]) => [path, entry.updateTime]));
+/** 照会1回の計数（KMS・tx・送出・書込み・点読み）。 */
+function statusCounter() {
+  const base = counter();
+  const start = { reads: db.stats.reads, grantReads: db.stats.grantReads, versions: allVersions() };
+  return () => ({ ...base(), reads: db.stats.reads - start.reads, grantReads: db.stats.grantReads - start.grantReads, unchanged: allVersions() === start.versions });
+}
+async function expectStatus(view, auth, expected, label, operation) {
+  const count = statusCounter();
+  const result = await statusOf(view, auth, operation);
+  const c = count();
+  assert.equal(result.ok, true, `${label}: ${result.code}`);
+  assert.equal(result.value, expected, label);
+  assert.deepEqual({ encrypt: c.encrypt, sent: c.sent, writes: c.writes, tx: c.tx, unchanged: c.unchanged }, { encrypt: 0, sent: 0, writes: 0, tx: 2, unchanged: true }, label);
+  assert.ok(c.decrypt >= 1 && c.decrypt <= 3, `${label}: decrypt ${c.decrypt}`);
+  assert.ok(c.grantReads <= 6, `${label}: grant point reads ${c.grantReads} (<=3 per transaction)`);
+  statusTally.push({ label, decrypt: c.decrypt, reads: c.reads, grantReads: c.grantReads });
+  return c;
+}
+async function expectRefused(view, auth, code, label, operation) {
+  const count = statusCounter();
+  const result = await statusOf(view, auth, operation);
+  const c = count();
+  assert.equal(result.ok, false, `${label}: unexpected ${result.value}`);
+  assert.equal(result.code, code, label);
+  assert.ok(result.error instanceof viewModule.KmsConnectionSubscriptionViewError, label);
+  assert.equal(result.error.cause, undefined);
+  assert.deepEqual({ encrypt: c.encrypt, sent: c.sent, writes: c.writes, unchanged: c.unchanged }, { encrypt: 0, sent: 0, writes: 0, unchanged: true }, label);
+  assert.ok(c.decrypt <= 3 && c.grantReads <= 6, label);
+  statusTally.push({ label, refused: code, decrypt: c.decrypt, reads: c.reads, grantReads: c.grantReads });
+  return c;
+}
+after(() => {
+  for (const view of views) view.dispose();
+  process.stdout.write(`# RECEIVING_STATUS_COUNTS cases=${statusTally.length} maxDecrypt=${Math.max(...statusTally.map((t) => t.decrypt))} maxGrantReads=${Math.max(...statusTally.map((t) => t.grantReads))} maxReads=${Math.max(...statusTally.map((t) => t.reads))} ${statusTally.map((t) => `${t.label.replace(/\s+/g, '_')}:${t.refused ?? 'ok'}/d${t.decrypt}/g${t.grantReads}/r${t.reads}`).join(' ')}\n`);
+});
+
+test('U21 receiving status: linked/subscribed/expired/change_pending/after unsubscribe; same-owner other Grant; other owner; in-memory projection only (Web viewFor still saves)', { timeout: 30_000 }, async () => {
+  const view = await makeView();
+  const a = await who();
+  await expectStatus(view, a, 'none', 'linked before subscribe');
+  const url = newUrl('u21');
+  assert.equal((await subscribe(a, input(url, newSecret(), { ttlMs: 60_000 }))).ok, true);
+  await expectStatus(view, a, 'subscribed', 'subscribed');
+  // 同じownerの有効な別Grant: アカウントの状態だけ（要求Grant＋束縛Grantの2件を開封）。
+  const sibling = { ownerId: a.ownerId, grantId: await newGrant(a.ownerId) };
+  const c = await expectStatus(view, sibling, 'subscribed', 'same owner other Grant');
+  assert.equal(c.decrypt, 2);
+  // 別owner: 自分の状態だけ。他ownerのowner/Grantの組合せは拒否。
+  const b = await who();
+  await expectStatus(view, b, 'none', 'other owner sees only its own state');
+  await expectRefused(view, { ownerId: a.ownerId, grantId: b.grantId }, 'grant_inactive', 'Grant of another owner');
+  await expectRefused(view, { ownerId: b.ownerId, grantId: a.grantId }, 'grant_inactive', 'owner with a foreign Grant');
+  // 送信先の変更確認待ちは有効な購読より優先する。
+  assert.equal((await subscribe(a, input(newUrl('u21b'), newSecret()))).kind, 'sub:destination_change_pending');
+  assert.ok(dataOf(subPath(a.ownerId)).active && dataOf(subPath(a.ownerId)).pending);
+  await expectStatus(view, a, 'change_pending', 'change_pending over subscribed');
+
+  // 保留取下げ（保留を束縛したGrantの失効）: 照会では投影するが保存しない。
+  const p = await who();
+  assert.equal((await subscribe(p, input(newUrl('u21p'), newSecret()))).ok, true);
+  const pendGrant = await newGrant(p.ownerId);
+  assert.equal((await subscribe({ ownerId: p.ownerId, grantId: pendGrant }, input(newUrl('u21q'), newSecret()))).kind, 'sub:destination_change_pending');
+  db.docs.delete(connect.grantDocRef(pendGrant).path);
+  await expectStatus(view, p, 'subscribed', 'pending withdrawn in memory');
+  assert.ok(dataOf(subPath(p.ownerId)).pending, 'the stored pending is not removed by the query');
+
+  // 有効な購読のGrantが失効 → 別の有効なGrantからの照会は購読待ち（保存しない）。
+  const g = await who();
+  assert.equal((await subscribe(g, input(newUrl('u21g'), newSecret()))).ok, true);
+  const g2 = { ownerId: g.ownerId, grantId: await newGrant(g.ownerId) };
+  db.docs.delete(connect.grantDocRef(g.grantId).path);
+  await expectStatus(view, g2, 'none', 'bound Grant ended');
+  assert.ok(dataOf(subPath(g.ownerId)).active, 'the stored active is not removed by the query');
+
+  // 期限切れ: 照会はexpired（保存なし）。Webの既存viewForは従来どおり整理結果を保存する。
+  const e = await who();
+  assert.equal((await subscribe(e, input(newUrl('u21e'), newSecret(), { ttlMs: 1_000 }))).ok, true);
+  advance(2_000);
+  await expectStatus(view, e, 'expired', 'expired');
+  assert.ok(dataOf(subPath(e.ownerId)).active, 'query keeps the stored record');
+  const writes = db.stats.txWrites;
+  assert.equal(await view.viewFor(e.ownerId, op()), 'expired');
+  assert.equal(db.stats.txWrites - writes, 1, 'Web viewFor saves the projection as before');
+  assert.equal(dataOf(subPath(e.ownerId)).active, null);
+  await expectStatus(view, e, 'expired', 'expired after Web projection');
+
+  // 購読解除の後は購読待ち。
+  const u = await who();
+  const uUrl = newUrl('u21u');
+  assert.equal((await subscribe(u, input(uUrl, newSecret()))).ok, true);
+  assert.equal((await unsubscribe(u, { name: EVENT, url: uUrl })).ok, true);
+  await expectStatus(view, u, 'none', 'after unsubscribe');
+});
+
+test('U22 receiving status refusals: inactive/revoked/stopped/old generation/scope; changes during the query; storage/KMS failures; abort/deadline/dispose; invalid input; never a state, never a write', { timeout: 30_000 }, async () => {
+  const view = await makeView();
+  // 失効（削除）したGrant・期限切れのpayload・scope不足: 開封の有無にかかわらず状態なし。
+  {
+    const a = await who();
+    db.docs.delete(connect.grantDocRef(a.grantId).path);
+    assert.equal((await expectRefused(view, a, 'grant_inactive', 'deleted Grant')).decrypt, 0);
+    const scopeless = { ownerId: a.ownerId, grantId: await newGrant(a.ownerId, { resources: { [RESOURCE]: 'openid' } }) };
+    await expectRefused(view, scopeless, 'grant_inactive', 'Grant without sttd:events');
+    const otherResource = { ownerId: a.ownerId, grantId: await newGrant(a.ownerId, { resources: { 'https://other.sttd-subscriptions.invalid/mcp': 'sttd:events' } }) };
+    await expectRefused(view, otherResource, 'grant_inactive', 'Grant for another resource');
+  }
+  // ownerの失効・利用許可の停止/欠落・旧世代のGrant・受信reset世代違い。
+  {
+    const a = await who();
+    db.write(ownerPath(a.ownerId), { ...dataOf(ownerPath(a.ownerId)), revokedAt: Math.floor(clockState.value) });
+    await expectRefused(view, a, 'grant_inactive', 'revoked owner');
+  }
+  {
+    const a = await who();
+    assert.equal((await subscribe(a, input(newUrl('u22s'), newSecret()))).ok, true);
+    setAccess(a.ownerId, 'disabled');
+    await expectRefused(view, a, 'grant_inactive', 'access stopped');
+    db.docs.delete(accessPath(accessOf.get(a.ownerId).identityHash));
+    await expectRefused(view, a, 'grant_inactive', 'access record missing');
+    // 再有効化（新世代）: 旧Grantは別の有効な購読を見られない。新世代のGrantだけが状態を見る。
+    setAccess(a.ownerId, 'active');
+    const fresh = { ownerId: a.ownerId, grantId: await newGrant(a.ownerId) };
+    assert.equal((await subscribe(fresh, input(newUrl('u22t'), newSecret()))).kind, 'sub:destination_change_pending');
+    await expectRefused(view, a, 'grant_inactive', 'old-generation caller Grant');
+    await expectStatus(view, fresh, 'change_pending', 'current-generation Grant');
+    // 不正な許可record・同意記録は一時障害（許可・拒否へ読み替えない）。
+    db.write(accessPath(accessOf.get(a.ownerId).identityHash), { version: 2, state: 'active', generation: accessOf.get(a.ownerId).generation, updatedAt: 1 });
+    await expectRefused(view, fresh, 'unavailable', 'malformed access record');
+    setAccess(a.ownerId, 'active', accessOf.get(a.ownerId).generation);
+    const meta = dataOf(metaPath(fresh.grantId));
+    db.write(metaPath(fresh.grantId), { ...meta, accessGeneration: 'not-a-generation' });
+    await expectRefused(view, fresh, 'unavailable', 'malformed consent record');
+    db.write(metaPath(fresh.grantId), meta);
+    db.write(ownerPath(a.ownerId), { ...dataOf(ownerPath(a.ownerId)), receiverGeneration: 1 });
+    await expectRefused(view, fresh, 'grant_inactive', 'receiver reset generation differs');
+  }
+  // 照会中（開封の直後）の失効・停止・版の変化: 最終snapshotで拒否・競合。
+  for (const [label, change, code] of [
+    ['Grant deleted during the query', (a) => db.docs.delete(connect.grantDocRef(a.grantId).path), 'grant_inactive'],
+    ['access stopped during the query', (a) => setAccess(a.ownerId, 'disabled'), 'grant_inactive'],
+    ['owner generation changed during the query', (a) => db.write(ownerPath(a.ownerId), { ...dataOf(ownerPath(a.ownerId)), subscriptionGeneration: 7 }), 'conflict'],
+    ['subscription re-saved during the query', (a) => restamp(subPath(a.ownerId)), 'conflict'],
+    ['Grant re-saved during the query', (a) => restamp(connect.grantDocRef(a.grantId).path), 'conflict'],
+  ]) {
+    const a = await who();
+    assert.equal((await subscribe(a, input(newUrl('u22c'), newSecret()))).ok, true);
+    const versions = allVersions();
+    let fired = 0;
+    statusHooks.onDecrypt = () => {
+      fired += 1;
+      change(a);
+    };
+    const result = await statusOf(view, a);
+    statusHooks.onDecrypt = null;
+    assert.equal(fired, 1, label);
+    assert.deepEqual([result.ok, result.code], [false, code], label);
+    assert.notEqual(allVersions(), versions, `${label}: only the synthetic change`);
+    statusTally.push({ label, refused: code, decrypt: 1, reads: 0, grantReads: 0 });
+  }
+  // DB/KMS異常: 固定unavailable（元の例外・値を持たない）。
+  {
+    const a = await who();
+    statusHooks.failDecrypt = true;
+    await expectRefused(view, a, 'unavailable', 'KMS failure');
+    statusHooks.failDecrypt = false;
+    const noMarker = await makeView({ kms: { ...baseKms, namespace: `t268_${randomUUID()}`, transport: statusTransport } });
+    await expectRefused(noMarker, a, 'unavailable', 'marker missing');
+    const broken = await who();
+    db.write(subPath(broken.ownerId), { version: 2, broken: true });
+    await expectRefused(view, broken, 'unavailable', 'corrupt subscription document');
+    // 利用許可の判定を持たない接続保存: I/Oの前にunavailable。
+    const minimal = await makeView({
+      connect: {
+        ownerDocRef: (id) => connect.ownerDocRef(id),
+        grantDocRef: (id) => connect.grantDocRef(id),
+        ownerDocActive: (data, now) => connect.ownerDocActive(data, now),
+        grantDocLive: (data, ownerId, grantId, now) => connect.grantDocLive(data, ownerId, grantId, now),
+      },
+    });
+    assert.equal((await expectRefused(minimal, a, 'unavailable', 'no access decision port')).tx, 0);
+  }
+  // 中止・期限・dispose（照会の途中）と、開始前の中止・不正な入力。
+  {
+    const a = await who();
+    const controller = new AbortController();
+    statusHooks.onDecrypt = () => controller.abort();
+    await expectRefused(view, a, 'aborted', 'aborted during the query', op({ signal: controller.signal }));
+    statusHooks.onDecrypt = () => advance(50);
+    await expectRefused(view, a, 'timed_out', 'deadline during the query', op({ deadlineAt: clockState.value + 20 }));
+    const local = await makeView();
+    statusHooks.onDecrypt = () => local.dispose();
+    await expectRefused(local, a, 'closed', 'disposed during the query');
+    statusHooks.onDecrypt = null;
+    assert.equal((await expectRefused(local, a, 'closed', 'after dispose')).tx, 0);
+    const aborted = new AbortController();
+    aborted.abort();
+    assert.equal((await expectRefused(view, a, 'aborted', 'aborted before start', op({ signal: aborted.signal }))).tx, 0);
+    for (const bad of [{ ...a, extra: 1 }, { ownerId: 'not-a-uuid', grantId: a.grantId }, { ownerId: a.ownerId }, null]) {
+      assert.equal((await expectRefused(view, bad, 'invalid_input', 'invalid auth')).tx, 0);
+    }
+  }
 });

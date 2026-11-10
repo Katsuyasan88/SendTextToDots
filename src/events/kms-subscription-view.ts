@@ -10,19 +10,25 @@
 // 各要求は元deadlineと開始+20000msの短い方を一度だけ決め（延長しない）、親signalとdisposeへ結んだ子operationを全工程へ同じobjectで渡す。
 // 開始前・各await後・次のI/O前・閉包の更新前・返却前にsignal→時計→signalで検査し、遅い成功を採用しない（既に始めたSDK commitの物理的な取消は
 // 約束しない）。外へ出す失敗は固定のKmsConnectionSubscriptionViewErrorだけで、元の例外・owner・Grant・文書の値を持たない。
+// statusForは通常MCPの受信状態照会（読取りだけ）。要求Grant（先頭）とactive/pendingの束縛Grant（重複なし・最大3）を点読みして証拠化し、
+// 最終transactionで登録と同じ利用許可・同意世代・受信reset世代・strictのsource（接続保存の既存判定）と要求Grantのactiveを確かめる。
+// 投影はメモリ内だけで、購読・owner・Grantへの書込み・活動時刻の更新・callback URL/secretの開封は0（viewForの整理保存とは別）。
 
 import { types } from 'node:util';
 
 import type { DocumentReference, DocumentSnapshot, Firestore, Transaction } from '@google-cloud/firestore';
 
+import { grantReceiverGenerationOf } from '../access/policy.js';
 import { createKmsGrantAuthorization, KmsGrantAuthorizationError, type KmsGrantAuthorization, type KmsGrantProof } from '../connect/kms-grant-authorization.js';
 import { CONNECT_STORAGE_ROOT, isConnectNamespace } from '../connect/firestore.js';
 import type { McpRequestOperation } from '../mcp/request-operation.js';
 import type { Clock } from '../policy.js';
 import type { KmsCallOptions, KmsDecryptRequest, KmsDecryptResponse, KmsSealingConfig } from '../protection/kms-sealing.js';
 import { isTime, isUuid } from '../storage/firestore/checks.js';
+import { ownerReceiverGeneration } from '../storage/firestore/receiver-reset.js';
 import {
   createKmsSubscriptionPolicy,
+  isKmsGrantId,
   kmsStateDocument,
   parseKmsState,
   requireKmsDocumentSize,
@@ -51,7 +57,11 @@ const OPTION_KEYS = ['db', 'connect', 'connectNamespace', 'resource', 'kms', 'cl
 const KMS_KEYS = ['environment', 'projectId', 'databaseId', 'namespace', 'cryptoKey', 'writeVersion', 'readVersions', 'transport'] as const;
 const GRANT_DOC_ID = /^Grant_[0-9a-f]{64}$/;
 
-export type KmsConnectionSubscriptionViewErrorCode = 'invalid_input' | 'unavailable' | 'timed_out' | 'aborted' | 'closed' | 'conflict';
+const HEX_DOC_ID = /^[0-9a-f]{64}$/;
+const SOURCE_DOC_ID = /^src_[a-z2-7]{26}$/;
+
+/** grant_inactiveはstatusForだけ（要求Grant・owner・利用許可・sourceの不成立）。viewForは出さない。 */
+export type KmsConnectionSubscriptionViewErrorCode = 'invalid_input' | 'unavailable' | 'timed_out' | 'aborted' | 'closed' | 'conflict' | 'grant_inactive';
 
 const ERROR_MESSAGES: Readonly<Record<KmsConnectionSubscriptionViewErrorCode, string>> = {
   invalid_input: 'kms subscription view: invalid input',
@@ -60,6 +70,7 @@ const ERROR_MESSAGES: Readonly<Record<KmsConnectionSubscriptionViewErrorCode, st
   aborted: 'kms subscription view: aborted',
   closed: 'kms subscription view: closed',
   conflict: 'kms subscription view: conflict',
+  grant_inactive: 'kms subscription view: grant inactive',
 };
 
 /** 固定の非成功。cause・owner・Grant・文書の値・元の例外を持たない。factoryの入力の不正もinvalid_input。 */
@@ -97,6 +108,11 @@ export interface KmsConnectionSubscriptionViewOptions {
 export interface KmsConnectionSubscriptionView {
   /** ownerはUUID、operationはMCP入口と同じexact {deadlineAt, signal}（signal必須）。 */
   viewFor(ownerId: string, operation: McpRequestOperation): Promise<SubscriptionView>;
+  /**
+   * 認証済みのowner/要求Grant（exact {ownerId, grantId}）の受信状態。読取りだけ（書込み・活動時刻の更新・callbackの開封0）。
+   * 要求Grant・owner・利用許可・strictのsourceの不成立はgrant_inactive、版の競合はconflict。接続保存が利用許可の判定を持たなければunavailable。
+   */
+  statusFor(auth: { readonly ownerId: string; readonly grantId: string }, operation: McpRequestOperation): Promise<SubscriptionView>;
   /** 同期・冪等。先に閉鎖して進行中の採用を中止し、以後を固定closedにする。借用資源は閉じない。 */
   dispose(): void;
 }
@@ -214,6 +230,31 @@ export function createKmsConnectionSubscriptionView(options: KmsConnectionSubscr
   const grantDocRef = methodOf(connectTarget, 'grantDocRef');
   const ownerDocActive = methodOf(connectTarget, 'ownerDocActive');
   const grantDocLive = methodOf(connectTarget, 'grantDocLive');
+  // 受信状態の照会だけが使う、登録と同じ利用許可・同意世代の判定（接続保存の既存method）。無い接続保存ではstatusForをunavailableにする。
+  const has = (name: string): boolean => {
+    try {
+      methodOf(connectTarget, name);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const access = ['accessDocRefForOwner', 'grantMetaDocRef', 'grantUseDecision'].every(has)
+    ? Object.freeze({
+        accessDocRefForOwner: methodOf(connectTarget, 'accessDocRefForOwner'),
+        grantMetaDocRef: methodOf(connectTarget, 'grantMetaDocRef'),
+        grantUseDecision: methodOf(connectTarget, 'grantUseDecision'),
+      })
+    : undefined;
+  // 許可元strict（接続保存にsourceを結んだ配置）だけ: 登録runtimeと同じ読み方で1回捕捉し、source照合のmethodが無ければconfigの不正。
+  const strictSources = (connectTarget as { readonly sourcesEnabled?: unknown }).sourcesEnabled === true;
+  const sourceMethods = strictSources
+    ? Object.freeze({
+        grantSourceDocRefByHash: methodOf(connectTarget, 'grantSourceDocRefByHash'),
+        grantSourceRecordRef: methodOf(connectTarget, 'grantSourceRecordRef'),
+        grantSourceDecision: methodOf(connectTarget, 'grantSourceDecision'),
+      })
+    : undefined;
 
   const connectNamespace = fields.get('connectNamespace');
   if (!isConnectNamespace(connectNamespace)) fail();
@@ -413,7 +454,11 @@ export function createKmsConnectionSubscriptionView(options: KmsConnectionSubscr
   }
 
   /** 接続保存の参照は、借用した同じinstance・同じt256 namespaceの決まったpathだけを使う（別instanceは同じproject文字列でもI/Oの前に拒否）。 */
-  function ownConnectRef(make: () => unknown, collection: 'owners' | 'oidc', accept: (id: string) => boolean): DocumentReference {
+  function ownConnectRef(
+    make: () => unknown,
+    collection: 'owners' | 'oidc' | 'access' | 'grantMeta' | 'sourceGrants' | 'sources',
+    accept: (id: string) => boolean,
+  ): DocumentReference {
     let ref: unknown;
     let firestore: unknown;
     let path: unknown;
@@ -580,8 +625,197 @@ export function createKmsConnectionSubscriptionView(options: KmsConnectionSubscr
     }
   }
 
+  /** 照会の入力のowner/要求Grant（exact {ownerId, grantId}、UUID・既存のKMS grant ID形式）。不正はinvalid_input。 */
+  function copyStatusAuth(value: unknown): { readonly ownerId: string; readonly grantId: string } {
+    const auth = dataFields(value, ['ownerId', 'grantId']);
+    const ownerId = auth.get('ownerId');
+    const grantId = auth.get('grantId');
+    if (!isUuid(ownerId) || !isKmsGrantId(grantId)) fail();
+    return Object.freeze({ ownerId, grantId });
+  }
+
+  /** 照会に使う同じtransactionで読んだ利用許可record・要求Grantの同意記録と、strictだけsourceのbinding・source。 */
+  interface StatusAccess {
+    readonly access: DocumentSnapshot;
+    readonly meta: DocumentSnapshot;
+    readonly source?: {
+      readonly binding: { readonly exists: boolean; readonly data: unknown };
+      readonly record: { readonly exists: boolean; readonly id: string; readonly data: unknown } | null;
+    };
+  }
+
+  /** 登録の保存口と同じ読み方: ownerのidentityHashから許可record、要求Grantの同意記録、strictはそのhashのbindingと指すsource。 */
+  async function readAccess(
+    tx: Transaction,
+    scope: ViewScope,
+    port: NonNullable<typeof access>,
+    owner: DocumentSnapshot,
+    metaRef: DocumentReference,
+  ): Promise<StatusAccess> {
+    const accessRef = ownConnectRef(() => port.accessDocRefForOwner(owner.data()), 'access', (id) => HEX_DOC_ID.test(id));
+    const [accessSnapshot, meta] = (await read(tx, scope, [accessRef, metaRef])) as [DocumentSnapshot, DocumentSnapshot];
+    if (sourceMethods === undefined) return { access: accessSnapshot, meta };
+    const bindingRef = ownConnectRef(() => sourceMethods.grantSourceDocRefByHash(metaRef.id), 'sourceGrants', (id) => HEX_DOC_ID.test(id));
+    const [bindingSnapshot] = (await read(tx, scope, [bindingRef])) as [DocumentSnapshot];
+    const binding = { exists: bindingSnapshot.exists, data: bindingSnapshot.exists ? bindingSnapshot.data() : undefined };
+    let made: unknown;
+    try {
+      made = sourceMethods.grantSourceRecordRef(binding);
+    } catch {
+      throw viewError('unavailable');
+    }
+    const sourceRef = made === null ? null : ownConnectRef(() => made, 'sources', (id) => SOURCE_DOC_ID.test(id));
+    const sourceSnapshot = sourceRef === null ? null : ((await read(tx, scope, [sourceRef])) as [DocumentSnapshot])[0];
+    const record = sourceSnapshot === null ? null : { exists: sourceSnapshot.exists, id: sourceSnapshot.id, data: sourceSnapshot.exists ? sourceSnapshot.data() : undefined };
+    return { access: accessSnapshot, meta, source: { binding, record } };
+  }
+
+  /**
+   * 登録の保存口と同じ判定（接続保存の既存method）: 利用許可がactiveで要求Grantの同意記録が同ownerの現在の世代、strictはsourceのbinding・
+   * 世代が有効、要求Grantの受信reset世代がownerの現在値。不許可はgrant_inactive、不正・不明はunavailable（許可へ読み替えない）。
+   */
+  function requireAccess(port: NonNullable<typeof access>, snapshots: StatusAccess, ownerId: string, owner: DocumentSnapshot, at: number): void {
+    let decision: unknown;
+    try {
+      decision = port.grantUseDecision(
+        { exists: snapshots.access.exists, data: snapshots.access.exists ? snapshots.access.data() : undefined },
+        { exists: snapshots.meta.exists, data: snapshots.meta.exists ? snapshots.meta.data() : undefined },
+        ownerId,
+      );
+    } catch {
+      throw viewError('unavailable');
+    }
+    if (decision === 'denied') throw viewError('grant_inactive');
+    if (decision !== 'allowed') throw viewError('unavailable');
+    if (sourceMethods !== undefined) {
+      if (snapshots.source === undefined) throw viewError('unavailable');
+      let sourceDecision: unknown;
+      try {
+        sourceDecision = sourceMethods.grantSourceDecision(snapshots.source.binding, snapshots.source.record, at);
+      } catch {
+        throw viewError('unavailable');
+      }
+      if (sourceDecision === 'denied') throw viewError('grant_inactive');
+      if (sourceDecision !== 'allowed') throw viewError('unavailable');
+    }
+    const grantReceiver = grantReceiverGenerationOf(snapshots.meta.data());
+    let ownerReceiver: number;
+    try {
+      ownerReceiver = ownerReceiverGeneration(owner.data());
+    } catch {
+      throw viewError('unavailable');
+    }
+    if (grantReceiver === null) throw viewError('unavailable');
+    if (grantReceiver !== ownerReceiver) throw viewError('grant_inactive');
+  }
+
+  async function statusFor(authInput: unknown, operationInput: unknown): Promise<SubscriptionView> {
+    let scope: ViewScope | null = null;
+    try {
+      // 最初のawaitの前に、閉鎖・中止・時計・期限・入力・参照を捕捉する（後の改変で束縛を変えない）。
+      scope = begin(operationInput);
+      const current: ViewScope = scope;
+      const auth = copyStatusAuth(authInput);
+      if (access === undefined) throw viewError('unavailable');
+      const port = access;
+      const { ownerId, grantId } = auth;
+      live(current);
+      const ownerRef = ownConnectRef(() => ownerDocRef(ownerId), 'owners', (id) => id === ownerId);
+      const requestGrantRef = ownConnectRef(() => grantDocRef(grantId), 'oidc', (id) => GRANT_DOC_ID.test(id));
+      const metaRef = ownConnectRef(() => port.grantMetaDocRef(grantId), 'grantMeta', (id) => HEX_DOC_ID.test(id));
+      const subscriptionRef = subscriptionDocs.doc(ownerId);
+
+      // 初回snapshot: 書込みなしの通常transaction。owner・marker・購読・要求Grantと、active/pendingの束縛Grant（要求Grantを除き重複なし・最大2）、
+      // 利用許可を読む。全ての読取りの後の最新時刻で、owner・要求Grantのmetadata・利用許可を確かめる（不成立は開封0で拒否）。
+      const first = await run(current, async (tx) => {
+        const [owner, marker, subscription, requestGrant] = (await read(tx, current, [ownerRef, markerRef, subscriptionRef, requestGrantRef])) as [
+          DocumentSnapshot,
+          DocumentSnapshot,
+          DocumentSnapshot,
+          DocumentSnapshot,
+        ];
+        const state = readState(subscription, ownerId);
+        const boundIds: string[] = [];
+        for (const bound of [state?.active?.grantId, state?.pending?.grantId]) {
+          if (bound !== undefined && bound !== grantId && !boundIds.includes(bound)) boundIds.push(bound);
+        }
+        const boundRefs = boundIds.map((bound) => ownConnectRef(() => grantDocRef(bound), 'oidc', (id) => GRANT_DOC_ID.test(id)));
+        const boundSnapshots = boundRefs.length === 0 ? [] : await read(tx, current, boundRefs);
+        const accessSnapshots = await readAccess(tx, current, port, owner, metaRef);
+        const at = live(current);
+        requireMarker(marker);
+        if (!ownerActive(owner, at)) throw viewError('grant_inactive');
+        const generation = generationOf(owner);
+        if (grantDocLive(requestGrant.data(), ownerId, grantId, at) !== true) throw viewError('grant_inactive');
+        requireAccess(port, accessSnapshots, ownerId, owner, at);
+        return {
+          generation,
+          subscription: snapshotVersion(subscription),
+          grants: [
+            { grantId, ref: requestGrantRef, snapshot: requestGrant },
+            ...boundIds.map((bound, index): BoundGrant => ({ grantId: bound, ref: boundRefs[index]!, snapshot: boundSnapshots[index]! })),
+          ],
+        };
+      });
+      live(current);
+
+      // 閉包の外で、取得済みの各Grant snapshotの証拠を順に作る（要求Grantを含め最大3回、同じ子operation）。
+      const proven: ProvenGrant[] = [];
+      for (const entry of first.grants) {
+        live(current);
+        const proof = await bounded(current, () => grants.prove(entry.snapshot, { ownerId, grantId: entry.grantId }, current.operation));
+        live(current);
+        proven.push(Object.freeze({ grantId: entry.grantId, ref: entry.ref, proof }));
+      }
+      const grantRefs = proven.map((entry) => entry.ref);
+
+      // 最終transaction（書込みなし）: 同じrefと利用許可を最新snapshotで再読し、marker・owner・Grant証拠（stale→conflict）・要求Grantのactive・
+      // 利用許可・世代・購読の期待版を照合してから、期限・束縛の投影をメモリ内だけで行う。
+      const view = await run(current, async (tx) => {
+        const [owner, marker, subscription, ...grantSnapshots] = (await read(tx, current, [ownerRef, markerRef, subscriptionRef, ...grantRefs])) as [
+          DocumentSnapshot,
+          DocumentSnapshot,
+          DocumentSnapshot,
+          ...DocumentSnapshot[],
+        ];
+        const accessSnapshots = await readAccess(tx, current, port, owner, metaRef);
+        const at = live(current);
+        requireMarker(marker);
+        if (!ownerActive(owner, at)) throw viewError('grant_inactive');
+        const generation = generationOf(owner);
+        const verdicts = new Map<string, BindingVerdict>();
+        proven.forEach((entry, index) => {
+          const snapshot = grantSnapshots[index];
+          if (snapshot === undefined) throw viewError('unavailable');
+          const result = grants.check(entry.proof, snapshot, { ownerId, grantId: entry.grantId }, current.operation);
+          if (result === 'stale') throw viewError('conflict');
+          verdicts.set(entry.grantId, result);
+        });
+        if (verdicts.get(grantId) !== 'active') throw viewError('grant_inactive');
+        requireAccess(port, accessSnapshots, ownerId, owner, live(current));
+        if (generation !== first.generation || !sameDocVersion(snapshotVersion(subscription), first.subscription)) throw viewError('conflict');
+        const state = readState(subscription, ownerId);
+        if (state === undefined) return 'none' as const;
+        projectBindings(state, at, (bound) => {
+          const verdict = verdicts.get(bound);
+          if (verdict === undefined) throw viewError('conflict');
+          return verdict;
+        });
+        // 投影の結果は保存しない（txへのset/update/create/delete 0）。
+        return classify(state);
+      });
+      live(current);
+      return view;
+    } catch (error) {
+      throw normalize(scope, error);
+    } finally {
+      scope?.release();
+    }
+  }
+
   return Object.freeze({
     viewFor: viewFor as KmsConnectionSubscriptionView['viewFor'],
+    statusFor: statusFor as KmsConnectionSubscriptionView['statusFor'],
     dispose(): void {
       if (closed) return;
       // 先に閉鎖してから進行中の子をabortする（以後の新しいDB/KMSは0）。借用資源は閉じない。

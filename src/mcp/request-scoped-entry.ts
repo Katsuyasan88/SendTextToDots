@@ -51,6 +51,7 @@ import {
   type McpEntry,
   type McpRequestErrorCategory,
   type McpRequestOperation,
+  type ReceivingState,
   type RequestScopedMcpEntryOptions,
 } from './request-operation.js';
 
@@ -62,7 +63,9 @@ export {
   type McpRequestErrorCategory,
   type McpRequestOperation,
   type RequestScopedMcpEntryOptions,
+  type ReceivingState,
   type RequestScopedOwnerResolver,
+  type RequestScopedReceivingStatusPort,
   type RequestScopedSubscriptionPort,
 } from './request-operation.js';
 
@@ -72,7 +75,37 @@ const SERVER_INFO = { name: 'sttd-server', version: '0.0.0' };
 type EventsCapabilities = ServerCapabilities & { events: Record<string, never> };
 
 const REQUIRED = ['issuer', 'resource', 'clock', 'resolveOAuthOwner', 'subscriptions', 'onError'] as const;
-const OPTIONAL = ['budgetMs', 'closeBudgetMs'] as const;
+const OPTIONAL = ['budgetMs', 'closeBudgetMs', 'receivingStatus'] as const;
+
+/** 受信状態の照会tool（状態照会portを渡された入口だけが一覧・呼出しに出す）。 */
+const RECEIVING_STATUS_TOOL = 'get_receiving_status';
+const RECEIVING_STATES: readonly ReceivingState[] = ['change_pending', 'subscribed', 'expired', 'linked'];
+
+/** `tools/list`に出す定義（固定。owner・Grant・購読の値を含まない）。 */
+function receivingStatusToolDefinition() {
+  return {
+    name: RECEIVING_STATUS_TOOL,
+    title: 'Get receiving status',
+    description:
+      "Use this when the user asks whether their SendTextToDots account is ready to receive text, or why text is not arriving. " +
+      'Read-only, account-level check of the signed-in user only: returns one state - change_pending (a new delivery destination awaits the user\'s confirmation), ' +
+      'subscribed (an active subscription exists), expired (the last subscription expired), or linked (connected, waiting for a subscription). ' +
+      'It does not return message text, history, destinations or identifiers, and "subscribed" does not guarantee delivery of any individual message. ' +
+      'Do not call it to send text or to change subscriptions.',
+    inputSchema: { type: 'object' as const, properties: {}, additionalProperties: false },
+    outputSchema: {
+      type: 'object' as const,
+      properties: { state: { type: 'string', enum: [...RECEIVING_STATES] } },
+      required: ['state'],
+      additionalProperties: false,
+    },
+    annotations: { title: 'Get receiving status', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  };
+}
+
+function isReceivingState(value: unknown): value is ReceivingState {
+  return (RECEIVING_STATES as readonly unknown[]).includes(value);
+}
 
 /**
  * `events/subscribe`の1回の結果の固定分類（診断の通知だけに使う）。成功は`ok`、portの失敗はkind（callbackはreasonつき）、
@@ -142,6 +175,8 @@ interface RequestState {
   readonly controller: AbortController;
   /** verifierが採用したowner/Grant（SDKのauthInfo.extraと照合する）。 */
   auth: SubscriptionAuth | undefined;
+  /** verifierが採用したaccess tokenの期限（epoch秒。SDKのAuthInfo.expiresAtと同じ単位）。受信状態の照会だけが使う。 */
+  tokenExpiresAt: number | undefined;
   /** verifyBearerTokenが返し、req.authとしてSDKへ渡したobject。 */
   authInfo: AuthInfo | undefined;
   /** SDK（toNodeHandler）へ渡した後か。以後の中止は応答を書かずに接続を終える。 */
@@ -347,6 +382,7 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
   const portTarget = fields.get('subscriptions');
   const subscribe = methodOf(portTarget, 'subscribe');
   const unsubscribe = methodOf(portTarget, 'unsubscribe');
+  const statusFor = fields.has('receivingStatus') ? methodOf(fields.get('receivingStatus'), 'statusFor') : undefined;
   const onErrorFn = plainFunction(fields.get('onError'));
   const budgetMs = boundedInteger(fields.get('budgetMs'), MCP_REQUEST_BUDGET_MS, MCP_REQUEST_BUDGET_MS);
   const closeBudgetMs = boundedInteger(fields.get('closeBudgetMs'), MCP_CLOSE_BUDGET_MS, MCP_CLOSE_BUDGET_MS);
@@ -413,6 +449,31 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
     }
     if (!alive(state)) throw contextUnavailable();
     return state;
+  };
+
+  /**
+   * 受信状態の照会だけ: 最新の捕捉clockで、認証が採用したaccess token自身の期限（epoch秒）に達していないことを確かめる。
+   * 期限と等しい時刻以降は状態なしの固定error。clockの例外・不正値は既存の扱い（clockの通知・要求の中止・context unavailable）。
+   */
+  const requireTokenLive = (state: RequestState): void => {
+    const expiresAt = state.tokenExpiresAt;
+    if (expiresAt === undefined) {
+      report('context');
+      throw contextUnavailable();
+    }
+    let now: unknown;
+    try {
+      now = clockNow();
+    } catch {
+      report('clock');
+      state.controller.abort();
+      throw contextUnavailable();
+    }
+    if (typeof now !== 'number' || !Number.isFinite(now)) {
+      state.controller.abort();
+      throw contextUnavailable();
+    }
+    if (!(now < expiresAt * 1000)) throw new ProtocolError(ProtocolErrorCode.InternalError, 'Access token expired');
   };
 
   /**
@@ -485,16 +546,43 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
 
   const handler = createMcpHandler(
     () => {
-      // tools:{}は空一覧のためだけ。実行可能なtoolとtools/callは提供しない。
+      // tools:{}。状態照会portを渡された入口だけが読取り専用の`get_receiving_status`を1つ提供し、無ければ空一覧でtools/callは未提供。
       const capabilities: EventsCapabilities = { events: {}, tools: {} };
       const server = new Server(SERVER_INFO, { capabilities });
 
       server.setRequestHandler('tools/list', (_request, ctx) =>
         (async () => {
           authOf(ctx);
-          return { tools: [] };
+          return { tools: statusFor === undefined ? [] : [receivingStatusToolDefinition()] };
         })(),
       );
+
+      if (statusFor !== undefined) {
+        server.setRequestHandler('tools/call', (request, ctx) =>
+          (async () => {
+            // 名前・引数の検査はportより前（未知tool・余分な引数は照会I/O 0）。引数は省略か空objectだけ。
+            const { name, arguments: args } = request.params;
+            if (name !== RECEIVING_STATUS_TOOL) throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'Unknown tool');
+            if (args !== undefined && (typeof args !== 'object' || args === null || Array.isArray(args) || Reflect.ownKeys(args).length !== 0)) {
+              throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'Invalid arguments');
+            }
+            const state = stateOf(ctx);
+            // 照会の開始前と結果を返す直前に、要求期限（alive）に加えてaccess token自身の期限も確かめる（照会中の期限到達で状態を出さない）。
+            requireTokenLive(state);
+            const auth = Object.freeze({ ...state.auth! });
+            const outcome: unknown = await callPort(state, () => statusFor(auth, state.operation));
+            if (!isReceivingState(outcome)) {
+              report('port');
+              throw internalError();
+            }
+            if (!alive(state)) throw contextUnavailable();
+            requireTokenLive(state);
+            if (!alive(state)) throw contextUnavailable();
+            const structured = { state: outcome };
+            return { content: [{ type: 'text' as const, text: JSON.stringify(structured) }], structuredContent: structured, isError: false };
+          })(),
+        );
+      }
 
       server.setRequestHandler('events/list', { params: EventsListParams }, (_params, ctx) =>
         (async () => {
@@ -648,7 +736,7 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
     const deadlineAt = Math.floor(receivedAt) + budgetMs;
     const controller = new AbortController();
     const operation: McpRequestOperation = Object.freeze({ deadlineAt, signal: controller.signal });
-    const state: RequestState = { operation, controller, auth: undefined, authInfo: undefined, sdkStarted: false, subscribeGate };
+    const state: RequestState = { operation, controller, auth: undefined, tokenExpiresAt: undefined, authInfo: undefined, sdkStarted: false, subscribeGate };
     active.add(state);
 
     const abort = (): void => controller.abort();
@@ -685,6 +773,7 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
             const owner = captureOwner(resolved);
             const auth = { ownerId: owner.ownerId, grantId: owner.grantId };
             state.auth = Object.freeze({ ...auth });
+            state.tokenExpiresAt = owner.expiresAt;
             return {
               // 受け取ったtokenをMCPのハンドラーへ引き回さない。
               token: '',

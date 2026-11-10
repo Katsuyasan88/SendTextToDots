@@ -33,6 +33,17 @@ export interface RequestScopedSubscriptionPort {
   unsubscribe(auth: SubscriptionAuth, identity: { readonly name: string; readonly url: string }, operation: McpRequestOperation): Promise<void>;
 }
 
+/** `get_receiving_status`の結果の状態（アカウント単位）。 */
+export type ReceivingState = 'change_pending' | 'subscribed' | 'expired' | 'linked';
+
+/**
+ * 受信状態の照会port（読取りだけ）。入口の認証で確定したowner/Grantだけを渡す。要求Grant・利用許可の不成立は既存の
+ * SubscribeError（grant_inactive）、版の競合はSubscribeError（conflict）、他は任意の例外（入口が固定InternalErrorにする）。
+ */
+export interface RequestScopedReceivingStatusPort {
+  statusFor(auth: SubscriptionAuth, operation: McpRequestOperation): Promise<ReceivingState>;
+}
+
 /** MCP入口の公開形。 */
 export interface McpEntry {
   /** 認証なしで取得できる公開情報だけ。 */
@@ -54,6 +65,8 @@ export interface RequestScopedMcpEntryOptions {
   readonly resolveOAuthOwner: RequestScopedOwnerResolver;
   readonly subscriptions: RequestScopedSubscriptionPort;
   readonly onError: (category: McpRequestErrorCategory) => void;
+  /** 渡された時だけ`get_receiving_status`を一覧・呼出しに出す（無ければ`tools/list`は空、`tools/call`は未提供）。 */
+  readonly receivingStatus?: RequestScopedReceivingStatusPort | undefined;
   /** 試験だけ: 正の整数・20000以下（既定20000、延長不可）。 */
   readonly budgetMs?: number | undefined;
   /** 試験だけ: 正の整数・5000以下（既定5000、延長不可）。 */

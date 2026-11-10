@@ -179,11 +179,11 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 
 状態の優先順位: 有効なGrantが無い→unlinked、承認待ちの送信先置換→change_pending、有効な購読→subscribed、直前の購読が期限切れ→expired、それ以外（未購読・購読取消）→linked。change_pending（既知の送信先と別の宛先）は、プラグインの接続をAppleでやり直し、最後の許可画面で本人が以前の受信先設定の削除を確認した時だけ解消します（受信先設定一式だけを消し、受信reset世代を進めます。それより前の同意のGrantでは、受信先を設定できません）。
 
-利用許可（`access`）は購読の`state`と別に返します。許可を読めない時もHTTP 200で`state`と`access: "unavailable"`を返し、新しい利用はできません。OAuth interactionのloginでは、未登録・停止中の本人は403 `access_denied`（画面は「このサービスの利用が許可されていません。運営者へ確認」）でownerを作りません。同意の時点で停止・再登録を跨いだ場合も同じ案内の403画面でGrantを使える状態にしません。code交換・refreshは同じ世代のGrantだけで、そうでなければ既存の`invalid_grant`です。MCPの`events/subscribe`（延長・secret更新を含む）は既存のForbidden（`data.reason` = `access_revoked`）で、challengeの前と最終の保存時の両方で確かめます。`events/unsubscribe`・接続解除・状態照会・取消は利用許可を条件にしません。
+利用許可（`access`）は購読の`state`と別に返します。許可を読めない時もHTTP 200で`state`と`access: "unavailable"`を返し、新しい利用はできません。OAuth interactionのloginでは、未登録・停止中の本人は403 `access_denied`（画面は「このサービスの利用が許可されていません。運営者へ確認」）でownerを作りません。同意の時点で停止・再登録を跨いだ場合も同じ案内の403画面でGrantを使える状態にしません。code交換・refreshは同じ世代のGrantだけで、そうでなければ既存の`invalid_grant`です。MCPの`events/subscribe`（延長・secret更新を含む）は既存のForbidden（`data.reason` = `access_revoked`）で、challengeの前と最終の保存時の両方で確かめます。`events/unsubscribe`・接続解除・Webの状態照会（`GET /v1/web/connection`）・取消は利用許可を条件にしません。MCPの `get_receiving_status` は購読と同じ利用許可を条件にします（4章）。
 
 ## 4. MCP Events
 
-`/mcp` の `server/discover` は `events:{}` と `tools:{}` を宣言し、`tools/list` は常に空です。`events/list` が返す唯一のイベントは `text.submitted`（認証済みの入力元が送った任意の本文を、本人の購読先へ配送する）です。submittedは本文の受付・配送のイベント名で、受信側の処理完了を意味しません。購読・配送は認証ownerに限られます。旧名 `shortcut.triggered` 等の未知のイベント名の購読・解除はNotFound（-32011、`data.kind` = `event`）で、保存・暗号・challengeへ進みません。
+`/mcp` の `server/discover` は `events:{}` と `tools:{}` を宣言し、`tools/list` が返すのは読み取り専用の `get_receiving_status` 1つだけです（direct配置。下記）。`events/list` が返す唯一のイベントは `text.submitted`（認証済みの入力元が送った任意の本文を、本人の購読先へ配送する）です。submittedは本文の受付・配送のイベント名で、受信側の処理完了を意味しません。購読・配送は認証ownerに限られます。旧名 `shortcut.triggered` 等の未知のイベント名の購読・解除はNotFound（-32011、`data.kind` = `event`）で、保存・暗号・challengeへ進みません。
 
 | 購読の入力 | 規則 |
 | --- | --- |
@@ -193,6 +193,32 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 | cursor | 省略かnullだけ（履歴再生なし） |
 
 購読は署名付きchallenge（最大10秒）が一致した時だけ有効になります。別のcallbackへの置換は本人の承認待ちになります。
+
+### 受信状態の照会（`get_receiving_status`）
+
+本人が「受信できる状態か」「届かないので受信設定を確認したい」と尋ねた時のための、アカウント単位の読み取り専用ツールです（annotations: `readOnlyHint: true`・`destructiveHint: false`・`openWorldHint: false`）。`tools/call` の `arguments` は省略か空オブジェクト `{}` だけで、余分な項目・型違い・未知のツール名はInvalid params（-32602）となり、照会しません。
+
+| 結果 `state` | 意味 |
+| --- | --- |
+| `change_pending` | 別の送信先への変更が本人の確認待ち（有効な購読より優先） |
+| `subscribed` | 有効な購読がある |
+| `expired` | 直前の購読が期限切れ |
+| `linked` | 接続済みで購読待ち（未購読・購読解除後・購読を結んだGrantの失効後を含む） |
+
+結果は `structuredContent` の `{"state": …}` と、同じJSONを本文に持つtext 1件です（`isError: false`）。状態の優先順位は2章の接続状態と同じです。`subscribed` は個々の会話との紐付け、送信元の権限、個別メッセージの到達や処理完了を保証しません。本文・履歴・宛先・購読ID・アカウント/Grantの識別子は返しません。
+
+照会するのは、Bearer access token（同じresource・`sttd:events`）から確定した本人だけです。呼び出したGrantについて、期限内であること、利用許可がactiveで同意の世代が一致すること、受信reset世代が一致すること、許可元を結ぶ配置ではsourceのbindingと世代が有効であることを、購読の保存と同じ判定で最後の読み取りの時点に確かめます。同じ本人の有効な別Grantからの照会もアカウントの状態だけを返します。照会は購読・接続・Grantへ書き込まず、期限切れや失効の整理結果も保存しません（Webの状態照会は従来どおり整理結果を保存します）。callback・送信・challengeは行いません。
+
+| 失敗 | 応答（状態は含めない） |
+| --- | --- |
+| 未認証・期限切れ・別resource・scope不足 | 既存のBearer認証エラー（401/403） |
+| Grantの失効・利用停止・同意や受信reset世代の不一致・sourceの停止や世代違い（照会途中を含む） | Forbidden（`data.reason` = `access_revoked`） |
+| 照会の開始前・結果を返す前にaccess token自身の期限へ到達 | Internal error（`Access token expired`） |
+| 照会中の版の競合 | Internal error（`Subscription changed concurrently`） |
+| 保存・鍵の障害、文書の破損 | Internal error（固定文言） |
+| 要求の期限超過・切断・停止 | 成功応答を返さない |
+
+このツールは通常のdirect配置の `/mcp` だけが提供します。URLを保つgateway配置（gateway-v1）のMCP backendとPlaygroundの入口では、`tools/list` は従来どおり空で、`tools/call` は提供しません（Method not found）。
 
 payload（`data`）は `schemaVersion`(2)・`commandId`・`text`・`expiresAt` の4項目ちょうどで、この順に並び、追加項目はありません（`createdAt` も含みません）。`text` は送信APIが受け付けた本文と同じ文字列です。
 

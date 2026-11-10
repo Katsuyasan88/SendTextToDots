@@ -180,11 +180,11 @@ Display language: the HTML pages (`/console`, the OAuth interaction and the user
 
 State priority: no valid Grant → unlinked, a destination replacement awaiting approval → change_pending, a valid subscription → subscribed, the most recent subscription expired → expired, otherwise (no subscription or subscription cancelled) → linked. change_pending (a destination different from the known one) is resolved only when the person connects the plugin again with Apple and confirms deleting the previous receiver settings on the final permission page (only the receiver settings are deleted and the receiver reset generation advances; Grants from earlier consents can no longer set up receiving).
 
-The access permission (`access`) is returned separately from the subscription `state`. When it cannot be read, the response is still HTTP 200 with `state` and `access: "unavailable"`, and new use is not possible. At the OAuth interaction login, a person who is not registered or is stopped gets 403 `access_denied` (the page says "This account is not permitted to use this service. Please check with the operator.") and no owner is created. If a stop or re-registration happens before consent completes, the same notice is shown with 403 and the Grant is not made usable. Code exchange and refresh accept only a Grant of the same generation; otherwise the existing `invalid_grant` applies. MCP `events/subscribe` (including extension and secret rotation) returns the existing Forbidden (`data.reason` = `access_revoked`), checked both before the challenge and at the final save. `events/unsubscribe`, disconnect, status lookups and cancellation do not require the permission.
+The access permission (`access`) is returned separately from the subscription `state`. When it cannot be read, the response is still HTTP 200 with `state` and `access: "unavailable"`, and new use is not possible. At the OAuth interaction login, a person who is not registered or is stopped gets 403 `access_denied` (the page says "This account is not permitted to use this service. Please check with the operator.") and no owner is created. If a stop or re-registration happens before consent completes, the same notice is shown with 403 and the Grant is not made usable. Code exchange and refresh accept only a Grant of the same generation; otherwise the existing `invalid_grant` applies. MCP `events/subscribe` (including extension and secret rotation) returns the existing Forbidden (`data.reason` = `access_revoked`), checked both before the challenge and at the final save. `events/unsubscribe`, disconnect, the web status lookup (`GET /v1/web/connection`) and cancellation do not require the permission. The MCP tool `get_receiving_status` requires the same permission as subscribing (section 4).
 
 ## 4. MCP Events
 
-`server/discover` on `/mcp` declares `events:{}` and `tools:{}`, and `tools/list` is always empty. The only event returned by `events/list` is `text.submitted` (delivery of arbitrary text sent by an authenticated source to the user's subscription). "submitted" is the event name for acceptance and delivery of the text; it does not mean the receiver finished processing. Subscriptions and delivery are limited to the authenticated owner. Subscribing to or unsubscribing from unknown event names such as the old `shortcut.triggered` is NotFound (-32011, `data.kind` = `event`) and does not reach storage, cryptography or the challenge.
+`server/discover` on `/mcp` declares `events:{}` and `tools:{}`, and `tools/list` returns exactly one read-only tool, `get_receiving_status` (direct deployment; see below). The only event returned by `events/list` is `text.submitted` (delivery of arbitrary text sent by an authenticated source to the user's subscription). "submitted" is the event name for acceptance and delivery of the text; it does not mean the receiver finished processing. Subscriptions and delivery are limited to the authenticated owner. Subscribing to or unsubscribing from unknown event names such as the old `shortcut.triggered` is NotFound (-32011, `data.kind` = `event`) and does not reach storage, cryptography or the challenge.
 
 | Subscription input | Rule |
 | --- | --- |
@@ -194,6 +194,32 @@ The access permission (`access`) is returned separately from the subscription `s
 | cursor | omitted or null only (no history replay) |
 
 A subscription becomes valid only when the signed challenge (at most 10 seconds) matches. Replacing the callback with another one waits for the user's approval.
+
+### Receiving status (`get_receiving_status`)
+
+A read-only, account-level tool for when the user asks whether they are ready to receive, or wants to check their receiving setup because text is not arriving (annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`). `arguments` of `tools/call` must be omitted or an empty object `{}`; extra fields, wrong types or an unknown tool name are Invalid params (-32602) and nothing is looked up.
+
+| Result `state` | Meaning |
+| --- | --- |
+| `change_pending` | A change to a different destination awaits the user's confirmation (takes priority over an active subscription) |
+| `subscribed` | An active subscription exists |
+| `expired` | The most recent subscription expired |
+| `linked` | Connected and waiting for a subscription (including no subscription, after unsubscribing, and after the Grant bound to the subscription ended) |
+
+The result is `{"state": …}` in `structuredContent` plus one text item carrying the same JSON (`isError: false`). The priority is the same as the connection state in section 2. `subscribed` does not guarantee a link to any particular conversation, the sender's permission, or arrival or completion of any individual message. Text, history, destinations, subscription IDs and account/Grant identifiers are never returned.
+
+Only the person resolved from the Bearer access token (same resource, `sttd:events`) is looked up. For the calling Grant, the final read checks, with the same decisions as saving a subscription, that it is unexpired, that the access permission is active with a matching consent generation, that the receiver reset generation matches, and, in deployments that bind sources, that the source binding and generation are valid. A query from another valid Grant of the same person returns only the account state. The query writes nothing to subscriptions, connections or Grants and does not save expiry or revocation cleanup (the web status lookup keeps saving it as before). No callback, delivery or challenge is made.
+
+| Failure | Response (never includes a state) |
+| --- | --- |
+| Unauthenticated, expired, another resource, missing scope | Existing Bearer authentication error (401/403) |
+| Grant revoked, use stopped, consent or receiver reset generation mismatch, source stopped or generation changed (including during the query) | Forbidden (`data.reason` = `access_revoked`) |
+| The access token itself expires before the query starts or before the result is returned | Internal error (`Access token expired`) |
+| Concurrent version change during the query | Internal error (`Subscription changed concurrently`) |
+| Storage or key failure, corrupted document | Internal error (fixed message) |
+| Request deadline exceeded, disconnect, shutdown | No success response |
+
+Only the direct deployment's `/mcp` provides this tool. In the URL-preserving gateway deployment (gateway-v1) MCP backend and the Playground entry, `tools/list` stays empty and `tools/call` is not provided (Method not found).
 
 The payload (`data`) is exactly the four fields `schemaVersion`(2), `commandId`, `text` and `expiresAt` in this order, with no additional fields (`createdAt` is not included). `text` is the same string the send API accepted.
 

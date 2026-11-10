@@ -261,3 +261,37 @@ test('互換配置（strict起動設定なし）: 承認routeは404、同意は�
   assert.ok([302, 303].includes(done.status), `compat consent (${done.status})`);
   assert.equal(paths(compat, 'sourceGrants').length, 0);
 });
+
+test('受信状態の照会（strict）: bound Grantは状態を返し、旧（unbound）Grant・source停止・世代違いは状態なしで拒否、照会の書込み0', async () => {
+  const { createSubscriptionRuntime } = await import('./fixtures/source-runtime.mjs');
+  const { newSourceGeneration, newSourceId } = await import('../dist/source/admin.js');
+  const s = await createSubscriptionRuntime();
+  try {
+    const now = Date.now();
+    const source = { schemaVersion: 1, sourceId: newSourceId(), kind: 'app', state: 'active', generation: newSourceGeneration(), operations: ['send', 'connect'], appId: '1:123456789012:ios:0123abcd', createdAt: now, updatedAt: now };
+    assert.equal(await s.sources.create(source), 'created');
+    const sourcePath = `sttdConnect/${s.NS}/sources/${source.sourceId}`;
+    const good = await s.enroll();
+    s.bind(good.grantId, source);
+    let versions = s.versions();
+    assert.deepEqual(await s.status(good), { ok: true, value: 'none' });
+    assert.equal(s.versions(), versions, 'linked query writes nothing');
+    assert.equal((await s.subscribe(good)).ok, true);
+    versions = s.versions();
+    assert.deepEqual(await s.status(good), { ok: true, value: 'subscribed' });
+    assert.equal(s.versions(), versions, 'subscribed query writes nothing');
+    // 旧（unbound）Grant: 利用許可があっても状態を返さない。
+    const legacy = await s.enroll();
+    assert.deepEqual(await s.status(legacy), { ok: false, kind: 'grant_inactive' });
+    // sourceの停止・世代違い（再有効化）: 状態なし。
+    s.docs.set(sourcePath, { data: { ...source, state: 'disabled', updatedAt: source.updatedAt + 1 }, updateTime: { seconds: 1, nanoseconds: 1 } });
+    versions = s.versions();
+    assert.deepEqual(await s.status(good), { ok: false, kind: 'grant_inactive' });
+    s.docs.set(sourcePath, { data: { ...source, generation: newSourceGeneration(), updatedAt: source.updatedAt + 2 }, updateTime: { seconds: 2, nanoseconds: 2 } });
+    assert.deepEqual(await s.status(good), { ok: false, kind: 'grant_inactive' });
+    assert.equal(s.versions().replace(/"seconds":2,"nanoseconds":2/, '"seconds":1,"nanoseconds":1'), versions, 'refused queries write nothing');
+    assert.ok(s.subscriptionOf(good.ownerId)?.active, 'the stored subscription is untouched');
+  } finally {
+    await s.close();
+  }
+});

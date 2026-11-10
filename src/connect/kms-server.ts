@@ -31,7 +31,7 @@ import {
   KmsConnectionSubscriptionViewError,
   type KmsConnectionSubscriptionView,
 } from '../events/kms-subscription-view.js';
-import type { SubscribeInput, SubscriptionAuth, VerificationSender } from '../events/subscriptions.js';
+import { SubscribeError, type SubscribeInput, type SubscriptionAuth, type VerificationSender } from '../events/subscriptions.js';
 import { assertNoBody, readForm, readJson } from '../http/body.js';
 import type { LogSink } from '../http/log.js';
 import { IdentityError, type IdentityVerifier, type VerifiedIdentity } from '../identity/firebase.js';
@@ -47,7 +47,7 @@ import {
 import { DEVELOPER_LOGIN_PURPOSE, defaultRandom, developerLoginKeys } from '../identity/developer-login.js';
 import { DeveloperLoginStore } from '../identity/developer-login-store.js';
 import { connectIdentityHash } from './firestore.js';
-import type { McpEntry, McpRequestOperation, RequestScopedSubscriptionPort } from '../mcp/request-operation.js';
+import type { McpEntry, McpRequestOperation, RequestScopedReceivingStatusPort, RequestScopedSubscriptionPort } from '../mcp/request-operation.js';
 import { createRequestScopedMcpEntry } from '../mcp/request-scoped-entry.js';
 import { runConsent } from './interaction-consent.js';
 import { CHATGPT_CIMD_CANDIDATE } from '../oauth/cimd.js';
@@ -1044,6 +1044,23 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       unsubscribe: (auth: SubscriptionAuth, identityInput: { readonly name: string; readonly url: string }, operation: McpRequestOperation) =>
         scoped(operation, (current) => service.unsubscribe(auth, identityInput, current)),
     });
+    /**
+     * 通常MCPの受信状態照会（読取りだけ）。viewForの整理保存とは別のstatusForを同じcontext.runで呼び、noneは接続済みの購読待ち（linked）。
+     * 要求Grant・利用許可の不成立は既存のgrant_inactive、版の競合は既存のconflictへ写し、他の固定errorはそのまま（入口が固定InternalError）。
+     */
+    const receivingStatus: RequestScopedReceivingStatusPort = Object.freeze({
+      statusFor: (auth: SubscriptionAuth, operation: McpRequestOperation) =>
+        scoped(operation, async (current) => {
+          try {
+            const viewed = await view.statusFor(auth, current);
+            return viewed === 'none' ? 'linked' : viewed;
+          } catch (error) {
+            if (error instanceof KmsConnectionSubscriptionViewError && error.code === 'grant_inactive') throw new SubscribeError({ kind: 'grant_inactive' });
+            if (error instanceof KmsConnectionSubscriptionViewError && error.code === 'conflict') throw new SubscribeError({ kind: 'conflict' });
+            throw error;
+          }
+        }),
+    });
 
     const mcp = createRequestScopedMcpEntry(
       {
@@ -1052,6 +1069,8 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         clock,
         resolveOAuthOwner: resolver,
         subscriptions,
+        // 通常のdirect配置だけ。gateway-v1のMCP backend（transportAuthorityあり）は対象外で、従来どおり空一覧。
+        ...(config.transportAuthority === undefined ? { receivingStatus } : {}),
         onError: (category) => log({ event: 'mcp.error', category }),
       },
       {

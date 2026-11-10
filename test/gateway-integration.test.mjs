@@ -47,10 +47,13 @@ const CLIENT_JWK = { ...CLIENT_KEY.publicKey.export({ format: 'jwk' }), kid: 'sy
 
 let rt;
 let connectGateway;
+/** 通常direct配置（transportAuthorityなし）の同じ実connect server。MCPのhelperはrtをこれへ差し替えた時だけ直接送る。 */
+let direct;
 const sent = [];
 
 before(async () => {
   rt = await startConnectHttpRuntime({ strict: true, transportAuthority: CONNECT_BACKEND_HOST, clientJwks: [CLIENT_JWK], echoChallenge: true });
+  direct = await startConnectHttpRuntime({ strict: true, clientJwks: [CLIENT_JWK], echoChallenge: true });
   countListener();
   const config = configFor(rt.issuer);
   const iam = iamFetcher();
@@ -72,6 +75,7 @@ before(async () => {
 
 after(async () => {
   await rt?.close();
+  await direct?.close();
   await closeAll();
   assert.ok(listenerCount() <= 20);
 });
@@ -215,7 +219,7 @@ test('API: 公開audienceへの正規source署名がgateway→実adapter→実ha
 // ---------- MCP ----------
 
 const paths = (collection) => [...rt.docs.keys()].filter((path) => path.startsWith(`${rt.root}/${collection}/`));
-const viaGateway = () => rt.browser({ via: connectGateway.port });
+const viaGateway = () => (rt === direct ? rt.browser() : rt.browser({ via: connectGateway.port }));
 
 async function startFlow() {
   const b = viaGateway();
@@ -505,7 +509,14 @@ function tokenRequest(fields) {
 function mcpCall(accessToken, id, method, params = {}) {
   return viaGateway().request('POST', '/mcp', {
     cookies: false,
-    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'MCP-Protocol-Version': '2026-07-28', 'Mcp-Method': method },
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      'MCP-Protocol-Version': '2026-07-28',
+      'Mcp-Method': method,
+      ...(method === 'tools/call' ? { 'Mcp-Name': params.name } : {}),
+    },
     // 2026-07-28版の要求ごとのenvelope（test/mcp-subscribe-audit.test.mjsと同じ最小の値）。
     body: JSON.stringify({ jsonrpc: '2.0', id, method, params: { ...params, _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {} } } }),
   });
@@ -533,7 +544,18 @@ test('MCP: gateway経由で元の公開URLのcode交換（PKCE・private_key_jwt
   // 認証済みMCP: serverが支持する版（MCP-Protocol-Version header・旧initialize手順なし）のtools/listが元resourceのBearerで成功する。
   const tools = await mcpCall(rotated.access_token, 2, 'tools/list');
   assert.equal(tools.status, 200, tools.body);
-  assert.match(tools.body, /"tools"/);
+  // gateway-v1のMCP backendは受信状態照会の対象外: 一覧は従来どおり空で、tools/callは未提供（照会0・文書書込み0）。
+  assert.deepEqual(JSON.parse(tools.body).result.tools, []);
+  const allVersions = () => JSON.stringify([...rt.docs.keys()].sort().map((path) => [path, JSON.stringify(rt.docs.get(path))]));
+  const statusCall = async (id, args) => {
+    const before = allVersions();
+    const response = await mcpCall(rotated.access_token, id, 'tools/call', { name: 'get_receiving_status', ...(args === undefined ? {} : { arguments: args }) });
+    assert.equal(allVersions(), before, 'tools/call writes no document');
+    return response;
+  };
+  const notProvided = await statusCall(20);
+  assert.equal(JSON.parse(notProvided.body).error?.code, -32601, notProvided.body);
+  assert.doesNotMatch(notProvided.body, /linked|subscribed|"state"/);
   // 購読保存: 実registration runtime/storeが合成callback challengeを確認して保存する（実HTTP 0）。
   const subscribe = (token, id) =>
     mcpCall(token, id, 'events/subscribe', { name: 'text.submitted', delivery: { mode: 'webhook', url: `https://hooks.sttd-gateway.example/${randomBytes(6).toString('hex')}`, secret: `whsec_${randomBytes(32).toString('base64')}` } });
@@ -545,6 +567,9 @@ test('MCP: gateway経由で元の公開URLのcode交換（PKCE・private_key_jwt
   assert.doesNotMatch(saved.body, /"error"/);
   assert.equal(rt.challenges.length, challengesBefore + 1);
   assert.equal(subscriptions().length, 1, 'subscription saved in the real store');
+  const stillNotProvided = await statusCall(21, {});
+  assert.equal(JSON.parse(stillNotProvided.body).error?.code, -32601, stillNotProvided.body);
+  assert.equal(rt.challenges.length, challengesBefore + 1, 'tools/call sends no challenge');
   const savedState = JSON.stringify(rt.docs.get(subscriptions()[0]).data);
   const refusedMcp = (res) => res.status !== 200 || !/"result"/.test(res.body);
   // Grantのsourceを停止すると、同じrefresh系列・access tokenは使えず、購読保存も拒否される。
@@ -561,4 +586,58 @@ test('MCP: gateway経由で元の公開URLのcode交換（PKCE・private_key_jwt
   assert.notEqual(refreshAfterStop.status, 200);
   // 同じcodeの再利用は拒否（Providerの単回利用。Providerは再利用で系列も失効させるため最後に確認）。
   assert.notEqual((await tokenRequest({ grant_type: 'authorization_code', code, redirect_uri: CHATGPT_CIMD_CANDIDATE.redirectUri, code_verifier: flow.verifier, resource: resourceFor(rt.issuer) })).status, 200);
+});
+
+test('MCP direct: 通常direct配置の実connect server・実Provider・実OAuth（PKCE・private_key_jwt）で、get_receiving_statusを1件発見し、引数省略/{}の実呼出しが実状態portの状態を返す（文書書込み0）', async () => {
+  const gatewayRuntime = rt;
+  rt = direct;
+  try {
+    const person = await rt.enrollPerson('uid-direct-status');
+    const flow = await startFlow();
+    await login(flow, person);
+    assert.equal((await approval('POST', flow.uid, person, { body: APPROVE })).status, 200);
+    const done = await consent(flow, await consentPage(flow));
+    assert.ok([302, 303].includes(done.status));
+    const resumed = await flow.b.request('GET', new URL(done.headers.location, rt.issuer).pathname);
+    const code = new URL(resumed.headers.location).searchParams.get('code');
+    assert.ok(code);
+    const exchanged = await tokenRequest({ grant_type: 'authorization_code', code, redirect_uri: CHATGPT_CIMD_CANDIDATE.redirectUri, code_verifier: flow.verifier, resource: resourceFor(rt.issuer) });
+    assert.equal(exchanged.status, 200, exchanged.body);
+    const token = JSON.parse(exchanged.body).access_token;
+    assert.ok(token);
+    // 発見: 読取り専用のget_receiving_status 1件だけ。
+    const listed = await mcpCall(token, 1, 'tools/list');
+    assert.equal(listed.status, 200, listed.body);
+    const tools = JSON.parse(listed.body).result.tools;
+    assert.deepEqual(
+      tools.map((tool) => [tool.name, tool.annotations.readOnlyHint, tool.annotations.destructiveHint, tool.annotations.openWorldHint, JSON.stringify(tool.inputSchema)]),
+      [['get_receiving_status', true, false, false, JSON.stringify({ type: 'object', properties: {}, additionalProperties: false })]],
+    );
+    const documents = () => JSON.stringify([...rt.docs.keys()].sort().map((path) => [path, JSON.stringify(rt.docs.get(path))]));
+    const status = async (id, args) => {
+      const before = documents();
+      const challenges = rt.challenges.length;
+      const response = await mcpCall(token, id, 'tools/call', { name: 'get_receiving_status', ...(args === undefined ? {} : { arguments: args }) });
+      assert.equal(response.status, 200, response.body);
+      assert.equal(documents(), before, 'the status query writes no document');
+      assert.equal(rt.challenges.length, challenges, 'the status query sends no challenge');
+      const { result } = JSON.parse(response.body);
+      assert.deepEqual(result.content, [{ type: 'text', text: JSON.stringify(result.structuredContent) }]);
+      return result.structuredContent;
+    };
+    // 実状態port（view.statusFor・strict source・実Grant開封）: 購読前は購読待ち、購読後は受信中。
+    assert.deepEqual(await status(2), { state: 'linked' });
+    const saved = await mcpCall(token, 3, 'events/subscribe', { name: 'text.submitted', delivery: { mode: 'webhook', url: `https://hooks.sttd-direct.example/${randomBytes(6).toString('hex')}`, secret: `whsec_${randomBytes(32).toString('base64')}` } });
+    assert.equal(saved.status, 200, saved.body);
+    assert.match(saved.body, /"result"/);
+    assert.deepEqual(await status(4, {}), { state: 'subscribed' });
+    assert.deepEqual(await status(5), { state: 'subscribed' });
+    // sourceの停止後は認証で拒否され、状態は出ない。
+    rt.write(`${rt.root}/sources/${person.record.sourceId}`, { ...person.record, state: 'disabled', updatedAt: person.record.updatedAt + 1 });
+    const stopped = await mcpCall(token, 6, 'tools/call', { name: 'get_receiving_status' });
+    assert.ok(stopped.status !== 200 || !/"result"/.test(stopped.body), `${stopped.status}`);
+    assert.doesNotMatch(stopped.body, /subscribed|linked/);
+  } finally {
+    rt = gatewayRuntime;
+  }
 });
