@@ -1,5 +1,5 @@
 // OAuth interactionの同意（POST）の手順を、純粋なport（保存・Grant・redirect・応答状態・ログ）だけで行う。HTTP・cookie・HTMLはserver側。
-//   1. 同意の消費（保存の1つのtransaction。受信先設定の削除の確認と同時）。未確認・表示後の変化は消費・削除0で再表示。
+//   1. 同意の消費と旧受信先の削除を1つのtransactionで行う。表示後の変化は消費・削除0で再表示。
 //   2. 段階A: ownerの現在のactive → Grantの保存 → grantMeta（利用許可の世代と受信reset世代を同じtransactionで再確認）。
 //   3. 段階B: redirect（interactionFinished）。
 // 受信先設定を消した（確定した）後の失敗は、段階で分けて固定の結果にする: 段階Aは「削除済み・接続未完了」（incomplete）、段階Bは
@@ -9,8 +9,7 @@
 import type { CheckedConsent, ConsentRecord } from './firestore.js';
 
 export interface ConsentPorts {
-  /** 同意の消費（CSRF・snapshot token・確認の有無）。 */
-  consume(input: { readonly csrf: string; readonly token: string; readonly confirm: boolean }): Promise<CheckedConsent>;
+  consume(input: { readonly csrf: string; readonly token: string }): Promise<CheckedConsent>;
   isOwnerActive(ownerId: string): Promise<boolean>;
   /** 同意したownerのGrantを保存してIDを返す。 */
   saveGrant(ownerId: string): Promise<string>;
@@ -30,13 +29,13 @@ export type ConsentResult =
   | { readonly kind: 'receiver_reset'; readonly outcome: 'incomplete' | 'unknown' | 'reset_unknown' }
   | { readonly kind: 'none' };
 
-export async function runConsent(ports: ConsentPorts, input: { readonly csrf: string; readonly token: string; readonly confirm: boolean }): Promise<ConsentResult> {
+export async function runConsent(ports: ConsentPorts, input: { readonly csrf: string; readonly token: string }): Promise<ConsentResult> {
   let consent: CheckedConsent;
   try {
     consent = await ports.consume(input);
   } catch (error) {
     // 確認付きの消費（削除を含み得るtransaction）の結果が不明。削除済みとも未削除とも断定しない。
-    if (input.confirm) {
+    if (input.token !== '') {
       ports.log({ event: 'interaction.receiver_reset_incomplete', category: 'reset_unknown' });
       return { kind: 'receiver_reset', outcome: 'reset_unknown' };
     }
@@ -44,7 +43,7 @@ export async function runConsent(ports: ConsentPorts, input: { readonly csrf: st
   }
   if (consent === undefined) return { kind: 'link_unavailable' };
   if (consent === 'denied') return { kind: 'access_denied' };
-  if (consent === 'changed' || consent === 'confirm_required') return { kind: 'reshow' };
+  if (consent === 'changed') return { kind: 'reshow' };
   const reset = consent.receiverReset === true;
   if (reset) ports.log({ event: 'interaction.receiver_reset' });
   const incomplete = (): ConsentResult => {

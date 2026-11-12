@@ -78,6 +78,60 @@ function helper(initialState = 'subscribed') {
   return { state, onFetch };
 }
 
+test('pairing wizard: rejects progress until registered and requires re-registration after removal', async () => {
+  const { onFetch } = helper('subscribed');
+  const sdk = syntheticSdk();
+  const seen = [];
+  let paired = false;
+  const ui = await runConsole({
+    html: consoleAsset('/console', WEB, { language: 'ja', nonce: NONCE, secure: false, connectedApps: true }).body,
+    sdk,
+    onFetch(entry) {
+      seen.push(entry);
+      if (entry.url === '/v1/source/pair') {
+        assert.equal(entry.headers[LOCAL_NONCE_HEADER], NONCE);
+        assert.equal(entry.headers.Authorization, 'Bearer synthetic-id-token');
+        if (entry.method === 'GET') return { status: 200, json: { allowed: paired } };
+        assert.deepEqual(JSON.parse(entry.body), { code: 'aB_23456-Cd7' });
+        paired = true;
+        return { status: 200, json: { linked: true } };
+      }
+      return onFetch(entry);
+    },
+  });
+  assert.equal(ui.el('sttd-app-pairing').hidden, true);
+  assert.equal(seen.length, 0);
+  ui.el('sttd-login').click();
+  await settle();
+  assert.equal(ui.el('sttd-app-pairing').hidden, false);
+  ui.el('sttd-refresh').click();
+  await settle();
+  assert.equal(ui.stepState(2), 'current');
+  assert.equal(ui.stepState(3), 'locked');
+  assert.equal(ui.el('sttd-pair-result').textContent, JA('pairing.required'));
+
+  ui.el('sttd-pair-code').value = 'short';
+  ui.el('sttd-pair-submit').click();
+  assert.equal(ui.el('sttd-pair-result').textContent, JA('pairing.invalid'));
+  ui.el('sttd-pair-code').value = 'aB_23456-Cd7';
+  ui.el('sttd-pair-submit').click();
+  ui.el('sttd-pair-submit').click();
+  await settle();
+  assert.equal(seen.filter((r) => r.url === '/v1/source/pair' && r.method === 'POST').length, 1);
+  assert.equal(ui.el('sttd-pair-code').value, '');
+  assert.equal(ui.el('sttd-pair-result').textContent, JA('pairing.success'));
+  ui.el('sttd-refresh').click();
+  await settle();
+  assert.equal(ui.stepState(3), 'current');
+
+  paired = false;
+  ui.el('sttd-panel-2').click();
+  ui.el('sttd-refresh').click();
+  await settle();
+  assert.equal(ui.stepState(2), 'current');
+  assert.equal(ui.el('sttd-pair-result').textContent, JA('pairing.required'));
+});
+
 function clipboardStub() {
   const clipboard = { writes: [], mode: 'ok' };
   const navigator = {
@@ -795,6 +849,7 @@ test('W7 disconnect from step 2: confirm first, one POST, steps 2+ reset and the
   assert.equal(el('sttd-disconnect-result').textContent, JA('common.disconnectDone'));
   assert.deepEqual([ui.stepState(2), ui.stepState(3), ui.stepState(4)], ['current', 'locked', 'locked']);
   assert.equal(el('sttd-state-guide').textContent, JA('wizard.next.unlinked'), 're-checked after the disconnect');
+  assert.equal(el('sttd-disconnect').hidden, false, 'an unlinked account can delete any saved settings');
   assert.equal(el('sttd-wizard-note').textContent, JA('wizard.stateReset'));
   results.W7 = { disconnects: state.disconnects };
 });

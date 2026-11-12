@@ -17,14 +17,18 @@ import {
   type KmsSubscriptionRecord,
 } from './kms-subscription-format.js';
 
-/** 外へ出すのはこの6分類だけ。元の例外・cause・URL・secret・payload・owner・Grant・capsule・planを持たない。 */
+/**
+ * 外へ出すのはこの7分類だけ。元の例外・cause・URL・secret・payload・owner・Grant・capsule・planを持たない。
+ * destination_refusedは審査・テスト専用ownerの受信先規則（reviewerDestinationAllowed）の不成立だけ。
+ */
 export type KmsSubscriptionRegistrationErrorCode =
   | 'invalid_input'
   | 'unavailable'
   | 'timed_out'
   | 'aborted'
   | 'grant_inactive'
-  | 'conflict';
+  | 'conflict'
+  | 'destination_refused';
 
 const ERROR_MESSAGES: Readonly<Record<KmsSubscriptionRegistrationErrorCode, string>> = {
   invalid_input: 'kms subscription registration: invalid input',
@@ -33,7 +37,112 @@ const ERROR_MESSAGES: Readonly<Record<KmsSubscriptionRegistrationErrorCode, stri
   aborted: 'kms subscription registration: aborted',
   grant_inactive: 'kms subscription registration: grant inactive',
   conflict: 'kms subscription registration: conflict',
+  destination_refused: 'kms subscription registration: destination refused',
 };
+
+/**
+ * 審査・テスト専用owner（owner文書のloginKind='reviewer'）の受信先規則。URLは持たない（URLの判定は呼出し側がclaimへ写す）。
+ *   - off: 機能offの配置。審査ownerの購読・解除を全て拒否する。
+ *   - standard: 通常の購読・解除規則を適用する。
+ *   - exact: 運用者が設定した完全一致URLだけ（claim='listed'）。以後は既存の購読規則（既知の受信先・変更待ち）のまま。
+ *   - first: 初回固定。既知の受信先（knownDestinationId）が無い間は、設定オリジン（claim='listed'）かつ絶対時間枠[startsAt, endsAt)の
+ *     時だけ初回の確認へ進める。既知の受信先がある時は、同じid（同じURL）の更新・解除・再購読だけ（時間枠の外でも可。別idは拒否）。
+ */
+export type ReviewerDestinationPolicy =
+  | { readonly kind: 'off' }
+  | { readonly kind: 'standard' }
+  | { readonly kind: 'exact' }
+  | { readonly kind: 'first'; readonly startsAt: number; readonly endsAt: number };
+
+/** 呼出し側がURLから決めた分類（exact: 完全一致リストにある、first: 設定オリジンと一致）。 */
+export type DestinationClaim = 'listed' | 'unlisted';
+
+export const REVIEWER_DESTINATIONS_OFF: ReviewerDestinationPolicy = Object.freeze({ kind: 'off' });
+
+function isReviewerOwnerData(ownerData: unknown): boolean {
+  if (typeof ownerData !== 'object' || ownerData === null) return false;
+  const descriptor = Object.getOwnPropertyDescriptor(ownerData, 'loginKind');
+  return descriptor !== undefined && 'value' in descriptor && descriptor.value === 'reviewer';
+}
+
+/**
+ * 購読（登録）の可否。審査owner以外は常にtrue（通常の利用者の規則は変えない）。分類transaction（challenge・pending保存の前）と
+ * 確定transaction（challenge後）の両方で、その時の最新のowner文書・投影後の状態・時刻で同じ判定をする。awaitしない。
+ */
+export function reviewerDestinationAllowed(
+  policy: ReviewerDestinationPolicy,
+  ownerData: unknown,
+  state: Pick<KmsMutableState, 'knownDestinationId'>,
+  requestId: string,
+  claim: DestinationClaim,
+  at: number,
+  receiverGeneration: number,
+): boolean {
+  if (!isReviewerOwnerData(ownerData)) return true;
+  switch (policy.kind) {
+    case 'standard':
+      return true;
+    case 'exact':
+      return claim === 'listed';
+    case 'first':
+      if (state.knownDestinationId !== null) return state.knownDestinationId === requestId;
+      // 接続承認で旧受信先を削除した後は、現在の世代のGrantで設定済みのオリジンに再登録できる。
+      return claim === 'listed' && Number.isSafeInteger(at) && (receiverGeneration > 0 || (policy.startsAt <= at && at < policy.endsAt));
+    default:
+      return false;
+  }
+}
+
+/** 解除の可否。審査owner以外は常にtrue。first: 固定済みの同じidだけ（未固定・別idは拒否）。exact: 完全一致URLだけ。 */
+export function reviewerCancelAllowed(
+  policy: ReviewerDestinationPolicy,
+  ownerData: unknown,
+  state: Pick<KmsMutableState, 'knownDestinationId'>,
+  id: string,
+  claim: DestinationClaim,
+): boolean {
+  if (!isReviewerOwnerData(ownerData)) return true;
+  switch (policy.kind) {
+    case 'standard':
+      return true;
+    case 'exact':
+      return claim === 'listed';
+    case 'first':
+      return state.knownDestinationId !== null && state.knownDestinationId === id;
+    default:
+      return false;
+  }
+}
+
+/** storeへ渡すpolicyの検査と凍結した写し（不正はinvalid_input）。 */
+export function copyReviewerPolicy(value: unknown): ReviewerDestinationPolicy {
+  if (value === undefined) return REVIEWER_DESTINATIONS_OFF;
+  const invalid = () => registrationError('invalid_input');
+  if (typeof value !== 'object' || value === null || types.isProxy(value)) throw invalid();
+  const kindDescriptor = Object.getOwnPropertyDescriptor(value, 'kind');
+  const kind: unknown = kindDescriptor !== undefined && 'value' in kindDescriptor ? kindDescriptor.value : undefined;
+  if (kind === 'off' || kind === 'standard' || kind === 'exact') {
+    exactFields(value, ['kind']);
+    return Object.freeze({ kind });
+  }
+  if (kind !== 'first') throw invalid();
+  const fields = exactFields(value, ['kind', 'startsAt', 'endsAt']);
+  const startsAt = fields.get('startsAt');
+  const endsAt = fields.get('endsAt');
+  if (typeof startsAt !== 'number' || typeof endsAt !== 'number' || !Number.isSafeInteger(startsAt) || !Number.isSafeInteger(endsAt)) throw invalid();
+  if (!(startsAt >= 0 && startsAt < endsAt && endsAt - startsAt <= REVIEWER_FIRST_WINDOW_MAX_MS)) throw invalid();
+  return Object.freeze({ kind: 'first', startsAt, endsAt });
+}
+
+/** 初回固定の絶対時間枠の上限（15分）。 */
+export const REVIEWER_FIRST_WINDOW_MAX_MS = 15 * 60 * 1000;
+
+/** 呼出し側のclaimの検査（未指定は'unlisted'＝拒否側）。 */
+export function copyClaim(value: unknown): DestinationClaim {
+  if (value === undefined) return 'unlisted';
+  if (value !== 'listed' && value !== 'unlisted') throw registrationError('invalid_input');
+  return value;
+}
 
 export class KmsSubscriptionRegistrationError extends Error {
   override readonly name = 'KmsSubscriptionRegistrationError';

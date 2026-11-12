@@ -31,7 +31,7 @@ import type { KeyManagementServiceClient } from '@google-cloud/kms';
 import type { SecretManagerServiceClient } from '@google-cloud/secret-manager';
 import type { App, Credential } from 'firebase-admin/app';
 
-import { loadDeploymentConfig, type DeploymentConfig } from '../config/validate.js';
+import { loadDeploymentConfig, reviewerUidsOf, type DeploymentConfig } from '../config/validate.js';
 import { boundedMemoryHintAccepted, RUNTIME_REFUSED_ENV } from '../policy.js';
 import { createFirebaseAdminVerifier, type AdminAuthLike, type IdentityVerifier } from '../identity/firebase.js';
 import { captureClock, dataFields, isEpochMs, isRealSignal, methodOf, ownValue } from '../protection/google-sdk-call.js';
@@ -431,7 +431,9 @@ export async function openDevelopmentGoogleSdk(options: DevelopmentGoogleSdkOpti
     });
     // 開発者向けコードの照合は、起動口が秘密を読んだ後に同じ配置の保存層を結ぶ（未結合＝機能off。customのID tokenを受けない）。
     const codeIdentities = createLateCodeIdentityCheck();
-    const identity = createFirebaseAdminVerifier({ auth: ownAuth, projectId: PROJECT_ID, codeIdentities });
+    // 審査・テスト専用UID（配置設定でonの時だけ）。API・MCPが共有するこのverifierは、そのUIDを一般の本人としてどのproviderでも受けない。
+    const reviewerUids = reviewerUidsOf(deployment);
+    const identity = createFirebaseAdminVerifier({ auth: ownAuth, projectId: PROJECT_ID, codeIdentities, ...(reviewerUids !== undefined ? { reviewerUids } : {}) });
     const developerCode: DevelopmentDeveloperCode = Object.freeze({
       lookup: codeIdentities,
       auth: Object.freeze({

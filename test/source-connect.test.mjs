@@ -110,7 +110,7 @@ async function consented(d, uid, interactionId) {
   const opened = await d.storage.openInteraction(interactionId);
   assert.equal(await d.storage.bindInteraction(interactionId, opened.csrf, admitted.ownerId, Math.floor(BASE / 1000), admitted.accessGeneration, 'developer_code'), 'ok');
   assert.deepEqual(await d.storage.interactionForApproval(interactionId), { ownerId: admitted.ownerId, expiresAt: BASE + 300_000 });
-  const consent = await d.storage.consumeInteractionChecked(interactionId, opened.csrf, '', false);
+  const consent = await d.storage.consumeInteractionChecked(interactionId, opened.csrf, '');
   assert.equal(typeof consent, 'object');
   return { ownerId: admitted.ownerId, consent };
 }
@@ -422,12 +422,13 @@ test('同意画面: strictだけ参照・承認方法・状態（待機/承認�
     ['ja', { waiting: '承認待ち', confirmed: '承認済み', required: '有効な承認がまだありません' }],
   ]) {
     for (const state of ['waiting', 'confirmed', 'required']) {
-      const html = renderInteractionConsent(web, 'ia-ref', 'Dots', 'csrf-1', language, { token: 'tok', confirm: true }, { reference: 'ia-ref', state });
+      const html = renderInteractionConsent(web, 'ia-ref', 'Dots', 'csrf-1', language, { token: 'tok', present: true }, { reference: 'ia-ref', state });
       assert.ok(html.includes('<code id="sttd-source-reference">ia-ref</code>'));
       assert.ok(html.includes(`data-sttd-source-state="${state}"`));
       assert.ok(html.includes(expected[state]), `${language}/${state}`);
       // 既存のCSRF・受信先設定の確認欄は残る。
-      assert.ok(html.includes('name="csrf" value="csrf-1"') && html.includes('name="receiverReset"'));
+      assert.ok(html.includes('name="csrf" value="csrf-1"') && html.includes('name="receiverToken"'));
+      assert.doesNotMatch(html, /name="receiverReset"/);
     }
   }
   const escaped = renderInteractionConsent(web, 'x', 'Dots', 'c', 'en', null, { reference: '<script>', state: 'waiting' });
@@ -495,5 +496,172 @@ test('承認本文: 元operationの期限・中止・切断・超過で清掃し
     controller.abort();
     assert.equal(await readApprovalBody(stream, operation, clock), null);
     assert.equal(listeners(stream), 0);
+  }
+});
+
+// ---- T-240 R3: Google wrapper経由の通常MCP起動（playgroundRegistrar）と、同じ購読へのApp Check・Web両sourceからの配送 ----
+import { DEPLOYMENT_CONFIG as R3_DEPLOYMENT } from './fixtures/synthetic-deployment.mjs';
+import { validateDeploymentConfig as r3Validate } from '../dist/config/validate.js';
+import { signSourceRequest as r3Sign } from '../dist/source/proof.js';
+
+test('T240-R3 起動: validateDeploymentConfigのplaygroundRegistrarをGoogle wrapper経由で通常MCPへ渡し、署名付きregisterが200、再送・署名不一致は403、未設定は404。compatible・gatewayの配置は設定error', async () => {
+  const { startConnectHttpRuntime } = await import('./fixtures/source-runtime.mjs');
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const registrar = { sourceId: newSourceId(), publicKey: publicKey.export({ format: 'jwk' }).x };
+  const strict = { mode: 'strict-v1', methods: ['developer-key-v1'] };
+  const base = structuredClone(R3_DEPLOYMENT);
+  assert.throws(() => r3Validate({ ...base, playgroundRegistrar: registrar }));
+  assert.throws(() => r3Validate({ ...base, sourceAuthorization: strict, playgroundRegistrar: { ...registrar, publicKey: 'x' } }));
+  const deployment = r3Validate({ ...base, sourceAuthorization: strict, playgroundRegistrar: registrar });
+  assert.deepEqual(deployment.playgroundRegistrar, registrar);
+  assert.equal(r3Validate({ ...base, sourceAuthorization: strict }).playgroundRegistrar, undefined);
+  const rt = await startConnectHttpRuntime({ deployment });
+  const off = await startConnectHttpRuntime({ deployment: r3Validate({ ...base, sourceAuthorization: strict }) });
+  try {
+    const path = '/v1/playground/register';
+    const signed = (key = privateKey, bearer = 'id-alice', nonce = randomBytes(16).toString('base64url')) => {
+      const iat = Math.floor(rt.clock.now() / 1000);
+      const sig = r3Sign({ audience: rt.issuer, method: 'POST', path, search: '', sourceId: registrar.sourceId, body: Buffer.from('{}'), bearer, idempotencyKey: undefined }, { issuedAt: iat, expiresAt: iat + 60, nonce }, key);
+      return { 'x-sttd-source': registrar.sourceId, 'x-sttd-source-signature': sig, Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' };
+    };
+    const b = rt.browser();
+    const headers = signed();
+    const ok = await b.request('POST', path, { headers, body: '{}', cookies: false });
+    assert.equal(ok.status, 200, ok.body);
+    const reg = JSON.parse(ok.body);
+    assert.deepEqual(Object.keys(reg).sort(), ['generation', 'sourceId']);
+    const src = rt.docs.get(`${rt.root}/sources/${reg.sourceId}`).data;
+    assert.deepEqual([src.kind, src.publicKey, [...src.operations].sort()], ['developer', registrar.publicKey, ['connect', 'send']]);
+    // 再実行（新しいnonce）は同じID・世代
+    assert.deepEqual(JSON.parse((await b.request('POST', path, { headers: signed(), body: '{}', cookies: false })).body), reg);
+    // 同じ署名の再送・別鍵の署名は403
+    assert.equal((await b.request('POST', path, { headers, body: '{}', cookies: false })).status, 403);
+    assert.equal((await b.request('POST', path, { headers: signed(generateKeyPairSync('ed25519').privateKey), body: '{}', cookies: false })).status, 403);
+    // browserのOriginは拒否
+    assert.equal((await b.request('POST', path, { headers: { ...signed(), Origin: rt.issuer }, body: '{}', cookies: false })).status, 403);
+    // 未設定の配置は404
+    assert.equal((await off.browser().request('POST', path, { headers: signed(), body: '{}', cookies: false })).status, 404);
+  } finally {
+    await rt.close?.();
+    await off.close?.();
+  }
+  // gateway-v1との併用は設定error（今回使わない入口を広げない）
+  const gw = (await import('./fixtures/gateway-runtime.mjs')).topologyConfig?.();
+  if (gw !== undefined) assert.throws(() => r3Validate({ ...gw, sourceAuthorization: strict, playgroundRegistrar: registrar }));
+});
+
+test('T240-R3 同じ購読: 既存の通常許可とApp Check Grantのownerに同じUIDのWeb sourceを追加しても、両方の送信元から同じcallbackへ届き、許可の世代は不変。Webだけ・片方停止・別UIDは送出0', async () => {
+  const { createDeliveryRuntime } = await import('./fixtures/source-runtime.mjs');
+  const w = createDeliveryRuntime();
+  const app = appRecord(w.clock.t);
+  assert.equal(await w.sources.create(app), 'created');
+  const owner = w.enroll({ uid: 'SameUid' });
+  w.bindGrant(owner.grantId, app); // DPADAAで承認した既存Grant
+  const accessPath = `sttdConnect/${w.NS}/access/${owner.identityHash}`;
+  const accessBefore = structuredClone(w.docs.get(accessPath));
+  // 同じUIDのWeb登録（限定routeと同じ store操作）
+  const reg = await w.sources.registerPlayground({ identityHash: owner.identityHash, publicKey: 'A'.repeat(43), expiresAt: null, fresh: { sourceId: newSourceId(), generation: newSourceGeneration() }, newAccessGeneration: randomUUID(), codeIdentity: false });
+  assert.equal(reg.kind, 'registered');
+  assert.deepEqual(w.docs.get(accessPath), accessBefore); // 世代・範囲は不変
+  const appBinding = { sourceId: app.sourceId, generation: app.generation };
+  const webBinding = reg.binding;
+  assert.equal((await w.post(owner, appBinding, owner.identity)).body.state, 'delivered');
+  w.clock.t += 10 * 60_000;
+  assert.equal((await w.post(owner, webBinding, owner.identity)).body.state, 'delivered');
+  assert.equal(w.sent.length, 2); // 同じ購読（同じcallback）へ両方
+  // 別UIDはWeb sourceの要求認可で拒否（本人違い）
+  const other = await w.sources.authorizeRequest({ sourceId: webBinding.sourceId, method: 'developer-key-v1', operation: 'send', identityHash: 'f'.repeat(64), proofMatches: () => true });
+  assert.deepEqual(other, { kind: 'rejected', reason: 'subject' });
+  // Web sourceを停止 → Webからは送出0、App Checkからは継続
+  const webPath = `sttdConnect/${w.NS}/sources/${webBinding.sourceId}`;
+  const web = w.docs.get(webPath);
+  w.clock.t += 10 * 60_000;
+  w.docs.set(webPath, { ...web, state: 'disabled', updatedAt: web.updatedAt + 1 });
+  assert.notEqual((await w.post(owner, webBinding, owner.identity)).body.state, 'delivered');
+  assert.equal(w.sent.length, 2); // 停止したWeb sourceからは送出0
+  w.clock.t += 10 * 60_000;
+  assert.equal((await w.post(owner, appBinding, owner.identity)).body.state, 'delivered');
+  assert.equal(w.sent.length, 3);
+  w.docs.set(webPath, web);
+  // Webだけの本人（範囲web）はApp Check sourceから送出0、Web sourceからは送出
+  w.clock.t += 10 * 60_000;
+  w.docs.set(accessPath, { ...accessBefore, sourceScope: 'web' });
+  assert.notEqual((await w.post(owner, appBinding, owner.identity)).body.state, 'delivered');
+  assert.equal(w.sent.length, 3); // Webだけの本人のApp Check要求は送出0
+  w.clock.t += 10 * 60_000;
+  assert.equal((await w.post(owner, webBinding, owner.identity)).body.state, 'delivered');
+  assert.equal(w.sent.length, 4);
+});
+
+// ---- T-257: OpenAIのアプリ公開のドメイン確認（/.well-known/openai-apps-challenge）。合成値だけ・実トークン0。 ----
+const T257_VALUE = 'synthetic-Challenge_0123.abc~XYZ';
+const T257_PATH = '/.well-known/openai-apps-challenge';
+
+test('T257-1 the configured value is returned only for an exact GET without query: 200, text/plain, no-store, exact bytes without newline; other methods/neighbours/query never show it; OAuth discovery and unauthenticated MCP unchanged', async () => {
+  const { startConnectHttpRuntime } = await import('./fixtures/source-runtime.mjs');
+  const rt = await startConnectHttpRuntime({ openaiAppsChallenge: T257_VALUE });
+  try {
+    const b = rt.browser();
+    const ok = await b.request('GET', T257_PATH, { cookies: false });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body, T257_VALUE);
+    assert.equal(Buffer.byteLength(ok.body), Buffer.byteLength(T257_VALUE)); // 改行なし
+    assert.equal(ok.headers['content-type'], 'text/plain; charset=utf-8');
+    assert.equal(ok.headers['cache-control'], 'no-store');
+    assert.equal(ok.headers['content-length'], String(Buffer.byteLength(T257_VALUE)));
+    for (const method of ['POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS']) {
+      const r = await b.request(method, T257_PATH, { cookies: false });
+      assert.notEqual(r.status, 200, method);
+      assert.ok(!r.body.includes(T257_VALUE), method);
+    }
+    // 空の「?」とドット区間は、正規化前の生のrequest-targetのまま送る（合成browserのrawTarget）。
+    for (const near of [`${T257_PATH}?`, '/.well-known/./openai-apps-challenge']) {
+      const r = await b.request('GET', near, { cookies: false, rawTarget: true });
+      assert.ok(!(r.status === 200 && r.body === T257_VALUE) && !r.body.includes(T257_VALUE), `raw ${near}`);
+    }
+    for (const near of [`${T257_PATH}/`, `${T257_PATH}.txt`, `${T257_PATH}?x=1`, '/.well-known/OPENAI-APPS-CHALLENGE', '/.well-known/openai-apps-challenge%2F', '/.well-known/openai-apps', '/openai-apps-challenge']) {
+      const r = await b.request('GET', near, { cookies: false });
+      assert.ok(!(r.status === 200 && r.body === T257_VALUE) && !r.body.includes(T257_VALUE), near);
+    }
+    // 既存のOAuth/MCP契約
+    assert.equal((await b.request('GET', '/.well-known/oauth-protected-resource/mcp', { cookies: false })).status, 200);
+    assert.equal((await b.request('GET', '/.well-known/oauth-authorization-server', { cookies: false })).status, 200);
+    const mcp = await b.request('POST', '/mcp', { cookies: false, headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' }, body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' });
+    assert.equal(mcp.status, 401);
+    assert.ok(!mcp.body.includes(T257_VALUE));
+  } finally {
+    await rt.close();
+  }
+});
+
+test('T257-2 without the option the path stays 404 (as before); an explicit invalid value refuses startup with a fixed config error that does not contain the value', async () => {
+  const { startConnectHttpRuntime } = await import('./fixtures/source-runtime.mjs');
+  const { isOpenAiAppsChallenge, OPENAI_APPS_CHALLENGE_PATH } = await import('../dist/connect/kms-server.js');
+  assert.equal(OPENAI_APPS_CHALLENGE_PATH, T257_PATH);
+  const off = await startConnectHttpRuntime();
+  try {
+    const r = await off.browser().request('GET', T257_PATH, { cookies: false });
+    assert.equal(r.status, 404);
+  } finally {
+    await off.close();
+  }
+  for (const bad of ['', 'has space', 'line\n', 'slash/x', 'quote"x', 'é', 'x'.repeat(257), 42, null]) {
+    assert.equal(isOpenAiAppsChallenge(bad), false, String(bad));
+    if (typeof bad !== 'string') continue;
+    await assert.rejects(startConnectHttpRuntime({ openaiAppsChallenge: bad }), (e) => e.code === 'kms_connect_config_invalid' && !(bad.length > 0 && e.message.includes(bad)));
+  }
+  assert.equal(isOpenAiAppsChallenge('x'.repeat(256)), true);
+  assert.equal(isOpenAiAppsChallenge(T257_VALUE), true);
+});
+
+test('T257-3 the Google wrapper forwards the option through its strict allowlist (direct deployment): exact GET 200', async () => {
+  const { startConnectHttpRuntime } = await import('./fixtures/source-runtime.mjs');
+  const deployment = r3Validate({ ...structuredClone(R3_DEPLOYMENT), sourceAuthorization: { mode: 'strict-v1', methods: ['developer-key-v1'] } });
+  const rt = await startConnectHttpRuntime({ deployment, openaiAppsChallenge: T257_VALUE });
+  try {
+    const r = await rt.browser().request('GET', T257_PATH, { cookies: false });
+    assert.deepEqual([r.status, r.body, r.headers['content-type']], [200, T257_VALUE, 'text/plain; charset=utf-8']);
+  } finally {
+    await rt.close();
   }
 });

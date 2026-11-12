@@ -31,9 +31,15 @@ export interface VerifiedIdentity {
   readonly uid: string;
   /** Firebaseへの認証時刻（epoch秒）。 */
   readonly authTimeSec: number;
-  /** 開発者向けコード由来は'developer_code'、Googleは'google'（Appleは省略＝従来どおり）。 */
-  readonly method?: 'developer_code' | 'google';
+  /**
+   * 開発者向けコード由来は'developer_code'、Googleは'google'（Appleは省略＝従来どおり）。'reviewer'は審査・テスト専用ログイン
+   * （verifyReviewerIdTokenだけが返す。通常のverifyIdTokenは返さない）。
+   */
+  readonly method?: 'developer_code' | 'google' | 'reviewer';
 }
+
+/** Firebaseのメール・パスワード認証のprovider ID（審査・テスト専用ログインだけで受ける）。 */
+export const PASSWORD_PROVIDER_ID = 'password';
 
 /**
  * 開発者向けコードのidentity照合（任意。未設定ならcustom providerは従来どおりwrong_provider）。providerがcustomというだけでは受理せず、
@@ -59,6 +65,11 @@ export interface IdentityVerifier {
   readonly projectId: string;
   /** 署名・issuer・audience・期限・失効/disabled・apple.comを確かめる。失敗はIdentityError。 */
   verifyIdToken(idToken: string): Promise<VerifiedIdentity>;
+  /**
+   * 任意（審査・テスト専用ログインを配置で有効にした時だけ）。同じ署名・project・失効の検証に加え、providerが`password`で、UIDが事前登録の
+   * 審査専用UIDである時だけ`method: 'reviewer'`を返す。他はIdentityError（未登録UIDもwrong_provider）。
+   */
+  verifyReviewerIdToken?(idToken: string): Promise<VerifiedIdentity>;
   /**
    * MCP認可の交換・refresh時の再確認。sinceSecより後に失効（tokensValidAfterTime）していればrevoked。
    * 確認できない一時障害はIdentityError('unavailable')で、成功にしない。
@@ -121,34 +132,64 @@ async function codeStatus(codeIdentities: CodeIdentityCheck, uid: string, family
   return status;
 }
 
+/** 審査・テスト専用UID（Firebase UIDの形・code UID形でない・重複なし）。 */
+const REVIEWER_UID = /^[A-Za-z0-9]{20,128}$/;
+const REVIEWER_UIDS_MAX = 8;
+
+function reviewerUidSet(value: unknown): ReadonlySet<string> {
+  if (value === undefined) return new Set();
+  if (!Array.isArray(value) || value.length === 0 || value.length > REVIEWER_UIDS_MAX) throw new Error('identity: invalid reviewer uids');
+  const set = new Set<string>();
+  for (const uid of value) {
+    if (typeof uid !== 'string' || !REVIEWER_UID.test(uid) || CODE_UID.test(uid) || set.has(uid)) throw new Error('identity: invalid reviewer uids');
+    set.add(uid);
+  }
+  return set;
+}
+
 export function createFirebaseAdminVerifier(deps: {
   readonly auth: AdminAuthLike;
   readonly projectId: string;
   readonly codeIdentities?: CodeIdentityCheck | undefined;
+  /**
+   * 任意（既定off）。事前登録した審査・テスト専用のFirebase UID（passwordで認証するもの）。指定するとverifyReviewerIdTokenが有効になり、
+   * 通常のverifyIdTokenはこれらのUIDをどのproviderでも受けない（同じUIDのApple/Google等で審査専用の制約を迂回させない）。
+   */
+  readonly reviewerUids?: readonly string[] | undefined;
 }): IdentityVerifier {
   const { auth, projectId, codeIdentities } = deps;
   if (!PROJECT_ID_PATTERN.test(projectId)) throw new Error('identity: invalid project id');
-  return {
+  const reviewerUids = reviewerUidSet(deps.reviewerUids);
+
+  /** SDKの署名・issuer・audience・期限・失効の検証と、project・tenantの重ねての確認（providerの判定は呼出し側）。 */
+  async function decode(idToken: unknown): Promise<{ readonly provider: unknown; readonly decoded: Record<string, unknown>; readonly subject: () => { sub: string; authTime: number } }> {
+    if (typeof idToken !== 'string' || idToken.length === 0 || idToken.length > 4096) throw new IdentityError('invalid');
+    let decoded: Record<string, unknown>;
+    try {
+      decoded = await auth.verifyIdToken(idToken, true);
+    } catch (error) {
+      throw new IdentityError(classify(error, idToken, projectId));
+    }
+    // SDKも確かめる項目だが、SendTextToDotsの条件として重ねて見る。
+    if (decoded.aud !== projectId || decoded.iss !== `${ISSUER_PREFIX}${projectId}`) throw new IdentityError('wrong_project');
+    const firebase = decoded.firebase as { sign_in_provider?: unknown; tenant?: unknown } | undefined;
+    if (firebase?.tenant !== undefined) throw new IdentityError('wrong_project');
+    const { sub, auth_time: authTime } = decoded;
+    const subject = () => {
+      if (typeof sub !== 'string' || sub.length === 0 || sub.length > 128) throw new IdentityError('invalid');
+      if (typeof authTime !== 'number' || !Number.isSafeInteger(authTime) || authTime <= 0) throw new IdentityError('invalid');
+      return { sub, authTime };
+    };
+    return { provider: firebase?.sign_in_provider, decoded, subject };
+  }
+
+  const verifier: IdentityVerifier = {
     projectId,
     async verifyIdToken(idToken) {
-      if (typeof idToken !== 'string' || idToken.length === 0 || idToken.length > 4096) throw new IdentityError('invalid');
-      let decoded: Record<string, unknown>;
-      try {
-        decoded = await auth.verifyIdToken(idToken, true);
-      } catch (error) {
-        throw new IdentityError(classify(error, idToken, projectId));
-      }
-      // SDKも確かめる項目だが、SendTextToDotsの条件として重ねて見る。
-      if (decoded.aud !== projectId || decoded.iss !== `${ISSUER_PREFIX}${projectId}`) throw new IdentityError('wrong_project');
-      const firebase = decoded.firebase as { sign_in_provider?: unknown; tenant?: unknown } | undefined;
-      if (firebase?.tenant !== undefined) throw new IdentityError('wrong_project');
-      const { sub, auth_time: authTime } = decoded;
-      const subjectChecked = () => {
-        if (typeof sub !== 'string' || sub.length === 0 || sub.length > 128) throw new IdentityError('invalid');
-        if (typeof authTime !== 'number' || !Number.isSafeInteger(authTime) || authTime <= 0) throw new IdentityError('invalid');
-        return { sub, authTime };
-      };
-      if (firebase?.sign_in_provider === CUSTOM_PROVIDER_ID) {
+      const { provider: signInProvider, decoded, subject: subjectChecked } = await decode(idToken);
+      // 審査・テスト専用UIDは通常の入口ではどのproviderでも受けない（専用の入口とverifyReviewerIdTokenだけ）。
+      if (typeof decoded.sub === 'string' && reviewerUids.has(decoded.sub)) throw new IdentityError('wrong_provider');
+      if (signInProvider === CUSTOM_PROVIDER_ID) {
         const { sub, authTime } = subjectChecked();
         // 開発者向けコード: 機能offではcustomを受けない。marker・専用UID・familyと保存identityのactiveが揃った時だけ。
         if (!codeEnabled(codeIdentities)) throw new IdentityError('wrong_provider');
@@ -162,7 +203,7 @@ export function createFirebaseAdminVerifier(deps: {
         if (status !== 'active') throw new IdentityError('revoked');
         return Object.freeze({ projectId, uid: sub, authTimeSec: authTime, method: 'developer_code' as const });
       }
-      const provider = firebase?.sign_in_provider;
+      const provider = signInProvider;
       // Apple・Googleだけ（generic OIDC/SAML・anonymous・password等は受けない）。署名・issuer・audience・失効はSDK、project/tenantは上で確認済み。
       if (provider !== APPLE_PROVIDER_ID && provider !== GOOGLE_PROVIDER_ID) throw new IdentityError('wrong_provider');
       const subject = subjectChecked();
@@ -196,5 +237,16 @@ export function createFirebaseAdminVerifier(deps: {
       return 'active';
     },
   };
+  if (reviewerUids.size > 0) {
+    verifier.verifyReviewerIdToken = async (idToken) => {
+      const { provider, subject } = await decode(idToken);
+      // passwordで認証した、事前登録の審査専用UIDだけ（Apple・Google・custom・anonymous・未登録のpasswordは受けない）。
+      if (provider !== PASSWORD_PROVIDER_ID) throw new IdentityError('wrong_provider');
+      const { sub, authTime } = subject();
+      if (!reviewerUids.has(sub)) throw new IdentityError('wrong_provider');
+      return Object.freeze({ projectId, uid: sub, authTimeSec: authTime, method: 'reviewer' as const });
+    };
+  }
+  return verifier;
 }
 

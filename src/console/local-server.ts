@@ -18,6 +18,7 @@ import { createPrivateKey, randomBytes, type KeyObject } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { readFileSync, realpathSync } from 'node:fs';
 
+import { APP_PAIR_CODE, PAIR_APP_PATH } from '../source/connected-apps.js';
 import { SIGNATURE_HEADER, signSourceRequest, SOURCE_HEADER } from '../source/proof.js';
 import { fileURLToPath } from 'node:url';
 
@@ -42,7 +43,7 @@ interface RelayRoute {
   readonly method: 'GET' | 'POST';
   readonly upstream: 'api' | 'mcp';
   readonly timeoutMs: number;
-  readonly body: 'json' | 'none' | 'approve';
+  readonly body: 'json' | 'none' | 'approve' | 'pair';
   /** 登録開発者環境の設定がある時だけ署名する（照会/取消・接続状態/解除は署名しない最小回復）。 */
   readonly sign?: true | undefined;
 }
@@ -53,10 +54,15 @@ const APPROVAL_PATH = /^\/v1\/source\/approvals\/([A-Za-z0-9_-]{1,128})$/;
 const APPROVE_BODY = '{"approve":true}';/** 許可元の承認画面のscript（同origin。CSPのscript-src 'self'）。 */
 export const SOURCE_SCRIPT_PATH = '/console/source.js';
 
-function relayRouteFor(method: string, path: string, sourceEnabled = false): RelayRoute | 'method' | null {
+function relayRouteFor(method: string, path: string, sourceMode: 'pair' | 'approve' | null): RelayRoute | 'method' | null {
   const table: Array<{ test: (p: string) => boolean; method: 'GET' | 'POST'; route: RelayRoute }> = [
-    // 登録開発者環境の設定がある時だけ: 固定MCP originの接続承認（内容の照会・明示承認）。
-    ...(sourceEnabled
+    ...(sourceMode === 'pair'
+      ? [
+          { test: (p: string) => p === PAIR_APP_PATH, method: 'GET' as const, route: { method: 'GET' as const, upstream: 'mcp' as const, timeoutMs: 11_000, body: 'none' as const, sign: true as const } },
+          { test: (p: string) => p === PAIR_APP_PATH, method: 'POST' as const, route: { method: 'POST' as const, upstream: 'mcp' as const, timeoutMs: 11_000, body: 'pair' as const, sign: true as const } },
+        ]
+      : []),
+    ...(sourceMode === 'approve'
       ? [
           { test: (p: string) => APPROVAL_PATH.test(p), method: 'GET' as const, route: { method: 'GET' as const, upstream: 'mcp' as const, timeoutMs: 11_000, body: 'none' as const, sign: true as const } },
           { test: (p: string) => APPROVAL_PATH.test(p), method: 'POST' as const, route: { method: 'POST' as const, upstream: 'mcp' as const, timeoutMs: 11_000, body: 'approve' as const, sign: true as const } },
@@ -64,7 +70,7 @@ function relayRouteFor(method: string, path: string, sourceEnabled = false): Rel
       : []),
     { test: (p) => p === '/v1/web/connection', method: 'GET', route: { method: 'GET', upstream: 'mcp', timeoutMs: 11_000, body: 'none' } },
     { test: (p) => p === '/v1/web/disconnect', method: 'POST', route: { method: 'POST', upstream: 'mcp', timeoutMs: 11_000, body: 'none' } },
-    { test: (p) => p === '/v2/commands', method: 'POST', route: { method: 'POST', upstream: 'api', timeoutMs: 26_000, body: 'json', ...(sourceEnabled ? { sign: true as const } : {}) } },
+    { test: (p) => p === '/v2/commands', method: 'POST', route: { method: 'POST', upstream: 'api', timeoutMs: 26_000, body: 'json', ...(sourceMode !== null ? { sign: true as const } : {}) } },
     { test: (p) => COMMAND_PATH.test(p) && !p.endsWith('/cancel'), method: 'GET', route: { method: 'GET', upstream: 'api', timeoutMs: 11_000, body: 'none' } },
     { test: (p) => COMMAND_PATH.test(p) && p.endsWith('/cancel'), method: 'POST', route: { method: 'POST', upstream: 'api', timeoutMs: 6_000, body: 'none' } },
   ];
@@ -333,6 +339,7 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
   const web = config.firebase;
   // 登録開発者環境の鍵（設定がある時だけ、起動時に1回だけ読む。Ed25519以外・読めない鍵は起動しない）。
   const signer = config.source === undefined ? null : loadSourceSigner(config.source);
+  const sourceMode = signer === null ? null : config.connectedApps ? 'pair' : 'approve';
 
   let port = requestedPort;
   let authority = '';
@@ -384,13 +391,23 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
       headers['Idempotency-Key'] = idempotency;
       body = await readBody(req, MAX_COMMAND_BODY_BYTES);
       if (body.length === 0) refuse(400, 'invalid_request');
-    } else if (route.body === 'approve') {
-      // 接続承認: 明示承認の固定本文だけ（他の本文・fieldは上流へ送らない）。
+    } else if (route.body === 'approve' || route.body === 'pair') {
       const contentType = single(raw, 'content-type');
       if (contentType === undefined || contentType.split(';')[0]!.trim().toLowerCase() !== 'application/json') refuse(400, 'invalid_request');
-      const approval = await readBody(req, APPROVE_BODY.length);
-      if (approval.toString('utf8') !== APPROVE_BODY) refuse(400, 'invalid_request');
-      body = approval;
+      const input = await readBody(req, route.body === 'approve' ? APPROVE_BODY.length : 64);
+      if (route.body === 'approve') {
+        if (input.toString('utf8') !== APPROVE_BODY) refuse(400, 'invalid_request');
+      } else {
+        try {
+          const value = JSON.parse(input.toString('utf8'));
+          if (typeof value !== 'object' || value === null || Object.keys(value).length !== 1 ||
+              typeof value.code !== 'string' || !APP_PAIR_CODE.test(value.code)) refuse(400, 'invalid_request');
+        } catch {
+          input.fill(0);
+          refuse(400, 'invalid_request');
+        }
+      }
+      body = input;
       headers['Content-Type'] = 'application/json';
     } else {
       // 本文を持たないroute: 本文を示すheaderがあれば読む前に拒否し、無くても届いた本文は拒否する。
@@ -451,6 +468,7 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
       res.writeHead(status, { ...BASE_HEADERS, ...forwarded, 'Content-Length': payload.length, ...(forwarded['Content-Type'] === undefined ? { 'Content-Type': 'application/octet-stream' } : {}) });
       res.end(payload);
     } finally {
+      if (route.body === 'pair') body?.fill(0);
       clearTimeout(timer);
       req.off('aborted', onClose);
       res.off('close', onClose);
@@ -475,9 +493,9 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
       const language = selectLanguage({ query, cookie: req.headers.cookie, acceptLanguage: req.headers['accept-language'] });
       const extra: Record<string, string> = path === CONSOLE_PATH && isLanguage(query) ? { 'Set-Cookie': languageCookie(language, false) } : {};
       const operatorSection =
-        renderOperatorSection({ language, enabled: options.operator !== undefined, nonce, web }) + (signer === null ? '' : renderSourceApprovalSection(language === 'ja' ? 'ja' : 'en', nonce));
+        renderOperatorSection({ language, enabled: options.operator !== undefined, nonce, web }) + (sourceMode === 'approve' ? renderSourceApprovalSection(language === 'ja' ? 'ja' : 'en', nonce) : '');
       const operatorCodePanel = renderOperatorCodePanel({ language, enabled: options.operator !== undefined });
-  const asset = consoleAsset(path, web, { language, nonce, secure: false, mcpOrigin: config.mcpOrigin, operatorSection, operatorFirst: options.operator !== undefined, operatorCodePanel })!;
+  const asset = consoleAsset(path, web, { language, nonce, secure: false, mcpOrigin: config.mcpOrigin, connectedApps: sourceMode === 'pair', operatorSection, operatorFirst: options.operator !== undefined, operatorCodePanel })!;
       log({ event: 'local.asset', route: path });
       return send(res, 200, asset.type, asset.body, { ...asset.headers, ...extra });
     }
@@ -487,13 +505,14 @@ export async function startLocalConsole(options: LocalConsoleOptions): Promise<L
       return options.operator.handle(req, res, { path, method, nonce, origin });
     }
     if (path === SOURCE_SCRIPT_PATH) {
-      if (signer === null) return sendLocalRefusal(res, 404, 'not_found');
+      if (sourceMode !== 'approve') return sendLocalRefusal(res, 404, 'not_found');
       if (method !== 'GET') return sendError(res, 405, 'method_not_allowed');
       if ((await readBody(req, 0)).length !== 0) return sendError(res, 400, 'invalid_request');
       return send(res, 200, 'text/javascript; charset=utf-8', SOURCE_SCRIPT);
     }
-    const route = relayRouteFor(method, path, signer !== null);
+    const route = relayRouteFor(method, path, sourceMode);
     if (route === null) return sendLocalRefusal(res, 404, 'not_found');
+    if (path === PAIR_APP_PATH && target.includes('?')) return sendLocalRefusal(res, 400, 'invalid_request');
     if (route === 'method') return sendLocalRefusal(res, 405, 'method_not_allowed');
     try {
       await relay(req, res, path, route);

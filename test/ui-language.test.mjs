@@ -24,7 +24,7 @@ import {
   selectLanguage,
   text,
 } from '../dist/connect/i18n.js';
-import { INTERACTION_SCRIPT, INTERACTION_SCRIPT_PATH, renderInteractionAccessDenied, renderInteractionConsent, renderInteractionLogin } from '../dist/connect/pages.js';
+import { DISCONNECT_SCRIPT, INTERACTION_SCRIPT, INTERACTION_SCRIPT_PATH, INTERACTION_STYLE, renderInteractionAccessDenied, renderInteractionConsent, renderInteractionLogin } from '../dist/connect/pages.js';
 import { loadDeploymentConfig } from '../dist/config/validate.js';
 import { renderOAuthErrorPage } from '../dist/oauth/provider.js';
 
@@ -138,7 +138,14 @@ test('L3 rendering: every page carries html lang, title and body in the selected
     const enText = en.replace(/<a id="sttd-lang-ja"[^>]*>[^<]*<\/a>/, '').replace(/<[^>]+>/g, ' ');
     assert.equal(JAPANESE.test(enText), false, `${name}: no Japanese body text in the English page`);
     assert.ok(JAPANESE.test(ja.replace(/<[^>]+>/g, ' ')), `${name}: Japanese body text in the Japanese page`);
-    assert.equal(/\sstyle=|<style|\son[a-z]+=/i.test(en + ja), false, `${name}: no inline style/handlers`);
+    // OAuth interaction画面は固定stylesheet（CSPのhashと同一文字列）を1つだけ持つ。それ以外のstyle・style属性・handlerは無い。
+    const fixedStyle = `<style>${INTERACTION_STYLE}</style>`;
+    const strip = (html) => {
+      if (name !== 'login' && name !== 'consent') return html;
+      assert.equal(html.split(fixedStyle).length, 2, `${name}: exactly one fixed stylesheet`);
+      return html.replace(fixedStyle, '');
+    };
+    assert.equal(/\sstyle=|<style|\son[a-z]+=/i.test(strip(en) + strip(ja)), false, `${name}: no other inline style/handlers`);
     assert.equal(render(undefined), en, `${name}: default language is en`);
     assert.equal(render('fr'), en, `${name}: unsupported language falls back to en`);
   }
@@ -267,4 +274,105 @@ test('L7 OAuth access refusal: the login script shows the not-permitted message 
     assert.equal(/<form|csrf|data-sttd-csrf|data-sttd-interaction/i.test(page), false, 'no form, CSRF or interaction binding');
   }
   results.L7 = { languages: 2 };
+});
+test('T-286 the disconnect popup shows the selected account and only deletes after explicit confirmation', async () => {
+  const auth = { currentUser: null };
+  const persistence = Symbol('in memory');
+  const popupResolver = Symbol('browser popup');
+  const providers = [];
+  const calls = [];
+  const nodes = new Map();
+  const getElementById = (id) => {
+    if (!nodes.has(id)) {
+      nodes.set(id, {
+        hidden: false, disabled: false, textContent: '',
+        addEventListener(event, listener) { this[event] = listener; },
+        focus() {},
+      });
+    }
+    return nodes.get(id);
+  };
+  const user = {
+    email: 'account@example.invalid',
+    getIdToken: async () => 'synthetic.id.token',
+  };
+  class Provider {
+    constructor(id) { this.id = id; }
+    setCustomParameters(parameters) { this.parameters = parameters; }
+  }
+  let responseOk = false;
+  const start = (reviewer) => vm.runInNewContext(DISCONNECT_SCRIPT.replace(/^import .*$/gm, ''), {
+    document: {
+      body: { dataset: { sttdLanguage: 'ja', sttdFirebase: JSON.stringify(WEB), sttdDisconnectReviewer: reviewer ? 'on' : undefined } },
+      getElementById,
+    },
+    initializeApp: (config) => config,
+    initializeAuth: (_app, options) => {
+      assert.equal(options.persistence, persistence);
+      assert.equal(options.popupRedirectResolver, popupResolver);
+      return auth;
+    },
+    inMemoryPersistence: persistence,
+    browserPopupRedirectResolver: popupResolver,
+    GoogleAuthProvider: class extends Provider { constructor() { super('google.com'); } },
+    OAuthProvider: Provider,
+    async signInWithPopup(_auth, provider) {
+      providers.push(provider);
+      auth.currentUser = user;
+      return { user };
+    },
+    async signInWithEmailAndPassword(_auth, email, password) {
+      assert.equal(email, user.email);
+      assert.equal(password, 'synthetic-password');
+      assert.equal(getElementById('sttd-disconnect-password').value, '');
+      auth.currentUser = user;
+      return { user };
+    },
+    async signOut() { auth.currentUser = null; },
+    async fetch(url, options) {
+      calls.push({ url, method: options.method, token: options.headers.Authorization });
+      return { ok: responseOk, json: async () => ({ state: 'unlinked' }) };
+    },
+    AbortSignal,
+  });
+  start(false);
+  const account = getElementById('sttd-disconnect-account');
+  const status = getElementById('sttd-message');
+  const confirm = getElementById('sttd-disconnect-confirm');
+  assert.equal(account.hidden, true);
+  await confirm.click();
+  await getElementById('sttd-apple-login').click();
+  assert.equal(account.hidden, false);
+  assert.equal(getElementById('sttd-disconnect-identity').textContent, user.email);
+  assert.equal(calls.length, 0, 'opening and authenticating never send a deletion request');
+  await getElementById('sttd-switch-account').click();
+  assert.equal(account.hidden, true);
+  await getElementById('sttd-google-login').click();
+  assert.deepEqual(providers.map(({ id }) => id), ['apple.com', 'google.com']);
+  assert.equal(providers[1].parameters.prompt, 'select_account');
+  await confirm.click();
+  assert.equal(status.textContent, MESSAGES.ja['disconnect.failed']);
+  assert.equal(account.hidden, false);
+  responseOk = true;
+  await Promise.all([confirm.click(), confirm.click()]);
+  assert.deepEqual(calls, Array.from({ length: 2 }, () => ({
+    url: '/v1/web/disconnect', method: 'POST', token: 'Bearer synthetic.id.token',
+  })));
+  assert.equal(status.textContent, MESSAGES.ja['disconnect.done']);
+  assert.equal(account.hidden, true);
+  assert.equal(auth.currentUser, null);
+
+  nodes.clear();
+  calls.length = 0;
+  start(true);
+  getElementById('sttd-disconnect-email').value = user.email;
+  getElementById('sttd-disconnect-password').value = 'synthetic-password';
+  let prevented = false;
+  await getElementById('sttd-disconnect-password-form').submit({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(getElementById('sttd-disconnect-identity').textContent, user.email);
+  assert.equal(calls.length, 0, 'password sign-in does not submit the deletion');
+  await getElementById('sttd-disconnect-confirm').click();
+  assert.deepEqual(calls, [{ url: '/v1/web/disconnect/reviewer', method: 'POST', token: 'Bearer synthetic.id.token' }]);
+  assert.equal(getElementById('sttd-message').textContent, MESSAGES.ja['disconnect.done']);
 });

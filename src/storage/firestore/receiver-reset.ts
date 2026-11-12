@@ -1,4 +1,4 @@
-// 受信先設定一式のreset（プラグイン接続のApple login後、本人が明示確認した時だけ）の純関数。暗号・開封・通信・時計・ログを使わない。
+// プラグイン接続を本人が承認したときに行う受信先設定一式のresetの純関数。暗号・開封・通信・時計・ログを使わない。
 //   - owner文書の受信reset世代（receiverGeneration）: 欠落は既存の0、不正は一時障害。resetの時だけ+1する。
 //   - 購読文書（version2）の受信先設定の有無: 既存のparseKmsState（版・owner・exact field・状態の整合・capsule・大きさ）で検査し、
 //     active・pending・knownDestinationIdのどれかがあれば「あり」。不正・別owner・未知の形は一時障害（消さない）。

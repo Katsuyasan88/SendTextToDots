@@ -23,6 +23,8 @@ lockの全333 package（runtime・dev・optional。optionalは環境により取
 
 ## 3. 参照data
 
+ログインボタンには[Appleの公式ボタン画像](https://developer.apple.com/documentation/signinwithapple/displaying-sign-in-with-apple-buttons-on-the-web)と[Googleの公式Gロゴ](https://developers.google.com/identity/branding-guidelines)を同梱しています。各社のブランドガイドに従って使用します。
+
 | 素材 | 由来 | license |
 | --- | --- | --- |
 | `references/iana_*_20261006.csv`（IPv4/IPv6特殊用途・IPv6割当空間） | IANA Protocol Registries（取得 2026-10-06、詳細は `references/README.md`） | CC0 1.0（帰属要件なし）。根拠: https://www.iana.org/help/licensing-terms（2026-10-23確認） |

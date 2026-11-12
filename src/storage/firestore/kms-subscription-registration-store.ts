@@ -40,8 +40,14 @@ import {
   copyAuth,
   copyCancel,
   copyCapsules,
+  copyClaim,
   copyRequest,
+  copyReviewerPolicy,
   KmsSubscriptionRegistrationError,
+  reviewerCancelAllowed,
+  reviewerDestinationAllowed,
+  type DestinationClaim,
+  type ReviewerDestinationPolicy,
   nextGeneration,
   ownerGeneration,
   projectBindings,
@@ -98,6 +104,8 @@ export interface KmsSubscriptionRegistrationOptions {
   /** codec設定からclockを除いたもの。namespaceはKMS購読の`t268_<小文字UUID>`。transportはGrantの開封（decrypt）だけに使う。 */
   readonly kms: Omit<KmsSealingConfig, 'clock'>;
   readonly clock: Clock;
+  /** 任意。審査・テスト専用ownerの受信先規則（省略は'off'＝審査ownerの購読・解除を全て拒否。他のownerには影響しない）。 */
+  readonly reviewerDestinations?: ReviewerDestinationPolicy | undefined;
 }
 
 /** 認証済みのowner（UUID）と要求のGrant（既存のKMS grant ID形式）。 */
@@ -125,17 +133,19 @@ export type KmsSubscriptionPrepareResult =
 
 export interface KmsSubscriptionRegistrationStore {
   /** id=`sub_<64hex>`、secretHash=64hex、ttlMs=nullか整数1..86400000。 */
+  /** claimは呼出し側がURLから決めた審査ownerの受信先分類（省略は'unlisted'）。審査owner以外では使わない。 */
   prepare(
     auth: KmsSubscriptionRegistrationAuth,
     request: { readonly id: string; readonly secretHash: string; readonly ttlMs: number | null },
     operation: KmsSubscriptionRegistrationOperation,
+    claim?: DestinationClaim,
   ): Promise<KmsSubscriptionPrepareResult>;
   activate(
     plan: KmsSubscriptionChallengePlan,
     capsules: { readonly sealedUrl: string; readonly sealedSecret: string },
     operation: KmsSubscriptionRegistrationOperation,
   ): Promise<{ readonly id: string; readonly expiresAt: number | null }>;
-  cancel(auth: KmsSubscriptionRegistrationAuth, request: { readonly id: string }, operation: KmsSubscriptionRegistrationOperation): Promise<void>;
+  cancel(auth: KmsSubscriptionRegistrationAuth, request: { readonly id: string }, operation: KmsSubscriptionRegistrationOperation, claim?: DestinationClaim): Promise<void>;
 }
 
 type Captured = Readonly<{ deadlineAt: number; signal: AbortSignal | undefined }>;
@@ -215,6 +225,8 @@ interface PlanRecord {
   readonly generation: number;
   /** 要求Grant（先頭）と、初回snapshotのactive/pendingが束縛したGrant（重複なし・最大3）の証拠。 */
   readonly grants: readonly ProvenGrant[];
+  /** 分類時と同じ受信先分類（確定transactionで同じ規則を再評価する）。 */
+  readonly claim: DestinationClaim;
 }
 
 /** 同じtransactionで読んだ利用許可recordと要求Grantの同意記録。 */
@@ -240,7 +252,8 @@ interface ProvenGrant {
  * 不正はKmsSubscriptionRegistrationError（invalid_input）。戻り値は凍結した{prepare, activate, cancel}。
  */
 export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionRegistrationOptions): KmsSubscriptionRegistrationStore {
-  const fields = dataFields(options, OPTION_KEYS, []);
+  const fields = dataFields(options, OPTION_KEYS, ['reviewerDestinations']);
+  const reviewerPolicy = copyReviewerPolicy(fields.get('reviewerDestinations'));
 
   // dbは借用。SDKのmethodの存在だけをdescriptorで確かめる（呼ばない・接続しない）。
   const dbInput = fields.get('db');
@@ -503,7 +516,7 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
    * 利用許可がactiveで、要求Grantの同意記録が同じownerの現在の世代か。不許可はgrant_inactive、不正・不明はunavailable。
    * さらに、要求Grantの受信reset世代がownerの現在の受信reset世代と同じこと（受信先設定一式を消した後に、前の同意のGrantで受信先設定を作らせない）。
    */
-  function requireAccess(snapshots: AccessSnapshots, ownerId: string, owner: DocumentSnapshot): void {
+  function requireAccess(snapshots: AccessSnapshots, ownerId: string, owner: DocumentSnapshot): number {
     const decision = grantUseDecision(
       { exists: snapshots.access.exists, data: snapshots.access.exists ? snapshots.access.data() : undefined },
       { exists: snapshots.meta.exists, data: snapshots.meta.exists ? snapshots.meta.data() : undefined },
@@ -527,6 +540,7 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
     }
     if (grantReceiver === null) throw registrationError('unavailable');
     if (grantReceiver !== ownerReceiver) throw registrationError('grant_inactive');
+    return ownerReceiver;
   }
 
   function requireMarker(snapshot: DocumentSnapshot): void {
@@ -612,12 +626,13 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
     };
   }
 
-  async function prepare(authInput: unknown, requestInput: unknown, operationInput: unknown): Promise<KmsSubscriptionPrepareResult> {
+  async function prepare(authInput: unknown, requestInput: unknown, operationInput: unknown, claimInput?: unknown): Promise<KmsSubscriptionPrepareResult> {
     try {
       // 最初のawaitの前に、入力・参照を捕捉・検査する（後の改変で束縛を変えない）。
       const operation = copyOperation(operationInput);
       const auth = copyAuth(authInput);
       const request = copyRequest(requestInput);
+      const claim = copyClaim(claimInput);
       liveNow(operation);
       const ownerRef = ownerRefOf(auth.ownerId);
       const requestGrantRef = grantRefOf(auth.grantId);
@@ -673,10 +688,12 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
         const accessSnapshots = await readAccess(tx, operation, owner, requestMetaRef);
         const at = decisionTime(operation);
         const { generation, verdicts } = authorize(operation, auth, { owner, marker, grants: grantSnapshots }, proven, at);
-        requireAccess(accessSnapshots, auth.ownerId, owner);
+        const receiverGeneration = requireAccess(accessSnapshots, auth.ownerId, owner);
         if (generation !== first.generation || !sameDocVersion(versionOf(subscription), first.subscription)) throw registrationError('conflict');
         const state = readState(subscription, auth.ownerId) ?? emptyKmsState();
         projectBindings(state, at, verdictLookup(verdicts));
+        // 審査ownerの受信先規則（challenge・pending保存・掃除の書込みより前。審査owner以外は常に成立）。
+        if (!reviewerDestinationAllowed(reviewerPolicy, owner.data(), state, request.id, claim, at, receiverGeneration)) throw registrationError('destination_refused');
         const decision = classify(state, auth, request, at);
         // challengeの枝は掃除も含め書かない（期待版を自分の書込みで変えない）。
         if (decision.kind === 'challenge') return decision;
@@ -702,6 +719,7 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
           subscription: first.subscription,
           generation: first.generation,
           grants: Object.freeze(proven),
+          claim,
         }),
       );
       return Object.freeze({ kind: 'challenge' as const, plan: plan as KmsSubscriptionChallengePlan });
@@ -742,11 +760,13 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
         const accessSnapshots = await readAccess(tx, operation, owner, metaRef);
         const at = decisionTime(operation);
         const { generation, verdicts } = authorize(operation, auth, { owner, marker, grants: grantSnapshots }, record.grants, at);
-        requireAccess(accessSnapshots, auth.ownerId, owner);
+        const receiverGeneration = requireAccess(accessSnapshots, auth.ownerId, owner);
         // challengeの待機中の取消・再登録・延長・Grantの再保存は、同じid/hashへ戻っていても版違いのconflict（自動の再challenge・外側retry0）。
         if (generation !== record.generation || !sameDocVersion(versionOf(subscription), record.subscription)) throw registrationError('conflict');
         const state = readState(subscription, auth.ownerId) ?? emptyKmsState();
         projectBindings(state, at, verdictLookup(verdicts));
+        // challengeの後にも、同じ規則を最新のowner文書・状態・時刻で再評価する（検証中の時間枠の終了・種別の変化で固定しない）。
+        if (!reviewerDestinationAllowed(reviewerPolicy, owner.data(), state, request.id, record.claim, at, receiverGeneration)) throw registrationError('destination_refused');
         const active = applyActivation(state, auth, request, capsules, at);
         requireKmsDocumentSizeOrUnavailable(auth.ownerId, state);
         liveNow(operation);
@@ -760,11 +780,12 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
     }
   }
 
-  async function cancel(authInput: unknown, requestInput: unknown, operationInput: unknown): Promise<void> {
+  async function cancel(authInput: unknown, requestInput: unknown, operationInput: unknown, claimInput?: unknown): Promise<void> {
     try {
       const operation = copyOperation(operationInput);
       const auth = copyAuth(authInput);
       const { id } = copyCancel(requestInput);
+      const claim = copyClaim(claimInput);
       liveNow(operation);
       const ownerRef = ownerRefOf(auth.ownerId);
       const requestGrantRef = grantRefOf(auth.grantId);
@@ -795,6 +816,8 @@ export function createKmsSubscriptionRegistrationStore(options: KmsSubscriptionR
         const { generation } = authorize(operation, auth, { owner, marker, grants: [grant] }, proven, at);
         const next = nextGeneration(generation);
         const state = readState(subscription, auth.ownerId) ?? emptyKmsState();
+        // 審査ownerの解除は規則の受信先だけ（世代・購読の書込みの前に拒否）。
+        if (!reviewerCancelAllowed(reviewerPolicy, owner.data(), state, id, claim)) throw registrationError('destination_refused');
         const swept = sweepKmsState(state, at);
         const changed = applyCancel(state, id);
         if (swept || changed) requireKmsDocumentSizeOrUnavailable(auth.ownerId, state);

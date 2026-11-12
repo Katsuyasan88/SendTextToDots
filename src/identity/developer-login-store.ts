@@ -12,7 +12,7 @@
 import { Timestamp, type DocumentReference, type Firestore, type Transaction } from '@google-cloud/firestore';
 
 import { accessDocRef } from '../access/firestore.js';
-import { AccessRecordError, nextAccessRecord, parseAccessRecord } from '../access/policy.js';
+import { ACCESS_SCOPE_WEB, AccessRecordError, nextAccessRecord, parseAccessRecord } from '../access/policy.js';
 import { hashesEqual, type SecretHasher } from '../secrets.js';
 import {
   CODE_AUTH_TTL_MS,
@@ -145,6 +145,8 @@ interface OperationRecord {
   readonly identityHash: string | null;
   readonly createdAt: number;
   readonly deleteAfter: number;
+  /** サーバー側で確定した発行元の範囲（Web自己発行だけ'web'）。 */
+  readonly sourceScope?: typeof ACCESS_SCOPE_WEB;
 }
 const OPERATION_KEYS = [
   'version',
@@ -225,7 +227,10 @@ function unavailable(): DeveloperLoginError {
 }
 
 function parseOperation(data: unknown): OperationRecord {
-  const r = exactKeys(data, OPERATION_KEYS);
+  // Web自己発行のoperationだけがsourceScope 'web'を持つ（従来の運営者発行は欠落のまま）。未知値は不正。
+  const scoped = typeof data === 'object' && data !== null && Object.hasOwn(data, 'sourceScope');
+  const r = exactKeys(data, scoped ? [...OPERATION_KEYS, 'sourceScope'] : OPERATION_KEYS);
+  if (scoped && r.sourceScope !== ACCESS_SCOPE_WEB) throw unavailable();
   const deleteAfter = millisOf(r.deleteAfter);
   if (r.version !== DEVELOPER_LOGIN_VERSION || !isUuid(r.issuanceId) || !isUuid(r.familyId)) throw unavailable();
   if (typeof r.reservationId !== 'string' || typeof r.consoleHash !== 'string' || typeof r.sealedUid !== 'string') throw unavailable();
@@ -347,7 +352,17 @@ export class DeveloperLoginStore {
    * コンソールの明示操作による発行。previousOperationIdがあれば同じ発行元の再発行で、新予約の作成と旧family/予約の失効を同じ
    * transactionで確定する（新候補を確保できなければ旧接続を止めない）。照会secretは発行元helperのRAMだけにあり、DBはHMACだけ。
    */
-  async issue(input: { readonly claimSecret: string; readonly previousOperationId?: string | undefined }): Promise<IssueOutcome> {
+  async issue(input: {
+    readonly claimSecret: string;
+    readonly previousOperationId?: string | undefined;
+    /**
+     * プレイグラウンドのサーバー（BFF）の自己発行だけが'web'を渡す（browser入力から決めない）。有効化時の利用許可がWebだけになる。
+     * 従来の運営者発行（console/CLI）は渡さず、従来どおりの許可を作る。
+     */
+    readonly sourceScope?: typeof ACCESS_SCOPE_WEB | undefined;
+  }): Promise<IssueOutcome> {
+    if (input.sourceScope !== undefined && input.sourceScope !== ACCESS_SCOPE_WEB) throw unavailable();
+    const scopeField: { sourceScope?: typeof ACCESS_SCOPE_WEB } = input.sourceScope === undefined ? {} : { sourceScope: ACCESS_SCOPE_WEB };
     const { hasher, clock, random } = this.#d;
     const consoleHash = claimSecretHashOf(hasher, this.#scope, input.claimSecret);
     const previousHash = input.previousOperationId === undefined ? null : operationIdHashOf(hasher, this.#scope, input.previousOperationId);
@@ -420,6 +435,7 @@ export class DeveloperLoginStore {
               identityHash: null,
               createdAt: now,
               deleteAfter: stamp(record.deleteAfter),
+              ...scopeField,
             });
             consoles[consoleHash] = { generation, operationIdHash, until: record.deleteAfter };
             tx.set(this.#metaRef(), {
@@ -700,7 +716,8 @@ export class DeveloperLoginStore {
           if (identitySnapshot.exists || accessSnapshot.exists) return { kind: 'conflict' };
           const now = clock.now();
           if (now >= deadline) return { kind: 'revoked' };
-          const access = nextAccessRecord(null, 'active', now, generation);
+          // 発行元の範囲は保存済みoperationから決める（交換要求・browser入力から決めない）。Web自己発行はWebだけの許可。
+          const access = nextAccessRecord(null, 'active', now, generation, operation.sourceScope);
           if (access === null) return { kind: 'conflict' };
           tx.create(this.#identityRef(identityHash), {
             version: DEVELOPER_LOGIN_VERSION,

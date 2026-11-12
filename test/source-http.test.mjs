@@ -82,7 +82,7 @@ async function consent(rt, flow, form, { cookies = true } = {}) {
   return flow.b.request('POST', `/interaction/${flow.uid}/consent`, {
     cookies,
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: rt.issuer },
-    body: new URLSearchParams({ csrf: form.csrf ?? '', receiverToken: form.receiverToken ?? '', ...(form.confirm ? { receiverReset: '1' } : {}) }).toString(),
+    body: new URLSearchParams({ csrf: form.csrf ?? '', receiverToken: form.receiverToken ?? '' }).toString(),
   });
 }
 
@@ -218,14 +218,14 @@ test('受信先設定の保護: 承認なし・承認後の停止では確認付
   );
   const before = JSON.stringify(strict.docs.get(subscriptionPath).data);
   const page = await consentPage(flow);
-  assert.equal(page.confirmBox, true, 'existing receiver settings ask for confirmation');
-  const refused = await consent(strict, flow, { ...page, confirm: true });
+  assert.equal(page.confirmBox, false, 'existing receiver settings do not require a checkbox');
+  const refused = await consent(strict, flow, page);
   assert.equal(refused.status, 409);
   assert.equal(JSON.stringify(strict.docs.get(subscriptionPath).data), before);
   // 承認の後にsourceが停止された同意も、受信先設定を消さない。
   assert.equal((await approval(strict, 'POST', flow.uid, person, { body: APPROVE })).status, 200);
   strict.write(`${strict.root}/sources/${person.record.sourceId}`, { ...person.record, state: 'disabled', updatedAt: person.record.updatedAt + 1 });
-  const stopped = await consent(strict, flow, { ...(await consentPage(flow)), confirm: true });
+  const stopped = await consent(strict, flow, await consentPage(flow));
   assert.equal(stopped.status, 409);
   assert.equal(JSON.stringify(strict.docs.get(subscriptionPath).data), before);
 });

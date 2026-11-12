@@ -164,12 +164,16 @@ const API_ROUTES: readonly Route[] = Object.freeze([
 
 /** MCP接続（connect/kms-server.ts・oauth/provider.ts・pinned Provider）の公開route。 */
 const CONNECT_ROUTES: readonly Route[] = Object.freeze([
+  { path: '/disconnect', methods: { GET: 0 } },
+  { path: '/disconnect/review', methods: { GET: 0 } },
+  { path: '/disconnect/app.js', methods: { GET: 0 } },
   { path: '/interaction/app.js', methods: { GET: 0 } },
   { path: new RegExp(`^/interaction/${ID}$`), methods: { GET: 0 } },
   { path: new RegExp(`^/interaction/${ID}/(?:login|consent|deny|code)$`), methods: { POST: FORM_MAX } },
   { path: new RegExp(`^/v1/source/approvals/${ID}$`), methods: { GET: 0, POST: APPROVAL_MAX } },
   { path: '/v1/web/connection', methods: { GET: 0 } },
   { path: '/v1/web/disconnect', methods: { POST: 0 } },
+  { path: '/v1/web/disconnect/reviewer', methods: { POST: 0 } },
   { path: '/mcp', methods: { POST: MAX_MCP_BODY_BYTES, GET: 0, DELETE: 0 } },
   { path: '/.well-known/oauth-protected-resource/mcp', methods: { GET: 0 } },
   { path: '/.well-known/oauth-authorization-server', methods: { GET: 0, OPTIONS: 0 } },

@@ -257,6 +257,85 @@ test('G4 with an unconfigured build, every entry and start function stops with a
   results.G4 = outcomes;
 });
 
+test('G6 reviewerLogin defaults to off and uses standard registration when destinations are omitted', async () => {
+  const { REVIEWER_LOGIN_MODE, reviewerServerOptionOf, reviewerUidsOf } = await import('../dist/config/validate.js');
+  const base = validateDeploymentConfig(clone());
+  assert.equal(base.reviewerLogin, 'off', 'omitted is off');
+  assert.equal(reviewerUidsOf(base), undefined);
+  assert.equal(reviewerServerOptionOf(base), undefined);
+  assert.equal(validateDeploymentConfig({ ...clone(), reviewerLogin: 'off' }).reviewerLogin, 'off');
+  const uid = 'SyntheticReviewerUid0001';
+  const destination = 'https://hooks.sendtexttodots.example.org/sample';
+  const on = { mode: REVIEWER_LOGIN_MODE, uids: [uid], destinations: [destination] };
+  const enabled = validateDeploymentConfig({ ...clone(), reviewerLogin: on });
+  assert.deepEqual(JSON.parse(JSON.stringify(enabled.reviewerLogin)), on);
+  assert.ok(Object.isFrozen(enabled.reviewerLogin) && Object.isFrozen(enabled.reviewerLogin.uids));
+  assert.deepEqual([...reviewerUidsOf(enabled)], [uid]);
+  assert.deepEqual([...reviewerServerOptionOf(enabled).destinations], [destination]);
+  const standard = validateDeploymentConfig({ ...clone(), reviewerLogin: { mode: REVIEWER_LOGIN_MODE, uids: [uid] } });
+  assert.deepEqual(reviewerUidsOf(standard), [uid]);
+  assert.deepEqual(reviewerServerOptionOf(standard), {});
+  const invalidCases = {
+    unknownMode: { ...on, mode: 'reviewer-password-v2' },
+    onTrue: true,
+    destinationsOnly: { mode: REVIEWER_LOGIN_MODE, destinations: [destination] },
+    emptyUids: { ...on, uids: [] },
+    emptyDestinations: { ...on, destinations: [] },
+    duplicateUid: { ...on, uids: [uid, uid] },
+    codeUid: { ...on, uids: [`sttdc_${'a'.repeat(32)}`] },
+    shortUid: { ...on, uids: ['short'] },
+    nineUids: { ...on, uids: Array.from({ length: 9 }, (_, i) => `SyntheticReviewerUid000${i}`) },
+    httpDestination: { ...on, destinations: ['http://hooks.sendtexttodots.example.org/sample'] },
+    nonCanonical: { ...on, destinations: ['https://HOOKS.sendtexttodots.example.org/sample'] },
+    userinfo: { ...on, destinations: ['https://user@hooks.sendtexttodots.example.org/sample'] },
+    ipHost: { ...on, destinations: ['https://203.0.113.10/sample'] },
+    extraKey: { ...on, secret: 'x' },
+  };
+  for (const [name, value] of Object.entries(invalidCases)) assert.equal(codeOf(() => validateDeploymentConfig({ ...clone(), reviewerLogin: value })), 'deployment_config_invalid', name);
+  // 未対応の組合せ: strictの許可元承認（緩めない）とgateway-v1は同時指定できない。
+  const strict = { ...clone(), reviewerLogin: on, sourceAuthorization: { mode: 'strict-v1', methods: ['developer-key-v1'] } };
+  assert.equal(codeOf(() => validateDeploymentConfig({ ...strict, reviewerLogin: 'off' })), 'ok', 'strict alone stays valid');
+  assert.equal(codeOf(() => validateDeploymentConfig(strict)), 'deployment_config_invalid', 'strict with reviewer');
+  results.G6 = { invalid: Object.keys(invalidCases).length };
+});
+
+test('G7 legacy reviewerLogin.firstDestination cannot be combined with destinations and requires a canonical origin and time window', async () => {
+  const { REVIEWER_LOGIN_MODE, reviewerServerOptionOf } = await import('../dist/config/validate.js');
+  const uid = 'SyntheticReviewerUid0001';
+  const origin = 'https://hooks.sendtexttodots.example.org';
+  const window = { startsAt: '2026-11-12T01:00:00.000Z', endsAt: '2026-11-12T01:15:00.000Z' };
+  const on = { mode: REVIEWER_LOGIN_MODE, uids: [uid], firstDestination: { origin, ...window } };
+  const enabled = validateDeploymentConfig({ ...clone(), reviewerLogin: on });
+  assert.deepEqual(JSON.parse(JSON.stringify(enabled.reviewerLogin)), on);
+  assert.deepEqual(JSON.parse(JSON.stringify(reviewerServerOptionOf(enabled))), { firstDestination: { origin, startsAt: Date.parse(window.startsAt), endsAt: Date.parse(window.endsAt) } });
+  const first = (patch) => ({ ...on, firstDestination: { ...on.firstDestination, ...patch } });
+  const invalidCases = {
+    both: { ...on, destinations: [`${origin}/sample`] },
+    over15min: first({ endsAt: '2026-11-12T01:15:00.001Z' }),
+    reversed: first({ startsAt: window.endsAt, endsAt: window.startsAt }),
+    equal: first({ endsAt: window.startsAt }),
+    nonCanonicalTime: first({ startsAt: '2026-11-12T01:00:00Z' }),
+    offsetTime: first({ startsAt: '2026-11-12T10:00:00.000+09:00' }),
+    epochNumber: first({ startsAt: Date.parse(window.startsAt) }),
+    originPath: first({ origin: `${origin}/hooks` }),
+    originSlash: first({ origin: `${origin}/` }),
+    originHttp: first({ origin: 'http://hooks.sendtexttodots.example.org' }),
+    originPort: first({ origin: 'https://hooks.sendtexttodots.example.org:8443' }),
+    originIp: first({ origin: 'https://203.0.113.10' }),
+    extraKey: first({ url: `${origin}/x` }),
+  };
+  for (const [name, value] of Object.entries(invalidCases)) assert.equal(codeOf(() => validateDeploymentConfig({ ...clone(), reviewerLogin: value })), 'deployment_config_invalid', name);
+  assert.equal(codeOf(() => validateDeploymentConfig({ ...clone(), reviewerLogin: on, sourceAuthorization: { mode: 'strict-v1', methods: ['developer-key-v1'] } })), 'deployment_config_invalid', 'strict stays unsupported');
+  results.G7 = { invalid: Object.keys(invalidCases).length };
+});
+
+test('T-289 send_text is opt-in on a direct deployment with strict source authorization', () => {
+  assert.equal(validateDeploymentConfig(clone()).mcpSendText, undefined);
+  assert.equal(codeOf(() => validateDeploymentConfig({ ...clone(), mcpSendText: true })), 'deployment_config_invalid');
+  const strict = { ...clone(), sourceAuthorization: { mode: 'strict-v1', methods: ['developer-key-v1'] }, mcpSendText: true };
+  assert.equal(validateDeploymentConfig(strict).mcpSendText, true);
+});
+
 test('G5 the Functions export name equals the value the config validator accepts', () => {
   const functions = readFileSync(join(WORK, 'dist', 'deployment', 'functions.js'), 'utf8');
   const exported = [...functions.matchAll(/^export const ([A-Za-z0-9_$]+) =/gm)].map((match) => match[1]);

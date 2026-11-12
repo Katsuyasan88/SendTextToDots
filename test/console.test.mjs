@@ -3,11 +3,12 @@
 // kms-server.js・functions.js・local-server.jsは評価せず、compile後のdist文字列で接合だけを静的に確かめる。fixtureの値は全て合成値。
 // 実scriptの合成実行（5段階wizard・送信・解除・言語・コピー）はtest/console-wizard.test.mjs、helperの配信/中継はtest/local-console.test.mjs。
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { after, test } from 'node:test';
 
 import * as consoleModule from '../dist/connect/console.js';
-import { pageSecurityHeaders } from '../dist/connect/pages.js';
+import { INTERACTION_STYLE, pageSecurityHeaders } from '../dist/connect/pages.js';
 import { loadDeploymentConfig } from '../dist/config/validate.js';
 import { applyConsoleCors, consoleAllowedOrigin, decideConsoleCors } from '../dist/deployment/console-cors.js';
 
@@ -124,12 +125,19 @@ test('A1 /console assets (local page): fixed HTML/JS/CSS, empty textarea with an
   const csp = page.headers['Content-Security-Policy'];
   assert.equal(
     csp,
-    `default-src 'none'; script-src 'self' ${CONSOLE_SDK_BASE} https://apis.google.com; connect-src 'self' https://identitytoolkit.googleapis.com https://securetoken.googleapis.com; frame-src https://${WEB.authDomain}; style-src 'self'; img-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'`,
+    `default-src 'none'; script-src 'self' ${CONSOLE_SDK_BASE} https://apis.google.com; connect-src 'self' https://identitytoolkit.googleapis.com https://securetoken.googleapis.com; frame-src https://${WEB.authDomain}; style-src 'self'; img-src data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'`,
   );
   assert.equal(/unsafe-|\*|https: |run\.app/.test(csp), false);
   assert.deepEqual([page.headers['X-Frame-Options'], page.headers['Referrer-Policy']], ['DENY', 'no-referrer']);
   const oauth = pageSecurityHeaders(WEB)['Content-Security-Policy'];
-  assert.ok(oauth.includes("style-src 'none'") && !oauth.includes(API), 'existing OAuth page CSP not widened');
+  // OAuth画面は固定stylesheetのSHA-256と組み込み画像を許可する。
+  const styleHash = `'sha256-${createHash('sha256').update(INTERACTION_STYLE, 'utf8').digest('base64')}'`;
+  assert.equal(
+    oauth,
+    `default-src 'none'; script-src 'self' https://www.gstatic.com/firebasejs/13.0.0/ https://apis.google.com; connect-src 'self' https://identitytoolkit.googleapis.com https://securetoken.googleapis.com; frame-src https://${WEB.authDomain}; style-src ${styleHash}; img-src data:; base-uri 'none'; frame-ancestors 'none'`,
+    'OAuth page CSP allows the fixed stylesheet and embedded images',
+  );
+  assert.equal(/unsafe-|\*/.test(oauth) || oauth.includes(API), false, 'existing OAuth page CSP not widened');
   assert.equal(consoleAsset('/console/app.js', WEB, PAGE).type, 'text/javascript; charset=utf-8');
   assert.equal(consoleAsset('/console/app.css', WEB, PAGE).type, 'text/css; charset=utf-8');
   assert.equal(consoleAsset('/console/other', WEB, PAGE), undefined);
@@ -159,8 +167,9 @@ test('S1 the script builds the 5-field v2 command (no task/direction/revision), 
   // cookieは表示言語の同期設定（書込み）だけ。読取り・他cookieの操作は無い。
   assert.deepEqual(s.match(/document\.cookie[^\n]*/g), ["document.cookie = LANGUAGE_COOKIE + '=' + next + '; ' + COOKIE_ATTRIBUTES;"], 'the only cookie access is the display-language write');
   // trimは空白だけの判定に使うだけで、送る値は捕捉した`text`のまま（上のpayloadの`text,`）。
-  assert.equal((s.match(/\.trim\(\)/g) ?? []).length, 1);
-  assert.ok(s.includes("text.trim() === ''"));
+  const send = s.slice(s.indexOf('async function send(lane) {'), s.indexOf('async function cancel(lane) {'));
+  assert.equal((send.match(/\.trim\(\)/g) ?? []).length, 1);
+  assert.ok(send.includes("text.trim() === ''"));
   assert.equal((s.match(/signInWithPopup\(/g) ?? []).length, 1, 'one call, inside the click handler only (no automatic popup)');
   results.S1 = { scriptBytes: Buffer.byteLength(s) };
 });

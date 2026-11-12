@@ -2,7 +2,8 @@
 // （systemClock）・専有のstartup operationで実startOwnedDevelopmentConnectServerを1回だけ起動する。PORTと設定のweb.apiKeyEnvが指す環境変数
 // を1回だけ捕捉する（PORTは正規の十進1024〜65535、web keyは非空string。値はlog・Gitへ出さない）。別host・origin・project・SA・key・
 // namespace・資格をenv・argvで上書きする口は無い（実SDKのCloud環境・資格・proxy等のgateはまま）。
-// 例外として、期限付きの診断ログの終了時刻（STTD_CONNECT_DIAGNOSTICS_UNTIL、既定off・最長30分）だけを読む。
+// 例外として、期限付きの診断ログの終了時刻（STTD_CONNECT_DIAGNOSTICS_UNTIL、既定off・最長30分）と、OpenAIのアプリ公開のドメイン確認値
+// （STTD_OPENAI_APPS_CHALLENGE、既定は未設定。URL-safe ASCII・1〜256文字だけ。明示した不正値は起動失敗）だけを読む。
 //   - importされた時はSDK・listen・signal登録0。Nodeからこのfileをdirect mainとして起動した時だけrunDevelopmentConnectを呼ぶ（argvの解決と
 //     import.meta.urlの比較。query付きのimportはauto-start 0）。
 //   - 同じprocessの二重runは同じ起動Promise・close所有へまとめ、失敗後の再初期化は0。ready後の戻り値はfrozen {close}だけ。
@@ -22,8 +23,14 @@ import {
   type OwnedDevelopmentConnectServer,
 } from '../google-runtime/connect-development.js';
 import { CONNECT_DIAGNOSTICS_ENV, createDiagnosticLogSink } from '../http/log.js';
+import { isOpenAiAppsChallenge } from '../connect/kms-server.js';
+
+/** OpenAIのアプリ公開のドメイン確認値を渡す任意の環境変数（既定は未設定＝従来404）。 */
+export const OPENAI_APPS_CHALLENGE_ENV = 'STTD_OPENAI_APPS_CHALLENGE';
 import { systemClock } from '../policy.js';
-import { loadDeploymentConfig, type DeploymentConfig } from '../config/validate.js';
+import { loadDeploymentConfig, reviewerApprovalOf, type DeploymentConfig } from '../config/validate.js';
+import type { KeyObject } from 'node:crypto';
+import { parseReviewerApprovalKey, REVIEWER_APPROVAL_KEY_ENV } from '../source/reviewer-approval.js';
 
 const START_BUDGET_MS = 20_000;
 /** 正規の十進（符号・空白・末尾文字・先頭0なし）。範囲は別に1024〜65535を確かめる。 */
@@ -159,6 +166,18 @@ async function start(): Promise<DevelopmentConnectHandle> {
   const bindPort = Number(portText);
   if (bindPort < 1024 || bindPort > 65535) throw new DevelopmentConnectEntryError('development_connect_config_invalid');
   if (typeof apiKey !== 'string' || apiKey === '') throw new DevelopmentConnectEntryError('development_connect_config_invalid');
+  // OpenAIのアプリ公開のドメイン確認値（任意・1回だけ捕捉）。未設定は従来404、明示した不正値（空を含む）は起動しない（値はerror・logへ出さない）。
+  const challengeText = process.env[OPENAI_APPS_CHALLENGE_ENV];
+  if (challengeText !== undefined && !isOpenAiAppsChallenge(challengeText)) throw new DevelopmentConnectEntryError('development_connect_config_invalid');
+  // strictの審査承認を設定で有効にした時だけ、専用envの秘密鍵を1回だけ読む（欠落・形式・種別の不正は値を出さない固定の設定error）。
+  let reviewerApprovalKey: KeyObject | undefined;
+  if (reviewerApprovalOf(M) !== undefined) {
+    try {
+      reviewerApprovalKey = parseReviewerApprovalKey(process.env[REVIEWER_APPROVAL_KEY_ENV]);
+    } catch {
+      throw new DevelopmentConnectEntryError('development_connect_config_invalid');
+    }
+  }
   // 期限付きの診断ログ（既定off。未設定・不正・過去・30分超は無効で、起動・認証には影響しない）。
   const log = createDiagnosticLogSink({
     until: process.env[CONNECT_DIAGNOSTICS_ENV],
@@ -188,6 +207,8 @@ async function start(): Promise<DevelopmentConnectHandle> {
       clock: systemClock,
       operation: { deadlineAt: startedAt + START_BUDGET_MS, signal: controller.signal },
       ...(log !== undefined ? { log } : {}),
+      ...(challengeText !== undefined ? { openaiAppsChallenge: challengeText } : {}),
+      ...(reviewerApprovalKey !== undefined ? { reviewerApprovalKey } : {}),
     });
   } catch (error) {
     if (!closing) unregisterSignals();

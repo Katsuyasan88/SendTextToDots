@@ -141,7 +141,7 @@ helperは既定のADCで動き、custom tokenの署名はFirebase Adminの`servi
 
 ## 許可元の認可（既定compatible、開発中）
 
-`sourceAuthorization`は省略または`'compatible'`で既存互換です。strictは`{ mode: 'strict-v1', methods: ['developer-key-v1', 'app-check-v1'] }`のように、使う方式（1〜2個）を管理者が明示します。空・未知・重複の方式、未知のkeyは設定errorで、互換へ降格しません。wireの形と接続承認の流れは[API](API.md)「許可元の証明」「許可元による接続承認」。strictへ切り替えると、source bindingの無い既存Grant・購読は新規配送・refreshに使えず、本人が新しく承認・同意し直す必要があります（account・owner・暗号化鍵・利用許可は保持）。
+`sourceAuthorization`は省略または`'compatible'`で既存互換です。strictは`{ mode: 'strict-v1', methods: ['developer-key-v1', 'app-check-v1'] }`のように、使う方式（1〜2個）を管理者が明示します。空・未知・重複の方式、未知のkeyは設定errorで、互換へ降格しません。wireの形と接続承認の流れは[API](API.md)「許可元の証明」「許可元による接続承認」。strictへ切り替えると、source bindingの無い既存Grant・購読は新規配送・refreshに使えず、本人がその配置の手順に沿って接続し直す必要があります（account・owner・暗号化鍵・利用許可は保持）。
 
 許可元は管理CLIで登録します（標準入力の1行JSON。UID・公開鍵をargvへ書かない）:
 
@@ -150,6 +150,8 @@ helperは既定のADCで動き、custom tokenの署名はFirebase Adminの`servi
 - `status`／`disable`／`enable`／`delete`は`--source <src_…>`、変更は`--expect <statusの版>`が必要です。停止→有効化は新しい世代になり、停止前の承認・Grantは戻りません。削除は登録recordの物理削除で、App ID・公開鍵・本人のHMAC・日時を残しません。新しい登録のID・世代は管理CLIが暗号学的乱数で作り、廃止したIDを指定して再登録する操作はありません（旧Grant・承認は元のIDを指したまま不在として拒否され、新しい登録へ付け替えません）。承認recordはsource ID/世代と本人・client・resourceのHMAC・期限・単回状態を持ち、TTLの掃除候補は期限から24時間です。
 
 操作（`operations`）は`send`（平文/暗号文の送信）・`keys`（公開鍵の取得/再発行）・`connect`（接続承認）です。保存先は`sttdConnect/{connectNamespace}/sources`・`sourceReplay`・`sourceApprovals`で、replay・承認は鍵付きhashの文書IDと期限だけを持ちます。掃除にTTLを使う場合は`sourceReplay.deleteAfter`・`sourceApprovals.deleteAfter`（最後の期限から24時間）へ配置側で設定します（期限の判定にはTTLを使いません）。App Check方式は、送信APIのservice accountにApp Check tokenの消費（Firebase App Check API）の権限と追加の通信が要り、SDKのconsume機能はbetaです。各Forkの管理者が自分のproject/appでApp Checkを設定してください。
+
+strictのdirect配置で `connectedApps: true` を設定すると、OAuth接続後に送信アプリを登録できます。アプリ登録には送信元証明と `send` 操作の許可が必要です。Playgroundとローカルコンソールにも対応する設定を入れます。[登録API](API.md#connected-apps)・[導入手順](INSTALL.md#connected-apps-rollout)
 
 ## 既存URLを保つgateway配置（任意・gateway-v1）
 

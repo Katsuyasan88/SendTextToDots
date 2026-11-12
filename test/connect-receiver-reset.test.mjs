@@ -165,24 +165,23 @@ test('R1 grantMeta receiver generation shape and the pure helpers (canonical rec
   assert.deepEqual(writes.subscriptionDoc, kmsStateDocument(ownerId, emptyKmsState()));
 });
 
-test('R2 consent page: hidden snapshot always for Apple; checkbox and deletion wording only when settings exist; fixed outcome pages (en/ja)', () => {
+test('R2 consent page: hidden snapshot and explicit approval button without a checkbox; fixed outcome pages (en/ja)', () => {
   const plain = renderInteractionConsent(WEB, 'i-1', 'Client', 'csrf-1', 'en');
   assert.ok(!plain.includes('receiver') && plain.includes('Allow the connection to this Dots'));
-  const none = renderInteractionConsent(WEB, 'i-1', 'Client', 'csrf-1', 'en', { token: 'opaque-none', confirm: false });
+  const none = renderInteractionConsent(WEB, 'i-1', 'Client', 'csrf-1', 'en', { token: 'opaque-none', present: false });
   assert.ok(none.includes('name="receiverToken" value="opaque-none"') && !none.includes('type="checkbox"') && none.includes('Allow the connection to this Dots'));
-  const offered = renderInteractionConsent(WEB, 'i-1', 'Client', 'csrf-1', 'en', { token: 'opaque-token', confirm: true });
-  assert.match(offered, /<input type="checkbox" id="sttd-receiver-reset" name="receiverReset" value="1" required>/);
-  assert.ok(!/checked/.test(offered.match(/<input type="checkbox"[^>]*>/)[0]), 'initially unchecked');
+  const offered = renderInteractionConsent(WEB, 'i-1', 'Client', 'csrf-1', 'en', { token: 'opaque-token', present: true });
+  assert.doesNotMatch(offered, /type="checkbox"|name="receiverReset"/);
   assert.ok(offered.includes('Delete the previous receiver settings and allow the connection') && !offered.includes('Allow the connection to this Dots'));
   assert.ok(offered.includes('deliveries already started are not cancelled'));
-  const ja = renderInteractionConsent(WEB, 'i-1', 'Client', 'csrf-1', 'ja', { token: 't', confirm: true, required: true });
-  assert.ok(ja.includes('以前の受信先設定を削除して接続を許可') && ja.includes('何も削除していません'));
+  const ja = renderInteractionConsent(WEB, 'i-1', 'Client', 'csrf-1', 'ja', { token: 't', present: true, required: true });
+  assert.ok(ja.includes('以前の受信先設定を削除して接続を許可') && ja.includes('もう一度接続を承認してください'));
   assert.ok(renderReceiverResetOutcome(WEB, 'i-1', 'incomplete', 'en').includes('were deleted, but the connection was not completed'));
   assert.ok(renderReceiverResetOutcome(WEB, 'i-1', 'unknown', 'ja').includes('接続が完了したかを確認できませんでした'));
   assert.ok(renderReceiverResetOutcome(WEB, 'i-1', 'reset_unknown', 'en').includes('could not be confirmed whether the previous receiver settings were deleted'));
 });
 
-test('R3 Apple + settings + confirmation: one transaction (maxAttempts 1) consumes, raises both generations, empties only the receiver settings; grantMeta binds the new generation; second submit deletes nothing', async () => {
+test('R3 Apple + settings + approval: one transaction consumes, raises both generations and clears the receiver; grantMeta binds the new generation', async () => {
   const fx = fixture();
   const s = await fx.loggedIn(`apple-${randomUUID()}`, 'apple');
   fx.putSettings(s.ownerId);
@@ -194,7 +193,7 @@ test('R3 Apple + settings + confirmation: one transaction (maxAttempts 1) consum
   const before = keep();
   const snapshot = await fx.storage.receiverSnapshot(s.interaction);
   assert.equal(snapshot.present, true);
-  const consent = await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, snapshot.token, true);
+  const consent = await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, snapshot.token);
   assert.equal(fx.db.control.txOptions.at(-1)?.maxAttempts, 1, 'no automatic retry of the destructive transaction');
   assert.equal(consent.receiverReset, true);
   assert.equal(consent.receiverGeneration, 1);
@@ -205,7 +204,7 @@ test('R3 Apple + settings + confirmation: one transaction (maxAttempts 1) consum
   assert.equal(await fx.storage.putGrantMeta('grant-new', consent), 'created');
   assert.equal(fx.data(fx.metaPath('grant-new')).receiverGeneration, 1);
   const version = fx.db.docs.get(fx.subPath(s.ownerId)).updateTime;
-  assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, snapshot.token, true), undefined, 'second submit');
+  assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, snapshot.token), undefined, 'second submit');
   assert.equal(fx.db.docs.get(fx.subPath(s.ownerId)).updateTime, version);
   assert.equal(fx.data(fx.ownerPath(s.ownerId)).receiverGeneration, 1);
   const again = await fx.loggedIn(s.uid, 'apple');
@@ -216,15 +215,15 @@ test('R4 nothing is deleted at any boundary (and nothing is consumed where a new
   const fx = fixture();
   const same = (ownerId, snap) => assert.deepEqual(fx.data(fx.subPath(ownerId)), snap);
   const open = (s) => fx.storage.interactionAccepts(s.interaction, s.csrf);
-  // コード・login方法なし: snapshotなし。偽造の確認でも通常の同意だけ（削除0）。
-  for (const method of ['developer_code', undefined]) {
+  // Google・コード・従来のlogin方法なしでも、不正なsnapshotでは旧設定を削除できない。
+  for (const method of ['google', 'developer_code', undefined]) {
     const s = await fx.loggedIn(`m-${randomUUID()}`, method);
     fx.putSettings(s.ownerId);
     const snap = fx.data(fx.subPath(s.ownerId));
-    assert.equal(await fx.storage.receiverSnapshot(s.interaction), null);
-    const consent = await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, 'forged', true);
-    assert.equal(consent.receiverReset, undefined);
+    assert.equal((await fx.storage.receiverSnapshot(s.interaction)).present, true);
+    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, 'forged'), 'changed');
     same(s.ownerId, snap);
+    assert.ok(await open(s));
   }
   // 設定なし→表示の後に設定ができた（none→あり）: 確認の有無に関わらず'changed'、消費・削除0。
   {
@@ -233,20 +232,18 @@ test('R4 nothing is deleted at any boundary (and nothing is consumed where a new
     assert.equal(shown.present, false);
     fx.putSettings(s.ownerId);
     const snap = fx.data(fx.subPath(s.ownerId));
-    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, shown.token, false), 'changed');
-    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, shown.token, true), 'changed');
+    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, shown.token), 'changed');
     same(s.ownerId, snap);
     assert.ok(await open(s), 'not consumed');
   }
-  // 設定あり・未確認: 'confirm_required'、消費・削除0。改変token・空token: 'changed'。
+  // 改変token・空tokenでは消費も削除もしない。
   {
     const s = await fx.loggedIn(`unc-${randomUUID()}`, 'apple');
     fx.putSettings(s.ownerId);
     const snap = fx.data(fx.subPath(s.ownerId));
     const shown = await fx.storage.receiverSnapshot(s.interaction);
-    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, shown.token, false), 'confirm_required');
-    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, `${shown.token}x`, true), 'changed');
-    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, '', true), 'changed');
+    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, `${shown.token}x`), 'changed');
+    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, ''), 'changed');
     same(s.ownerId, snap);
     assert.ok(await open(s));
   }
@@ -258,10 +255,10 @@ test('R4 nothing is deleted at any boundary (and nothing is consumed where a new
     const shownA = await fx.storage.receiverSnapshot(a.interaction);
     const b = await fx.loggedIn(uid, 'apple');
     const shownB = await fx.storage.receiverSnapshot(b.interaction);
-    assert.equal((await fx.storage.consumeInteractionChecked(b.interaction, b.csrf, shownB.token, true)).receiverReset, true);
+    assert.equal((await fx.storage.consumeInteractionChecked(b.interaction, b.csrf, shownB.token)).receiverReset, true);
     fx.putSettings(a.ownerId, subId('d'));
     const snap = fx.data(fx.subPath(a.ownerId));
-    assert.equal(await fx.storage.consumeInteractionChecked(a.interaction, a.csrf, shownA.token, true), 'changed');
+    assert.equal(await fx.storage.consumeInteractionChecked(a.interaction, a.csrf, shownA.token), 'changed');
     same(a.ownerId, snap);
     assert.equal(fx.data(fx.ownerPath(a.ownerId)).receiverGeneration, 1);
   }
@@ -271,10 +268,10 @@ test('R4 nothing is deleted at any boundary (and nothing is consumed where a new
     fx.putSettings(s.ownerId);
     const snap = fx.data(fx.subPath(s.ownerId));
     const shown = await fx.storage.receiverSnapshot(s.interaction);
-    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, 'wrong-csrf', shown.token, true), undefined);
+    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, 'wrong-csrf', shown.token), undefined);
     fx.advance(300_001);
     assert.equal(await fx.storage.receiverSnapshot(s.interaction), null);
-    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, shown.token, true), undefined);
+    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, shown.token), undefined);
     same(s.ownerId, snap);
   }
   // 許可の停止（表示の後）: 'denied'、削除0。ownerの失効・無活動（表示の後）: undefined、削除0・世代の変化0。
@@ -284,7 +281,7 @@ test('R4 nothing is deleted at any boundary (and nothing is consumed where a new
     const snap = fx.data(fx.subPath(s.ownerId));
     const shown = await fx.storage.receiverSnapshot(s.interaction);
     fx.setAccess(s.uid, 'disabled');
-    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, shown.token, true), 'denied');
+    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, shown.token), 'denied');
     same(s.ownerId, snap);
   }
   for (const change of [(owner) => ({ ...owner, revokedAt: BASE }), (owner) => ({ ...owner, lastActiveAt: BASE - 91 * DAY })]) {
@@ -293,7 +290,7 @@ test('R4 nothing is deleted at any boundary (and nothing is consumed where a new
     const snap = fx.data(fx.subPath(s.ownerId));
     const shown = await fx.storage.receiverSnapshot(s.interaction);
     fx.db.write(fx.ownerPath(s.ownerId), change(fx.data(fx.ownerPath(s.ownerId))));
-    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, shown.token, true), undefined);
+    assert.equal(await fx.storage.consumeInteractionChecked(s.interaction, s.csrf, shown.token), undefined);
     assert.equal(await fx.storage.receiverSnapshot(s.interaction), null);
     same(s.ownerId, snap);
     assert.equal(fx.data(fx.ownerPath(s.ownerId)).receiverGeneration, undefined);
@@ -308,7 +305,7 @@ test('R4 nothing is deleted at any boundary (and nothing is consumed where a new
     fx.db.write(fx.subPath(t.ownerId), kmsStateDocument(randomUUID(), { ...emptyKmsState(), knownDestinationId: subId('e') }));
     const snap = fx.data(fx.subPath(t.ownerId));
     await assert.rejects(fx.storage.receiverSnapshot(t.interaction), (error) => error instanceof AccessUnavailableError);
-    await assert.rejects(fx.storage.consumeInteractionChecked(t.interaction, t.csrf, 'x', true), (error) => error instanceof AccessUnavailableError);
+    await assert.rejects(fx.storage.consumeInteractionChecked(t.interaction, t.csrf, 'x'), (error) => error instanceof AccessUnavailableError);
     same(t.ownerId, snap);
   }
 });
@@ -318,12 +315,12 @@ test('R5 an older consent is not upgraded: consumed before another reset, its gr
   const uid = `late-${randomUUID()}`;
   const first = await fx.loggedIn(uid, 'apple');
   const shown = await fx.storage.receiverSnapshot(first.interaction);
-  const late = await fx.storage.consumeInteractionChecked(first.interaction, first.csrf, shown.token, false);
+  const late = await fx.storage.consumeInteractionChecked(first.interaction, first.csrf, shown.token);
   assert.equal(late.receiverGeneration ?? 0, 0, 'generation 0 is the absent field (unchanged consent shape)');
   fx.putSettings(first.ownerId);
   const second = await fx.loggedIn(uid, 'apple');
   const shown2 = await fx.storage.receiverSnapshot(second.interaction);
-  const fresh = await fx.storage.consumeInteractionChecked(second.interaction, second.csrf, shown2.token, true);
+  const fresh = await fx.storage.consumeInteractionChecked(second.interaction, second.csrf, shown2.token);
   assert.equal(fresh.receiverGeneration, 1);
   assert.equal(await fx.storage.putGrantMeta('grant-late', late), 'denied');
   assert.equal(fx.data(fx.metaPath('grant-late')), undefined);

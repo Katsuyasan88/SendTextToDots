@@ -15,12 +15,15 @@
 //     含む）、起動失敗ではなく固定のclose failureで返す。errorは固定のconfig/startup/closeの3種だけ（元error・cause・値を転記しない）。
 // 既に始めたSDK・HTTPの物理取消、Cloudのcold startの所要時間、RAMの物理消去は保証しない。
 
-import { DEVELOPER_LOGIN_MODE } from '../config/validate.js';
+import { DEVELOPER_LOGIN_MODE, reviewerApprovalOf, reviewerServerOptionOf } from '../config/validate.js';
+import { KeyObject } from 'node:crypto';
+import { createKeyObjectReviewerSigner, type ReviewerApprovalSigner } from '../source/reviewer-approval.js';
 import type { CodeIdentityLookup } from '../identity/developer-code-identity.js';
 import { types } from 'node:util';
 
 import { cryptoKeyLocation, loadDeploymentConfig, type DeploymentConfig } from '../config/validate.js';
 import { isConnectNamespace } from '../connect/firestore.js';
+import { isOpenAiAppsChallenge } from '../connect/kms-server.js';
 import {
   GoogleKmsConnectCloseError,
   GoogleKmsConnectConfigError,
@@ -124,6 +127,12 @@ export interface OwnedDevelopmentConnectOptions {
   readonly log?: LogSink | undefined;
   /** gateway-v1のMCP backendだけ: 物理transport authority（省略は従来のdirect）。 */
   readonly transportAuthority?: string | undefined;
+  /** 任意。OpenAIのアプリ公開のドメイン確認値（配置の入口が環境から1回だけ読み、形を検査して渡す）。省略は従来404。 */
+  readonly openaiAppsChallenge?: string | undefined;
+  /**
+   * strictの審査承認を有効にした配置だけで必須（他では指定不可）: 審査承認のEd25519秘密鍵（配置の入口が専用envから1回だけ読んで渡す）。
+   */
+  readonly reviewerApprovalKey?: KeyObject | undefined;
 }
 
 export interface OwnedDevelopmentConnectServer {
@@ -140,6 +149,9 @@ interface Captured {
   readonly bindPort: number;
   readonly publicOrigin: string;
   readonly transportAuthority: string | undefined;
+  readonly openaiAppsChallenge: string | undefined;
+  /** strictの審査承認の署名port（無効はnull）。 */
+  readonly reviewerApproval: ReviewerApprovalSigner | null;
   readonly connectNamespace: string;
   readonly expectedServiceName: string;
   readonly kms: Readonly<Record<(typeof KMS_KEYS)[number], unknown>>;
@@ -185,7 +197,7 @@ function capture(options: unknown): Captured {
   const DATABASE_ID = deployment.databaseId;
   let fields: Map<string, unknown>;
   try {
-    fields = dataFields(options, OPTION_KEYS, ['log', 'transportAuthority']);
+    fields = dataFields(options, OPTION_KEYS, ['log', 'transportAuthority', 'openaiAppsChallenge', 'reviewerApprovalKey']);
   } catch {
     throw configInvalid();
   }
@@ -206,6 +218,22 @@ function capture(options: unknown): Captured {
   } else if (backend !== undefined) throw configInvalid();
   const connectNamespace = fields.get('connectNamespace');
   if (!isConnectNamespace(connectNamespace)) throw configInvalid();
+  // ドメイン確認値（任意）: 明示した値は形を検査する（不正は設定error。値は出さない）。
+  const openaiAppsChallenge = fields.get('openaiAppsChallenge');
+  if (openaiAppsChallenge !== undefined && !isOpenAiAppsChallenge(openaiAppsChallenge)) throw configInvalid();
+  // strictの審査承認: 設定が有効な時だけ鍵が必須、無効な時は鍵を受けない（どちらの不一致も設定error。鍵の値は出さない）。
+  const approvalConfig = reviewerApprovalOf(deployment);
+  const approvalKey = fields.get('reviewerApprovalKey');
+  if ((approvalConfig === undefined) !== (approvalKey === undefined)) throw configInvalid();
+  let reviewerApproval: ReviewerApprovalSigner | null = null;
+  if (approvalConfig !== undefined) {
+    if (!(approvalKey instanceof KeyObject) || approvalKey.type !== 'private' || approvalKey.asymmetricKeyType !== 'ed25519') throw configInvalid();
+    try {
+      reviewerApproval = createKeyObjectReviewerSigner(approvalConfig.sourceId, approvalKey, approvalConfig.reviewerUid);
+    } catch {
+      throw configInvalid();
+    }
+  }
   try {
     // KMS: environment=development・同じproject/database・設定locationの鍵だけ。数値版・t268 namespaceの検査は既存のpure policyで行う。
     const kmsFields = dataFields(fields.get('kms'), KMS_KEYS);
@@ -245,6 +273,8 @@ function capture(options: unknown): Captured {
       bindPort,
       publicOrigin,
       transportAuthority: transportAuthority as string | undefined,
+      openaiAppsChallenge: openaiAppsChallenge as string | undefined,
+      reviewerApproval,
       connectNamespace,
       expectedServiceName,
       kms,
@@ -348,6 +378,7 @@ export async function startOwnedDevelopmentConnectServer(options: OwnedDevelopme
     if (!live()) throw new OwnedDevelopmentConnectStartupError();
     const egress = createProductEgress();
     const ownedSdk = sdk;
+    const reviewerServerOption = reviewerServerOptionOf(config.deployment);
     try {
       server = await startDevelopmentGoogleKmsConnectServer({
         server: {
@@ -357,10 +388,13 @@ export async function startOwnedDevelopmentConnectServer(options: OwnedDevelopme
           identity: ownedSdk.identity,
           web: config.web,
           clientEgress: egress,
+          ...(config.deployment.connectedApps === true ? { connectedApps: true as const } : {}),
+          ...(config.deployment.mcpSendText === true ? { sendText: { namespace: config.deployment.deliveryNamespace, egress } } : {}),
           verificationSender: createEgressVerificationSender(egress),
           clock,
           publicOrigin: config.publicOrigin,
           ...(config.transportAuthority !== undefined ? { transportAuthority: config.transportAuthority } : {}),
+          ...(config.openaiAppsChallenge !== undefined ? { openaiAppsChallenge: config.openaiAppsChallenge } : {}),
           ...(config.log !== undefined ? { log: config.log } : {}),
           // 開発者向けコード（配置設定でonの時だけ）。保存層は接続serverが読んだidentifierKeyから作り、同じSDKの共通verifierへ結ぶ。
           ...(config.deployment.developerLogin === DEVELOPER_LOGIN_MODE
@@ -373,6 +407,12 @@ export async function startOwnedDevelopmentConnectServer(options: OwnedDevelopme
               }
             : {}),
           startupOperation: operation,
+          // プレイグラウンドの限定route（配置設定で固定BFF登録元を明示した時だけ。既定は無効で/v1/playground/*は404）。
+          ...(config.deployment.playgroundRegistrar !== undefined ? { playground: { sourceId: config.deployment.playgroundRegistrar.sourceId, publicKey: config.deployment.playgroundRegistrar.publicKey } } : {}),
+          // 審査・テスト専用ログイン（配置設定でonの時だけ。同じ設定のUIDで作った共通verifierの審査口が無ければ接続serverが設定errorで起動しない）。
+          ...(reviewerServerOption !== undefined
+            ? { reviewer: { ...reviewerServerOption, ...(config.reviewerApproval !== null ? { approval: config.reviewerApproval } : {}) } }
+            : {}),
           // 許可元strict（配置設定で明示した時だけ）。App Check方式は同じ所有Admin AppのAppCheck（初回検証時に取得）を渡す。
           ...(config.deployment.sourceAuthorization !== 'compatible'
             ? {

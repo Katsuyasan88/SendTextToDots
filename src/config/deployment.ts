@@ -18,6 +18,15 @@ export const DEPLOYMENT_CONFIG = {
    * `{ mode: 'strict-v1', methods: ['developer-key-v1', 'app-check-v1'] }`. See "Trusted source authorization" in docs/CONFIGURATION_EN.md.
    */
   sourceAuthorization: 'compatible',
+  /**
+   * App review / test sign-in with email and password. `off` (default). On a direct deployment, set
+   * `{ mode: 'reviewer-password-v1', uids: ['<pre-registered Firebase UID>'] }` for standard subscription rules.
+   * Strict source authorization also requires `approvalSourceId` and exactly one reviewer UID.
+   * Existing `destinations` and `firstDestination` settings still opt into their respective receiver restrictions.
+   */
+  reviewerLogin: 'off',
+  // connectedApps: true, // Enable account OAuth and separate sending-app registration.
+  // mcpSendText: true, // Enable send_text on a direct deployment with strict source authorization.
   /** Google Cloud / Firebase project ID (6 to 30 characters). */
   projectId: 'your-project-id',
   /** Numeric project number of the same project. */

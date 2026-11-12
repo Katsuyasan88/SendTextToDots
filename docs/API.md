@@ -168,7 +168,7 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 | endpoint | 内容 |
 | --- | --- |
 | `GET /v1/web/connection` | Bearer Firebase ID token。`{state, access}`（accessは `allowed`・`denied`・`unavailable`。UID・許可一覧・世代は返さない） |
-| `POST /v1/web/disconnect` | 同ownerのGrant/購読を失効。`{state}` |
+| `POST /v1/web/disconnect` | 本人の認可、トークン、購読、受信先設定を削除。`{state}` |
 | `/interaction/{uid}`・`…/login`・`…/consent`・`…/deny`・`/interaction/app.js` | OAuth認可のinteraction（同origin・CSRF・毎回の明示同意）とその固定script |
 | `/mcp` | MCP（Bearer access token、scope `sttd:events`） |
 | `/.well-known/*`・`/oauth/*` | OAuth metadata・token等（`oidc-provider`） |
@@ -177,7 +177,7 @@ callbackの2xxはdelivered、5xx・送出後の応答不明はdelivery_unknown�
 
 表示言語: HTML画面（`/console`・OAuth interaction・利用者向けOAuthエラー）は英語/日本語で描きます。`?lang=en` / `?lang=ja` の明示選択は表示専用のsession cookie `sttd_language`（Path=/・SameSite=Lax・Secure・期限なし）へ保存し、送信画面での言語切替も同じcookieをbrowserで書くため最後の選択が残ります。無い時は `Accept-Language` の優先順位（日本語選好ならja、それ以外はen）で決めます。このcookieを認証・認可に使わず、machine code・field・scope・route・送信本文は翻訳しません。
 
-状態の優先順位: 有効なGrantが無い→unlinked、承認待ちの送信先置換→change_pending、有効な購読→subscribed、直前の購読が期限切れ→expired、それ以外（未購読・購読取消）→linked。change_pending（既知の送信先と別の宛先）は、プラグインの接続をAppleでやり直し、最後の許可画面で本人が以前の受信先設定の削除を確認した時だけ解消します（受信先設定一式だけを消し、受信reset世代を進めます。それより前の同意のGrantでは、受信先を設定できません）。
+状態の優先順位: 有効なGrantが無い→unlinked、承認待ちの送信先置換→change_pending、有効な購読→subscribed、直前の購読が期限切れ→expired、それ以外（未購読・購読取消）→linked。change_pending（既知の送信先と別の宛先）は、最初に接続したときと同じAppleまたはGoogleアカウントでプラグインを再接続し、最後の許可画面で本人が以前の受信先設定の削除を確認した時だけ解消します（受信先設定一式だけを消し、受信reset世代を進めます。それより前の同意のGrantでは、受信先を設定できません）。
 
 利用許可（`access`）は購読の`state`と別に返します。許可を読めない時もHTTP 200で`state`と`access: "unavailable"`を返し、新しい利用はできません。OAuth interactionのloginでは、未登録・停止中の本人は403 `access_denied`（画面は「このサービスの利用が許可されていません。運営者へ確認」）でownerを作りません。同意の時点で停止・再登録を跨いだ場合も同じ案内の403画面でGrantを使える状態にしません。code交換・refreshは同じ世代のGrantだけで、そうでなければ既存の`invalid_grant`です。MCPの`events/subscribe`（延長・secret更新を含む）は既存のForbidden（`data.reason` = `access_revoked`）で、challengeの前と最終の保存時の両方で確かめます。`events/unsubscribe`・接続解除・Webの状態照会（`GET /v1/web/connection`）・取消は利用許可を条件にしません。MCPの `get_receiving_status` は購読と同じ利用許可を条件にします（4章）。
 
@@ -302,11 +302,21 @@ console.log(response.status, await response.json());
 
 欠落の403は本人確認（401）より先に返します（本人token・owner・鍵・配送を始めないため）。App Checkのconsumeは登録sourceの照合より先に行うので、停止・削除済みのsourceへ送ったtokenも消費されます。
 
-**送出までの照合:** 入口で認可したsourceは捨てず、送出確定のFirestore transactionで同じsourceを読み直し、全ての読取りの後の時刻で再確認します。購読を承認したGrantのsource（下記）も同じtransactionで照合し、API要求のsourceと購読のsourceが異なっても両方が現在有効な時だけ送出します。停止が先に確定していれば送出しません。送出を確定した後のHTTP送信は撤回できません。DB待機中に署名の期限を過ぎた要求も拒否します。
+**送出までの照合:** 入口で認可したsourceは捨てず、送出確定のFirestore transactionで同じsourceを読み直し、全ての読取りの後の時刻で再確認します。旧方式のGrantに結ばれたsourceも同じtransactionで照合します。アプリ登録方式へ移行済みなら、送信を要求したアプリの登録と世代を確認します。停止が先に確定していれば送出しません。送出を確定した後のHTTP送信は撤回できません。DB待機中に署名の期限を過ぎた要求も拒否します。
 
-### 許可元による接続承認（strict配置だけ）
+<a id="connected-apps"></a>
+### 送信アプリを登録する
 
-strictでは、Dots等のOAuth接続は同じ本人が許可元で明示承認してからだけ完了します。Dotsへ追加のheaderは要求しません。
+strictのdirect配置で `connectedApps: true` にすると、ChatGPTの接続はログインと同意で完了します。送信アプリは接続後に登録します。
+
+- `add_connected_app` に表示用の `name` を渡すと、12文字の登録コードと有効期限が返ります。コードは英数字・`_`・`-` で、10分以内に1回使えます。新しいコードを発行すると、同じアカウントの未使用コードは失効します。
+- 送信アプリからMCP originの `POST /v1/source/pair` に `{"code":"…"}` をJSONで送ります。同じアカウントのFirebase ID tokenと、`send` 操作が有効な送信元証明が必要です。成功は `200 {"linked":true}`。誤り・期限切れ・使用済み・別アカウントのコードは `400 invalid_pairing_code` です。
+- 同じ認証で `GET /v1/source/pair` を呼ぶと、送信元の許可状態が `{"allowed":true}` または `{"allowed":false}` で返ります。GETは本文なしで、両方ともクエリは付けません。開発者署名の宛先はMCP originです。
+- `list_connected_apps` は登録済みアプリの `appId` と表示名を返します。`remove_connected_app` に `appId` を渡すと、そのアプリの送信許可を解除します。アカウントの接続解除では送信アプリの設定と未使用コードも削除します。
+
+### 許可元による接続承認（従来のstrict配置）
+
+`connectedApps` を省略したstrict配置では、Dots等のOAuth接続は同じ本人が許可元で明示承認してからだけ完了します。Dotsへ追加のheaderは要求しません。
 
 1. 元browserの接続画面（`/interaction/{interactionId}`）でログインします。strictの同意画面は、権限の無い接続要求の参照（interaction ID）、許可元での確認・承認の方法、状態（承認待ち・承認済み・承認なしで同意できなかった）を日英で表示します。状態は通常の表示・再読み込み・同意の操作の時だけ更新し、匿名の状態APIや自動pollはありません。参照だけではlogin・同意・Grantは作られません。
 2. 許可元（登録app、またはローカル送信画面の登録開発者環境）が、MCP originの`GET /v1/source/approvals/{interactionId}`で内容を確認し、`POST /v1/source/approvals/{interactionId}`（`Content-Type: application/json`、本文は正確に`{"approve":true}`）で明示承認します。どちらもqueryなし、`Authorization: Bearer <同じ本人のFirebase ID token>`と上の許可元証明（`connect`操作。署名の宛先はMCP origin、pathはこのpath、GETの本文は空）が必要です。App Check tokenはGET/POSTとも消費します。GETの応答は`{"client","scope","resource","expiresAt"}`、POSTは`{"state":"approved","expiresAt"}`です。

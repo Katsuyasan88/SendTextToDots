@@ -23,6 +23,8 @@ License breakdown of all 333 packages in the lock (runtime, dev and optional; op
 
 ## 3. Reference data
 
+The sign-in buttons embed [Apple's official button artwork](https://developer.apple.com/documentation/signinwithapple/displaying-sign-in-with-apple-buttons-on-the-web) and [Google's official G logo](https://developers.google.com/identity/branding-guidelines). The assets are used under the respective brand guidelines.
+
 | Material | Source | License |
 | --- | --- | --- |
 | `references/iana_*_20261006.csv` (IPv4/IPv6 special-purpose, IPv6 address space) | IANA Protocol Registries (retrieved 2026-10-06; details in `references/README_EN.md`) | CC0 1.0 (no attribution requirement). Basis: https://www.iana.org/help/licensing-terms (checked 2026-10-23) |

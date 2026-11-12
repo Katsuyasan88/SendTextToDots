@@ -26,9 +26,10 @@ export interface LocalConsoleConfig {
   };
   /**
    * 任意: 管理者が登録した開発者環境（許可元strictの配置）。source IDと、このPCだけに置くEd25519秘密鍵（PKCS#8 PEM）のfile path。
-   * helperは起動時に鍵を1回読んでmemoryだけに持ち、固定上流（apiOriginの送信・mcpOriginの接続承認）向けの要求だけに署名する。
+   * helperは起動時に鍵を1回読んでmemoryだけに持ち、固定上流（apiOriginの送信・mcpOriginの送信アプリ登録または旧接続承認）向けの要求だけに署名する。
    * 鍵の本文はbrowser・URL・CLI引数・ログへ出さない。
    */
+  readonly connectedApps?: true | undefined;
   readonly source?: { readonly sourceId: string; readonly keyFile: string } | undefined;
 }
 
@@ -55,7 +56,9 @@ function plainObject(value: unknown, keys: readonly string[]): Record<string, un
 /** 解析済みの値を検査して凍結した設定を返す（file読取りと分離。試験は合成objectを渡せる）。 */
 export function validateLocalConsoleConfig(value: unknown): LocalConsoleConfig {
   const hasSource = typeof value === 'object' && value !== null && !Array.isArray(value) && Object.keys(value).includes('source');
-  const top = plainObject(value, hasSource ? [...TOP_KEYS, 'source'] : TOP_KEYS);
+  const hasConnectedApps = typeof value === 'object' && value !== null && Object.hasOwn(value, 'connectedApps');
+  const top = plainObject(value, [...TOP_KEYS, ...(hasSource ? ['source'] : []), ...(hasConnectedApps ? ['connectedApps'] : [])]);
+  if (hasConnectedApps && (top.connectedApps !== true || !hasSource)) fail();
   let source: LocalConsoleConfig['source'];
   if (hasSource) {
     const entry = plainObject(top.source, SOURCE_KEYS);
@@ -74,6 +77,7 @@ export function validateLocalConsoleConfig(value: unknown): LocalConsoleConfig {
     mcpOrigin,
     firebase: Object.freeze({ apiKey: firebase.apiKey as string, authDomain: firebase.authDomain as string, projectId: firebase.projectId as string }),
     ...(source !== undefined ? { source } : {}),
+    ...(hasConnectedApps ? { connectedApps: true as const } : {}),
   });
 }
 

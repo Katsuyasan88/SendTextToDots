@@ -176,7 +176,8 @@ export function isSourceBinding(value: unknown): value is SourceBinding {
   return typeof sourceId === 'string' && SOURCE_ID.test(sourceId) && typeof generation === 'string' && SOURCE_GENERATION.test(generation);
 }
 
-export type SourceRejection = 'missing' | 'disabled' | 'expired' | 'operation' | 'subject' | 'method' | 'generation';
+/** scope: 利用許可がWebだけ（sourceScope 'web'）の本人に、developer以外（App Check）のsourceを使わせない。 */
+export type SourceRejection = 'missing' | 'disabled' | 'expired' | 'operation' | 'subject' | 'method' | 'generation' | 'scope';
 
 export type SourceVerdict = { readonly kind: 'usable'; readonly record: AppSourceRecord | DeveloperSourceRecord } | { readonly kind: 'rejected'; readonly reason: SourceRejection };
 

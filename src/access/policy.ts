@@ -19,7 +19,9 @@ const IDENTITY_HASH = /^[0-9a-f]{64}$/;
 const RECORD_KEYS = ['version', 'state', 'generation', 'updatedAt'] as const;
 const GRANT_META_LEGACY_KEYS = ['ownerId', 'authTimeSec', 'createdAt'] as const;
 const GRANT_META_KEYS = ['ownerId', 'authTimeSec', 'createdAt', 'accessGeneration'] as const;
-const GRANT_META_RECEIVER_KEYS = ['ownerId', 'authTimeSec', 'createdAt', 'accessGeneration', 'receiverGeneration'] as const;
+/** 審査・テスト専用ログインのGrantの絶対期限（Firebaseのauth_timeから24時間。refresh・再ログインで既存Grantの値を変えない）。 */
+export const REVIEWER_GRANT_TTL_MS = 24 * 60 * 60 * 1000;
+export const REVIEWER_EXPIRY_FIELD = 'reviewerExpiresAt';
 
 /** 受信reset世代（ownerの受信先設定一式を消した回数）。安全な整数で、下限以上の時だけ有効。 */
 function isReceiverGeneration(value: unknown, min: number): value is number {
@@ -56,11 +58,19 @@ export interface AccessRecord {
    * これ以降は新規利用（login・交換・refresh・送信・購読・MCPの既存access token）を許さない。Apple/Googleの許可recordには無い。
    */
   readonly codeLoginExpiresAt?: number;
+  /**
+   * 送信元の範囲。'web'はプレイグラウンド（developer-key-v1の登録済みサーバー）だけで、App Check（DPADAA等のアプリ）の接続承認・送信・鍵を拒否する。
+   * 欠落は従来の通常許可（全方式）。Web登録・Web自己発行コードの有効化だけが新規作成時に付け、既存recordへは付けも外しもしない。
+   */
+  readonly sourceScope?: typeof ACCESS_SCOPE_WEB;
 }
+
+/** Webだけの利用許可の範囲値。 */
+export const ACCESS_SCOPE_WEB = 'web' as const;
 
 /** 新規利用の可否。allowedだけが世代を持つ（コードloginの許可は期限も持つ）。 */
 export type AccessVerdict =
-  | { readonly kind: 'allowed'; readonly generation: string; readonly codeLoginExpiresAt?: number }
+  | { readonly kind: 'allowed'; readonly generation: string; readonly codeLoginExpiresAt?: number; readonly sourceScope?: typeof ACCESS_SCOPE_WEB }
   | { readonly kind: 'denied' }
   | { readonly kind: 'unavailable' };
 
@@ -104,7 +114,8 @@ export function parseAccessRecord(value: unknown): AccessRecord {
   if (data === null) throw new AccessRecordError();
   const keys = Reflect.ownKeys(data);
   const coded = Object.hasOwn(data, 'codeLoginExpiresAt');
-  const expected: readonly string[] = coded ? [...RECORD_KEYS, 'codeLoginExpiresAt'] : RECORD_KEYS;
+  const scoped = Object.hasOwn(data, 'sourceScope');
+  const expected: readonly string[] = [...RECORD_KEYS, ...(coded ? ['codeLoginExpiresAt'] : []), ...(scoped ? ['sourceScope'] : [])];
   if (keys.length !== expected.length || !keys.every((key) => typeof key === 'string' && expected.includes(key))) {
     throw new AccessRecordError();
   }
@@ -116,10 +127,30 @@ export function parseAccessRecord(value: unknown): AccessRecord {
   if (state !== 'active' && state !== 'disabled') throw new AccessRecordError();
   if (!isAccessGeneration(generation)) throw new AccessRecordError();
   if (typeof updatedAt !== 'number' || !Number.isSafeInteger(updatedAt) || updatedAt < 0) throw new AccessRecordError();
-  if (!coded) return Object.freeze({ version: ACCESS_RECORD_VERSION, state, generation, updatedAt });
+  // 範囲は既知の'web'だけ（未知値・型違いはallowedへ読み替えない）。
+  if (scoped && ownValue(data, 'sourceScope') !== ACCESS_SCOPE_WEB) throw new AccessRecordError();
+  const scope: { sourceScope?: typeof ACCESS_SCOPE_WEB } = scoped ? { sourceScope: ACCESS_SCOPE_WEB } : {};
+  if (!coded) return Object.freeze({ version: ACCESS_RECORD_VERSION, state, generation, updatedAt, ...scope });
   const codeLoginExpiresAt = ownValue(data, 'codeLoginExpiresAt');
   if (!isExpiry(codeLoginExpiresAt)) throw new AccessRecordError();
-  return Object.freeze({ version: ACCESS_RECORD_VERSION, state, generation, updatedAt, codeLoginExpiresAt });
+  return Object.freeze({ version: ACCESS_RECORD_VERSION, state, generation, updatedAt, codeLoginExpiresAt, ...scope });
+}
+
+export type AccessSourceKind = 'app' | 'developer';
+
+/**
+ * 許可recordの送信元範囲がこの種別のsourceを許すか（存在・停止・期限の判定はaccessVerdictOf側。ここは範囲だけ）。
+ * 欠落recordは範囲の制約なし（利用許可の判定で別に拒否される）。不正recordはunavailable（許可へ読み替えない）。
+ */
+export function accessSourceScopeVerdict(exists: boolean, data: unknown, kind: AccessSourceKind): 'allowed' | 'scope' | 'unavailable' {
+  if (!exists) return 'allowed';
+  let record: AccessRecord;
+  try {
+    record = parseAccessRecord(data);
+  } catch {
+    return 'unavailable';
+  }
+  return record.sourceScope === ACCESS_SCOPE_WEB && kind !== 'developer' ? 'scope' : 'allowed';
 }
 
 /** epoch msとして有効な時刻（安全整数・非負・Dateの表現域内）。小数・負・NaN・Infinity・unsafe integerは不可。 */
@@ -151,9 +182,10 @@ export function accessVerdictOf(exists: boolean, data: unknown, now?: number): A
     return ACCESS_UNAVAILABLE;
   }
   if (record.state !== 'active') return ACCESS_DENIED;
-  if (record.codeLoginExpiresAt === undefined) return Object.freeze({ kind: 'allowed' as const, generation: record.generation });
+  const scope: { sourceScope?: typeof ACCESS_SCOPE_WEB } = record.sourceScope === undefined ? {} : { sourceScope: record.sourceScope };
+  if (record.codeLoginExpiresAt === undefined) return Object.freeze({ kind: 'allowed' as const, generation: record.generation, ...scope });
   if (!codeLoginWithin(record.codeLoginExpiresAt, now)) return ACCESS_DENIED;
-  return Object.freeze({ kind: 'allowed' as const, generation: record.generation, codeLoginExpiresAt: record.codeLoginExpiresAt });
+  return Object.freeze({ kind: 'allowed' as const, generation: record.generation, codeLoginExpiresAt: record.codeLoginExpiresAt, ...scope });
 }
 
 /** owner文書のidentityHash（無い・形違いはnull）。 */
@@ -170,7 +202,7 @@ export function ownerIdentityHash(ownerData: unknown): string | null {
 
 /** grantMetaの世代の束縛。legacyは世代を持たない移行前Grant、invalidは形の不正。 */
 export type GrantGeneration =
-  | { readonly kind: 'bound'; readonly ownerId: string; readonly generation: string }
+  | { readonly kind: 'bound'; readonly ownerId: string; readonly generation: string; readonly reviewerExpiresAt?: number }
   | { readonly kind: 'missing' }
   | { readonly kind: 'legacy' }
   | { readonly kind: 'invalid' };
@@ -180,10 +212,14 @@ export function grantGenerationOf(exists: boolean, value: unknown): GrantGenerat
   const data = plainData(value);
   if (data === null) return { kind: 'invalid' };
   try {
-    // exact key: 旧形式は{ownerId, authTimeSec, createdAt}、現行はそれにaccessGeneration（受信reset世代が1以上ならreceiverGenerationも）。余分・欠落は不正。
+    // exact key: 旧形式は{ownerId, authTimeSec, createdAt}、現行はそれにaccessGeneration（受信reset世代が1以上ならreceiverGeneration、
+    // 審査専用ログインのGrantならreviewerExpiresAtも）。余分・欠落は不正。
     const keys = Reflect.ownKeys(data);
     const legacy = !Object.hasOwn(data, 'accessGeneration');
-    const expected: readonly string[] = legacy ? GRANT_META_LEGACY_KEYS : Object.hasOwn(data, 'receiverGeneration') ? GRANT_META_RECEIVER_KEYS : GRANT_META_KEYS;
+    const reviewer = Object.hasOwn(data, REVIEWER_EXPIRY_FIELD);
+    const expected: readonly string[] = legacy
+      ? GRANT_META_LEGACY_KEYS
+      : [...GRANT_META_KEYS, ...(Object.hasOwn(data, 'receiverGeneration') ? ['receiverGeneration'] : []), ...(reviewer ? [REVIEWER_EXPIRY_FIELD] : [])];
     if (keys.length !== expected.length || !keys.every((key) => typeof key === 'string' && expected.includes(key))) return { kind: 'invalid' };
     const ownerId = ownValue(data, 'ownerId');
     const authTimeSec = ownValue(data, 'authTimeSec');
@@ -196,7 +232,11 @@ export function grantGenerationOf(exists: boolean, value: unknown): GrantGenerat
     const generation = ownValue(data, 'accessGeneration');
     if (!isAccessGeneration(generation)) return { kind: 'invalid' };
     if (Object.hasOwn(data, 'receiverGeneration') && !isReceiverGeneration(ownValue(data, 'receiverGeneration'), 1)) return { kind: 'invalid' };
-    return { kind: 'bound', ownerId, generation };
+    if (!reviewer) return { kind: 'bound', ownerId, generation };
+    // 移行前に発行された審査Grantの期限は引き続き検証する。新規Grantはこのfieldを持たない。
+    const reviewerExpiresAt = ownValue(data, REVIEWER_EXPIRY_FIELD);
+    if (!isExpiry(reviewerExpiresAt) || reviewerExpiresAt !== authTimeSec * 1000 + REVIEWER_GRANT_TTL_MS) return { kind: 'invalid' };
+    return { kind: 'bound', ownerId, generation, reviewerExpiresAt };
   } catch {
     return { kind: 'invalid' };
   }
@@ -204,24 +244,37 @@ export function grantGenerationOf(exists: boolean, value: unknown): GrantGenerat
 
 /**
  * Grantを新規利用（code交換・refresh・購読・送信）に使えるか。許可がallowedで、grantMetaが同じownerと現在の世代へ束縛されている時だけallowed。
- * 許可・metadataの不正はunavailable、欠落・disabled・旧形式・旧世代・別ownerはdenied。
+ * 許可・metadataの不正はunavailable、欠落・disabled・旧形式・旧世代・別ownerはdenied。審査専用ログインのGrantは、nowが期限
+ * （auth_time＋24時間）より前の時だけ（nowを渡さない・時刻不正・期限以降はdenied＝fail closed）。
  */
-export function grantUseVerdict(access: AccessVerdict, grant: GrantGeneration, ownerId: string): AccessVerdict {
+export function grantUseVerdict(access: AccessVerdict, grant: GrantGeneration, ownerId: string, now?: number): AccessVerdict {
   if (access.kind === 'unavailable' || grant.kind === 'invalid') return ACCESS_UNAVAILABLE;
   if (access.kind === 'denied') return ACCESS_DENIED;
   if (grant.kind !== 'bound' || grant.ownerId !== ownerId || grant.generation !== access.generation) return ACCESS_DENIED;
+  if (grant.reviewerExpiresAt !== undefined && !codeLoginWithin(grant.reviewerExpiresAt, now)) return ACCESS_DENIED;
   return access;
 }
 
 /** 管理操作の目標状態への遷移。同じ状態・欠落の停止なら書込みなし（世代も変えない）。遷移・初回登録は新しい世代。 */
-export function nextAccessRecord(current: AccessRecord | null, desired: AccessState, now: number, newGeneration: string): AccessRecord | null {
+export function nextAccessRecord(
+  current: AccessRecord | null,
+  desired: AccessState,
+  now: number,
+  newGeneration: string,
+  /** 新規作成時だけ使う範囲（既存recordの範囲は保持し、ここで付け替えない）。 */
+  createScope?: typeof ACCESS_SCOPE_WEB,
+): AccessRecord | null {
   if (!isAccessGeneration(newGeneration) || !Number.isSafeInteger(now) || now < 0) throw new AccessRecordError();
   // 欠落は既に利用不許可なので、停止で新しいrecordを作らない。
   if (current === null ? desired === 'disabled' : current.state === desired) return null;
   if (current !== null && current.generation === newGeneration) throw new AccessRecordError();
+  if (createScope !== undefined && createScope !== ACCESS_SCOPE_WEB) throw new AccessRecordError();
+  // Webだけの範囲は管理操作（停止→再許可）でも外さない（DPADAAの権限へ自動で広げない）。新規作成時だけ指定の範囲を付ける。
+  const scopeValue = current === null ? createScope : current.sourceScope;
+  const scope: { sourceScope?: typeof ACCESS_SCOPE_WEB } = scopeValue === undefined ? {} : { sourceScope: scopeValue };
   // コードloginの期限は管理操作（停止→再許可）でも外さない・延ばさない（無期限化しない）。
   if (current?.codeLoginExpiresAt !== undefined) {
-    return Object.freeze({ version: ACCESS_RECORD_VERSION, state: desired, generation: newGeneration, updatedAt: now, codeLoginExpiresAt: current.codeLoginExpiresAt });
+    return Object.freeze({ version: ACCESS_RECORD_VERSION, state: desired, generation: newGeneration, updatedAt: now, codeLoginExpiresAt: current.codeLoginExpiresAt, ...scope });
   }
-  return Object.freeze({ version: ACCESS_RECORD_VERSION, state: desired, generation: newGeneration, updatedAt: now });
+  return Object.freeze({ version: ACCESS_RECORD_VERSION, state: desired, generation: newGeneration, updatedAt: now, ...scope });
 }

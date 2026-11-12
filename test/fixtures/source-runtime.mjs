@@ -11,7 +11,7 @@ import { KMS_CAPSULE_PREFIX } from '../../dist/protection/kms-sealing.js';
 import { createSourceGate } from '../../dist/source/http.js';
 import { createKmsSubscriptionPolicy, kmsMarkerDocument, kmsStateDocument, kmsVersionName } from '../../dist/storage/firestore/kms-subscription-format.js';
 
-import { ConnectStorage } from '../../dist/connect/firestore.js';
+import { ConnectStorage, connectIdentityHash as identityHashOf } from '../../dist/connect/firestore.js';
 import { createConnectKmsSealingPort } from '../../dist/connect/kms-port.js';
 import { createOAuthProvider, resourceFor } from '../../dist/oauth/provider.js';
 import { createRequestAuthContext, createRequestScopedOAuthOwnerResolver } from '../../dist/oauth/request-auth-runtime.js';
@@ -184,17 +184,27 @@ export function createResolverRuntime({ strict = true } = {}) {
  * 本番のlisten境界（0.0.0.0/明示port）だけを試験内で局所interceptして127.0.0.1/port 0へ結び、起動後すぐrestoreする（製品codeは不変）。
  * 要求はNode HTTP clientで、元のhttps Host（設定のauthority）・Origin・cookieを付けて127.0.0.1へ送る。redirectは追わない。
  */
-export async function startConnectHttpRuntime({ strict = true, transportAuthority, clientJwks = [], echoChallenge = false } = {}) {
+/**
+ * 合成のFirebase ID token（`h.<base64url JSON>.s`。署名検証は合成AdminAuthが代行）。claims: sub・provider・authTimeSec・aud（省略はproject）。
+ * reviewer runtimeでは実createFirebaseAdminVerifierがこれを受け、project・provider・審査UIDの判定は製品codeのまま通る。
+ */
+export function syntheticFirebaseToken({ sub, provider, authTimeSec, aud }) {
+  const part = Buffer.from(JSON.stringify({ sub, provider, authTimeSec, ...(aud === undefined ? {} : { aud }) }), 'utf8').toString('base64url');
+  return `syn.${part}.sig`;
+}
+
+export async function startConnectHttpRuntime({ strict = true, transportAuthority, clientJwks = [], echoChallenge = false, deployment, openaiAppsChallenge, reviewer, playground, sendText, connectedApps, appCheck } = {}) {
   const net = await import('node:net');
   const http = await import('node:http');
   const { startDevelopmentKmsConnectServer } = await import('../../dist/connect/kms-server.js');
   const { CHATGPT_CIMD_CANDIDATE } = await import('../../dist/oauth/cimd.js');
   const { connectIdentityHash } = await import('../../dist/connect/firestore.js');
-  const projectId = 'sttd-http-test';
-  const issuer = 'https://connect.sttd-http.example.com';
+  // deployment（validateDeploymentConfigの結果）を渡すと、その値でGoogle wrapper（startDevelopmentGoogleKmsConnectServer）経由で起動する。
+  const projectId = deployment?.projectId ?? 'sttd-http-test';
+  const issuer = deployment?.connect.publicOrigin ?? 'https://connect.sttd-http.example.com';
   const authority = new URL(issuer).host;
-  const NS = `t256_${randomUUID()}`;
-  const SUB_NS = `t268_${randomUUID()}`;
+  const NS = deployment?.connectNamespace ?? `t256_${randomUUID()}`;
+  const SUB_NS = deployment?.kms.namespace ?? `t268_${randomUUID()}`;
   const docs = new Map();
   let tick = 0;
   const stamp = () => {
@@ -251,6 +261,7 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
     };
   }
   let lock = Promise.resolve();
+  let rejectNextCommit = false;
   const db = {
     projectId,
     docs,
@@ -273,7 +284,7 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
       const run = lock.then(async () => {
         const pending = [];
         const tx = {
-          get: async (ref) => snapshot(ref.path),
+          get: async (ref) => (ref.path === undefined ? ref.get() : snapshot(ref.path)),
           getAll: async (...refs) => refs.map((ref) => snapshot(ref.path)),
           set: (ref, data) => (pending.push(() => write(ref.path, data)), tx),
           create: (ref, data) =>
@@ -291,6 +302,10 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
           delete: (ref) => (pending.push(() => docs.delete(ref.path)), tx),
         };
         const result = await fn(tx);
+        if (rejectNextCommit) {
+          rejectNextCommit = false;
+          throw new Error('synthetic commit refused');
+        }
         for (const apply of pending) apply();
         return result;
       });
@@ -300,7 +315,7 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
   };
   const offset = { ms: 0 };
   const clock = { now: () => Date.now() + offset.ms };
-  const cryptoKey = `projects/${projectId}/locations/asia-northeast1/keyRings/sttd/cryptoKeys/connect`;
+  const cryptoKey = deployment?.kms.cryptoKey ?? `projects/${projectId}/locations/asia-northeast1/keyRings/sttd/cryptoKeys/connect`;
   const kms = { environment: 'development', projectId, databaseId: '(default)', namespace: SUB_NS, cryptoKey, writeVersion: 1, readVersions: [1] };
   const policy = createKmsSubscriptionPolicy(kms);
   write(`sttdAuth/${SUB_NS}/config/kms-subscription`, kmsMarkerDocument(policy));
@@ -320,6 +335,8 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
   };
   const egressCalls = [];
   const challenges = [];
+  /** echo: null＝起動時のechoChallenge、true/false＝上書き。during: 応答の前に呼ぶ割込み（null＝なし）。 */
+  const challengeControl = { echo: null, during: null };
   const clientEgress = {
     getJson: async (url) => {
       egressCalls.push(url);
@@ -329,7 +346,7 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
     },
   };
   // 合成本人verifier: `id-<uid>`の形のtokenを、このprojectのAppleの本人として検証済みにする（外部通信0）。
-  const identity = {
+  const syntheticIdentity = {
     projectId,
     async verifyIdToken(token) {
       const match = /^id-([a-z0-9-]{1,40})$/.exec(token);
@@ -340,6 +357,29 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
       return 'active';
     },
   };
+  // 審査・テスト専用ログインの試験だけ: 実verifier（createFirebaseAdminVerifier）を合成AdminAuth（syntheticFirebaseTokenを解く・失効0）で使う。
+  const accountStates = new Map();
+  const identity =
+    reviewer === undefined
+      ? syntheticIdentity
+      : (await import('../../dist/identity/firebase.js')).createFirebaseAdminVerifier({
+          projectId,
+          reviewerUids: reviewer.uids,
+          auth: {
+            async verifyIdToken(token) {
+              const part = /^syn\.([A-Za-z0-9_-]+)\.sig$/.exec(token)?.[1];
+              if (part === undefined) throw Object.assign(new Error('invalid'), { code: 'auth/argument-error' });
+              const claims = JSON.parse(Buffer.from(part, 'base64url').toString('utf8'));
+              const aud = claims.aud ?? projectId;
+              // 実SDKは別projectのtokenをaudience不一致として拒否する（分類はverifier側）。
+              if (aud !== projectId) throw Object.assign(new Error('aud'), { code: 'auth/argument-error' });
+              return { aud, iss: `https://securetoken.google.com/${aud}`, sub: claims.sub, auth_time: claims.authTimeSec, firebase: { sign_in_provider: claims.provider } };
+            },
+            async getUser(uid) {
+              return { disabled: accountStates.get(uid) === 'disabled' };
+            },
+          },
+        });
   // listen境界だけの局所intercept（0.0.0.0/明示port → 127.0.0.1/port 0）。起動後すぐrestoreする。
   const originalListen = net.Server.prototype.listen;
   let listened = null;
@@ -348,25 +388,51 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
     return originalListen.call(this, 0, '127.0.0.1', typeof host === 'function' ? host : callback);
   };
   let server;
+  const jwksKeys = [es, rs];
+  const cookieKey = randomBytes(32);
   try {
-    server = await startDevelopmentKmsConnectServer({
+    if (deployment !== undefined) {
+      server = await startViaGoogleWrapper({ deployment, db, NS, kms, jwksKeys, cookieKey, identifierKey, identity, clientEgress, clock, issuer, challenges, echoChallenge, openaiAppsChallenge });
+    } else server = await startDevelopmentKmsConnectServer({
       bindPort: 18_080,
       db,
       namespace: NS,
       kms: { ...kms, transport: syntheticKmsTransport() },
-      secrets: { load: async () => ({ jwks: { keys: [es, rs] }, cookieKeys: [randomBytes(32)], identifierKey: Buffer.from(identifierKey) }) },
+      secrets: { load: async () => ({ jwks: { keys: jwksKeys }, cookieKeys: [cookieKey], identifierKey: Buffer.from(identifierKey) }) },
       identity,
       web: { apiKey: 'synthetic-web-key', authDomain: `${projectId}.firebaseapp.com`, projectId },
       clientEgress,
       // 合成のcallback challenge（echoChallengeの時だけ受信先の正しい応答を返す。実HTTP 0）。
       verificationSender: async (request) => {
         challenges.push(request.url);
-        return echoChallenge ? { status: 200, body: JSON.stringify({ challenge: JSON.parse(request.body).challenge }) } : { status: 500, body: '' };
+        // T-277: 試験ごとの応答の上書きと、検証中（応答の前）の割込み（時刻・権限の変化）。
+        if (challengeControl.during !== null) await challengeControl.during(request);
+        const echo = challengeControl.echo ?? echoChallenge;
+        return echo ? { status: 200, body: JSON.stringify({ challenge: JSON.parse(request.body).challenge }) } : { status: 500, body: '' };
       },
       clock,
       publicOrigin: issuer,
       ...(transportAuthority !== undefined ? { transportAuthority } : {}),
-      ...(strict ? { sourceAuthorization: { policy: { mode: 'strict-v1', methods: ['developer-key-v1'] }, projectNumber: '123456789012' } } : {}),
+      ...(openaiAppsChallenge !== undefined ? { openaiAppsChallenge } : {}),
+      ...(playground !== undefined ? { playground } : {}),
+      ...(sendText !== undefined ? { sendText } : {}),
+      ...(connectedApps === true ? { connectedApps } : {}),
+      ...(strict ? { sourceAuthorization: {
+        policy: { mode: 'strict-v1', methods: appCheck === undefined ? ['developer-key-v1'] : ['developer-key-v1', 'app-check-v1'] },
+        projectNumber: '123456789012', ...(appCheck === undefined ? {} : { appCheck }),
+      } } : {}),
+      ...(reviewer !== undefined
+        ? {
+            reviewer:
+              reviewer.raw !== undefined
+                ? reviewer.raw
+                : {
+                    ...(reviewer.firstDestination !== undefined ? { firstDestination: reviewer.firstDestination } : {}),
+                    ...(reviewer.destinations !== undefined ? { destinations: reviewer.destinations } : {}),
+                    ...(reviewer.approval !== undefined ? { approval: reviewer.approval } : {}),
+                  },
+          }
+        : {}),
     });
   } finally {
     net.Server.prototype.listen = originalListen;
@@ -398,11 +464,13 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
         .join('; ');
     return {
       jar,
-      request: (method, target, { headers = {}, body, cookies = true } = {}) =>
+      // rawTarget: true の時だけ、origin-formのtargetを正規化せずにそのまま送る（空の「?」・ドット区間の試験用）。既定は従来どおり。
+      request: (method, target, { headers = {}, body, cookies = true, rawTarget = false } = {}) =>
         new Promise((resolve, reject) => {
           const url = new URL(target, issuer);
           if (url.origin !== issuer) throw new Error('synthetic browser: only the original issuer is mapped to localhost');
-          const path = `${url.pathname}${url.search}`;
+          if (rawTarget && (typeof target !== 'string' || !target.startsWith('/') || target.startsWith('//'))) throw new Error('synthetic browser: rawTarget must be origin-form');
+          const path = rawTarget ? target : `${url.pathname}${url.search}`;
           const cookie = cookies ? cookieFor(url.pathname) : '';
           const req = http.request(
             { host: '127.0.0.1', port: via, method, path, headers: { Host: authority, ...(cookie ? { Cookie: cookie } : {}), ...headers, ...(body !== undefined ? { 'Content-Length': Buffer.byteLength(body) } : {}) } },
@@ -423,7 +491,7 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
   };
 
   /** 利用許可と、その本人へ結んだ登録開発者source（connect操作）と鍵。 */
-  const enrollPerson = async (uid) => {
+  const enrollPerson = async (uid, operations = ['connect']) => {
     const identityHash = connectIdentityHash(hasher, NS, { projectId, uid });
     write(`${root}/access/${identityHash}`, { version: 1, state: 'active', generation: randomUUID(), updatedAt: clock.now() });
     const { publicKey, privateKey } = generateKeyPairSync('ed25519');
@@ -434,7 +502,7 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
       kind: 'developer',
       state: 'active',
       generation: newSourceGeneration(),
-      operations: ['connect'],
+      operations,
       publicKey: publicKey.export({ format: 'jwk' }).x,
       identityHash,
       expiresAt: null,
@@ -454,6 +522,7 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
     db,
     docs,
     write,
+    rejectNextCommit: () => { rejectNextCommit = true; },
     offset,
     clock,
     hasher,
@@ -464,6 +533,15 @@ export async function startConnectHttpRuntime({ strict = true, transportAuthorit
     root,
     browser,
     enrollPerson,
+    accountStates,
+    challengeControl,
+    /** 利用許可だけ（source無し。compatible配置の通常・審査の本人）。 */
+    allow: (uid) => {
+      const identityHash = connectIdentityHash(hasher, NS, { projectId, uid });
+      write(`${root}/access/${identityHash}`, { version: 1, state: 'active', generation: randomUUID(), updatedAt: clock.now() });
+      return identityHash;
+    },
+    projectId,
     close: () => server.close(),
   };
 }
@@ -691,9 +769,9 @@ export function createDeliveryRuntime({ audience = 'https://api.sttd-source.inva
     ...(appCheck !== undefined ? { appCheck } : {}),
   });
   /** 有効な購読のある本人（購読はgrantIdのGrantに束縛）。 */
-  const enroll = () => {
+  const enroll = ({ uid } = {}) => {
     const ownerId = randomUUID();
-    const identityHash = randomBytes(32).toString('hex');
+    const identityHash = uid === undefined ? randomBytes(32).toString('hex') : identityHashOf(hasher, NS, { projectId: 'p', uid });
     const grantId = `grant-${ownerId}`;
     docs.set(`${root}/access/${identityHash}`, { version: 1, state: 'active', generation: randomUUID(), updatedAt: BASE });
     docs.set(`${root}/owners/${ownerId}`, { identityHash, sealedUid: 'synthetic-sealed', createdAt: BASE, lastActiveAt: BASE, revokedAt: null });
@@ -707,19 +785,74 @@ export function createDeliveryRuntime({ audience = 'https://api.sttd-source.inva
         lastEnded: null,
       }),
     );
-    return { ownerId, grantId };
+    return { ownerId, grantId, identityHash, ...(uid === undefined ? {} : { identity: { projectId: 'p', uid, authTimeSec: 1 } }) };
   };
   /** 同意の最終txが作るのと同じGrantのbinding記録。 */
   const bindGrant = (grantId, binding) => docs.set(`${root}/sourceGrants/${hasher.hash(`t256:${NS}:grant`, grantId)}`, { sourceId: binding.sourceId, generation: binding.generation });
   const iso = (ms) => new Date(ms).toISOString();
   /** 平文の送信（実serviceのpost）。requestBindingがあれば実gateのdispatchCheckを送出確定txへ渡す。 */
-  const post = (owner, requestBinding) => {
+  const post = (owner, requestBinding, identity) => {
     const commandId = randomUUID();
     const body = Buffer.from(JSON.stringify({ schemaVersion: 2, commandId, text: 'synthetic', createdAt: iso(clock.t), expiresAt: iso(clock.t + 60_000) }));
     const operation = Object.freeze({ deadlineAt: clock.t + 20_000, signal: new AbortController().signal });
     return requestBinding === undefined
       ? service.post(owner.ownerId, commandId, body, clock.t, operation)
-      : service.post(owner.ownerId, commandId, body, clock.t, operation, gate.dispatchCheck(requestBinding, 'send'));
+      : service.post(owner.ownerId, commandId, body, clock.t, operation, gate.dispatchCheck(requestBinding, 'send', identity));
   };
   return { db, docs, log, clock, NS, hasher, sources, storage, gate, service, sent, enroll, bindGrant, post };
+}
+
+
+/**
+ * 製品のGoogle wrapper（startDevelopmentGoogleKmsConnectServer）を、合成GAX client（innerApiCallsのcancel付きPromise）で起動する。
+ * server optionsはgoogle-runtime/connect-development.tsと同じ規則で配置設定から作る（strict・playgroundRegistrar→playground）。
+ * Secretは用途ごとの合成値（jwks・cookieKeys・identifierKey）、KMSは起動・登録で使わないため呼ばれたら失敗。外部通信0。
+ */
+async function startViaGoogleWrapper({ deployment, db, NS, kms, jwksKeys, cookieKey, identifierKey, identity, clientEgress, clock, issuer, challenges, echoChallenge, openaiAppsChallenge }) {
+  const { startDevelopmentGoogleKmsConnectServer } = await import('../../dist/connect/google-kms-server.js');
+  const gax = (promise) => Object.assign(promise, { cancel: () => {} });
+  const payloads = {
+    jwks: Buffer.from(JSON.stringify({ keys: jwksKeys }), 'utf8'),
+    cookieKeys: Buffer.from(cookieKey),
+    identifierKey: Buffer.from(identifierKey),
+    commandDigestKey: randomBytes(32),
+  };
+  const purposeOf = (name) => Object.keys(deployment.secretVersions).find((purpose) => deployment.secretVersions[purpose] === name);
+  const secretClient = {
+    innerApiCalls: {
+      accessSecretVersion: (request) => {
+        const data = Buffer.from(payloads[purposeOf(request.name)] ?? Buffer.alloc(0));
+        return gax(Promise.resolve([{ name: request.name, payload: { data, dataCrc32c: crc32c(data) } }, undefined, undefined]));
+      },
+    },
+  };
+  const kmsClient = {
+    innerApiCalls: {
+      encrypt: () => gax(Promise.reject(new Error('unused'))),
+      decrypt: () => gax(Promise.reject(new Error('unused'))),
+    },
+  };
+  const { transport: _unused, ...kmsOptions } = { ...kms, transport: undefined };
+  void _unused;
+  return startDevelopmentGoogleKmsConnectServer({
+    server: {
+      bindPort: 18_080,
+      db,
+      namespace: NS,
+      identity,
+      web: { apiKey: 'synthetic-web-key', authDomain: deployment.web.authDomain, projectId: deployment.web.projectId },
+      clientEgress,
+      verificationSender: async (request) => {
+        challenges.push(request.url);
+        return echoChallenge ? { status: 200, body: JSON.stringify({ challenge: JSON.parse(request.body).challenge }) } : { status: 500, body: '' };
+      },
+      clock,
+      publicOrigin: issuer,
+      ...(openaiAppsChallenge !== undefined ? { openaiAppsChallenge } : {}),
+      ...(deployment.playgroundRegistrar !== undefined ? { playground: { sourceId: deployment.playgroundRegistrar.sourceId, publicKey: deployment.playgroundRegistrar.publicKey } } : {}),
+      ...(deployment.sourceAuthorization !== 'compatible' ? { sourceAuthorization: { policy: deployment.sourceAuthorization, projectNumber: deployment.projectNumber } } : {}),
+    },
+    kms: kmsOptions,
+    google: { kmsClient, secretClient, projectNumber: deployment.projectNumber, secretVersions: deployment.secretVersions },
+  });
 }

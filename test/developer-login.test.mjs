@@ -1250,3 +1250,34 @@ test('F5 late committed activation after the exchange deadline is revoked by fai
   const access = [...db.docs].find(([path]) => path.endsWith(`/${accessIdentityHash}`));
   assert.equal(access[1].data.state, 'disabled');
 });
+
+// ================= T-240: Web自己発行コードはWebだけの許可、従来の運営者発行は従来の許可 =================
+
+async function codeLoginWithScope(code, sourceScope) {
+  const { store, clock, db } = makeStore({ codes: [code] });
+  const issued = await store.issue({ claimSecret: claim(), ...(sourceScope === undefined ? {} : { sourceScope }) });
+  const opPath = [...db.docs.keys()].find((p) => /\/developerLoginOperations\/[^/]+$/.test(p));
+  const outcome = await exchangeFor(store, fakeAuth(), clock).exchange({ code: issued.code, interactionKey: 'i', sourceKey: 's' });
+  assert.equal(outcome.kind, 'token');
+  const accessPath = [...db.docs.keys()].find((p) => /\/access\/[^/]+$/.test(p));
+  return { store, clock, db, op: opPath === undefined ? undefined : db.docs.get(opPath).data, access: db.docs.get(accessPath).data };
+}
+
+test('T240-1 Web self-issued code: operation keeps the server-side issuer scope and activation creates a web-only access record (code lifetime kept)', async () => {
+  const { access, op, clock } = await codeLoginWithScope(740, 'web');
+  assert.equal(op?.sourceScope, 'web');
+  assert.equal(access.sourceScope, 'web');
+  assert.equal(access.codeLoginExpiresAt, clock.t + CODE_LOGIN_LIFETIME_MS);
+  assert.equal(accessVerdictOf(true, access, clock.t).sourceScope, 'web');
+  // 管理の停止→再許可でも範囲を外さない
+  const disabled = nextAccessRecord(parseAccessRecord(access), 'disabled', clock.t, globalThis.crypto.randomUUID());
+  assert.equal(nextAccessRecord(disabled, 'active', clock.t + 1, globalThis.crypto.randomUUID()).sourceScope, 'web');
+});
+
+test('T240-2 operator-issued code keeps the existing (unscoped) access; unknown issuer scope values are refused', async () => {
+  const { access, op } = await codeLoginWithScope(741, undefined);
+  assert.equal(Object.hasOwn(access, 'sourceScope'), false);
+  assert.equal(op === undefined || !Object.hasOwn(op, 'sourceScope'), true);
+  const { store } = makeStore({ codes: [742] });
+  await assert.rejects(store.issue({ claimSecret: claim(), sourceScope: 'all' }), (e) => e.code === 'unavailable');
+});

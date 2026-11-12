@@ -31,8 +31,10 @@ import {
   type Language,
   type MessageKey,
 } from './i18n.js';
+import { APP_PAIR_CODE, PAIR_APP_PATH } from '../source/connected-apps.js';
 import { isDevelopmentPublicOrigin } from '../http/origin.js';
 import { FIREBASE_POPUP_SCRIPT_ORIGIN, FIREBASE_WEB_SDK_VERSION, type FirebaseWebConfig } from './pages.js';
+import { GOOGLE_SIGN_IN_LOGO, PROVIDER_BUTTON_STYLE } from './provider-buttons.js';
 
 export const CONSOLE_PATH = '/console';
 export const CONSOLE_SCRIPT_PATH = '/console/app.js';
@@ -98,6 +100,7 @@ export interface ConsolePageOptions {
   readonly operatorFirst?: boolean | undefined;
   /** operator modeのコード操作（6桁・残り時間・案内・再発行・接続確認・取消・結果）。手順2の追加方法の後に置く（escape済みの値）。 */
   readonly operatorCodePanel?: string | undefined;
+  readonly connectedApps?: boolean | undefined;
 }
 
 /**
@@ -113,7 +116,7 @@ export function consoleSecurityHeaders(web: FirebaseWebConfig): Record<string, s
       "connect-src 'self' https://identitytoolkit.googleapis.com https://securetoken.googleapis.com",
       `frame-src https://${web.authDomain}`,
       "style-src 'self'",
-      "img-src 'none'",
+      "img-src data:",
       "form-action 'none'",
       "base-uri 'none'",
       "frame-ancestors 'none'",
@@ -158,7 +161,7 @@ export function renderConsolePage(web: FirebaseWebConfig, options: ConsolePageOp
 <html lang="${lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${t('console.title')}</title>
 <link rel="stylesheet" href="${CONSOLE_STYLE_PATH}">
 <script type="module" src="${CONSOLE_SCRIPT_PATH}"></script></head>
-<body${data}>
+<body class="sttd-light-only"${data}>
 <main>
 <nav class="sttd-language" aria-labelledby="sttd-language-label">
 <span id="sttd-language-label"${i18n('common.language')}>${t('common.language')}</span>
@@ -175,8 +178,8 @@ ${options.operatorFirst === true ? (options.operatorSection ?? '') : ''}
 <p id="sttd-login-intro"${i18n('wizard.loginIntro')}>${t('wizard.loginIntro')}</p>
 <p id="sttd-account-text" role="status">${t('console.accountSignedOut')}</p>
 <div class="sttd-actions">
-<button type="button" id="sttd-login"${i18n('common.appleLogin')}>${t('common.appleLogin')}</button>
-<button type="button" id="sttd-login-google"${i18n('common.googleLogin')}>${t('common.googleLogin')}</button>
+<button type="button" id="sttd-login" class="sttd-provider sttd-apple"><span class="sttd-provider-label"${i18n('common.appleLogin')}>${t('common.appleLogin')}</span></button>
+<button type="button" id="sttd-login-google" class="sttd-provider sttd-google"><img src="${GOOGLE_SIGN_IN_LOGO}" alt="" width="20" height="20"><span${i18n('common.googleLogin')}>${t('common.googleLogin')}</span></button>
 <button type="button" id="sttd-switch" hidden${i18n('common.switchAccount')}>${t('common.switchAccount')}</button>
 </div>
 </div>
@@ -209,6 +212,14 @@ ${
 </ul>
 </details>
 ${options.operatorCodePanel ?? ''}
+${options.connectedApps ? `<div id="sttd-app-pairing" hidden>
+<h3${i18n('pairing.title')}>${t('pairing.title')}</h3>
+<p${i18n('pairing.intro')}>${t('pairing.intro')}</p>
+<label for="sttd-pair-code"${i18n('pairing.code')}>${t('pairing.code')}</label>
+<input type="text" id="sttd-pair-code" maxlength="12" autocomplete="off" autocapitalize="none" spellcheck="false" disabled>
+<div class="sttd-actions"><button type="button" id="sttd-pair-submit" disabled${i18n('pairing.register')}>${t('pairing.register')}</button></div>
+<p id="sttd-pair-result" role="status"></p>
+</div>` : ''}
 <p id="sttd-state-text" role="status"></p>
 <p id="sttd-state-guide"></p>
 <div class="sttd-actions">
@@ -284,11 +295,14 @@ h1 { font-size: 1.35rem; margin: 0.5rem 0 1rem; }
 h2 { font-size: 1.05rem; margin: 0 0 0.5rem; }
 section { background: #fff; border: 1px solid #d9dce1; border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }
 label { display: block; font-weight: 600; margin: 0.75rem 0 0.25rem; }
-textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 0.5rem; border: 1px solid #b8bdc6; border-radius: 6px; }
+textarea, #sttd-pair-code { width: 100%; box-sizing: border-box; font: inherit; padding: 0.5rem; border: 1px solid #b8bdc6; border-radius: 6px; }
 button { font: inherit; min-height: 44px; padding: 0.5rem 1rem; margin: 0.5rem 0.5rem 0 0; border-radius: 8px; border: 1px solid #1f5fbf; background: #1f5fbf; color: #fff; }
 button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 #sttd-cancel, #sttd-disconnect, #sttd-disconnect-yes { background: #fff; color: #b3261e; border-color: #b3261e; }
 #sttd-disconnect-no { background: #fff; color: #1d1f23; border-color: #b8bdc6; }
+#sttd-app-pairing { border: 1px solid #d9dce1; border-radius: 8px; padding: 0.75rem; margin-top: 0.75rem; }
+#sttd-app-pairing h3 { margin: 0; font-size: 1rem; }
+#sttd-pair-code { width: min(100%, 22rem); }
 #sttd-disconnect-confirm { border: 1px solid #b3261e; border-radius: 8px; padding: 0.75rem; margin-top: 0.75rem; }
 .sttd-language { display: flex; gap: 0.75rem; align-items: center; justify-content: flex-end; font-size: 0.9rem; min-height: 44px; }
 .sttd-language a { color: #1f5fbf; padding: 0.5rem 0.25rem; }
@@ -319,7 +333,7 @@ button:disabled { background: #c9ced6; border-color: #c9ced6; color: #5b616b; }
 .sttd-complete { font-weight: 700; border: 2px solid #1f5fbf; border-radius: 8px; padding: 0.75rem; }
 .sttd-fixed { font-weight: 600; border: 1px solid #888; border-radius: 6px; padding: 0.5rem 0.75rem; white-space: pre-wrap; }
 [hidden] { display: none !important; }
-`;
+${PROVIDER_BUTTON_STYLE}`;
 
 /**
  * 画面のscript（固定asset）。7段階wizardの状態・単回送信・中止・同ID確認・確認後の解除・固定プロンプトのコピー・言語切替。
@@ -359,6 +373,9 @@ const CODE_FAMILY = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 const loadSdkModules = () => Promise.all([import(SDK_BASE + 'firebase-app.js'), import(SDK_BASE + 'firebase-auth.js')]);
 
 const el = (id) => document.getElementById(id);
+const PAIR_PATH = '${PAIR_APP_PATH}';
+const PAIR_CODE = ${APP_PAIR_CODE};
+const pairingEnabled = el('sttd-app-pairing') !== null;
 let lang = Object.hasOwn(TEXT, body.dataset.sttdLanguage) ? body.dataset.sttdLanguage : 'en';
 const T = (key) => (Object.hasOwn(TEXT[lang], key) ? TEXT[lang][key] : '');
 
@@ -373,6 +390,8 @@ let accountKey = 'console.accountSignedOut';
 let connection = null;
 // 利用許可（接続確認の応答のaccess。allowed/denied/unavailable、欠落は旧サービスのoutdated）。allowedの時だけ新しい送信を解放する。
 let access = null;
+let pairingState = null;
+let pairingMessage = '';
 let connectionKey = '';
 let guideKey = '';
 let checking = false;
@@ -476,7 +495,7 @@ function doneAfter(n) {
 }
 
 function sendableNow(n = 5) {
-  return available(n) && signedIn && connection === 'subscribed' && access === 'allowed' && !busy();
+  return available(n) && signedIn && connection === 'subscribed' && access === 'allowed' && (!pairingEnabled || pairingState === 'registered') && !busy();
 }
 
 function languageLocked() {
@@ -501,6 +520,9 @@ function resetFrom(n) {
   if (n <= 2) {
     connection = null;
     access = null;
+    pairingState = null;
+    pairingMessage = '';
+    if (pairingEnabled) el('sttd-pair-code').value = '';
     connectionKey = '';
     guideKey = '';
     confirming = false;
@@ -562,8 +584,15 @@ function render() {
   el('sttd-refresh').disabled = inactive(2) || !available(2) || busy() || inFlight() || confirming;
   // コード方式で未認証の間は、コードの接続確認だけ（通常の接続確認は認証後に出す）。追加方法の認証説明も選んだ方式に合わせる
   el('sttd-refresh').hidden = method === 'code' && !signedIn;
+  if (pairingEnabled) {
+    const pairDisabled = inactive(2) || !signedIn || busy() || inFlight() || confirming;
+    el('sttd-app-pairing').hidden = !signedIn;
+    el('sttd-pair-code').disabled = pairDisabled;
+    el('sttd-pair-submit').disabled = pairDisabled;
+    el('sttd-pair-result').textContent = T(pairingMessage || (pairingState === null ? '' : 'pairing.' + pairingState));
+  }
   el('sttd-plugin-step-3').textContent = T(method === 'code' ? 'plugin.step3Code' : 'plugin.step3');
-  el('sttd-disconnect').hidden = !signedIn || confirming || connection === null || connection === 'unlinked';
+  el('sttd-disconnect').hidden = !signedIn || confirming || connection === null;
   el('sttd-disconnect').disabled = inactive(2) || busy() || inFlight();
   el('sttd-disconnect-confirm').hidden = !confirming;
   el('sttd-disconnect-yes').disabled = inactive(2) || busy();
@@ -1041,7 +1070,9 @@ async function checkConnection(internal) {
   if (json === undefined) return;
   if (json === null) return render();
   let moveTo = 0;
-  if ((json.state === 'linked' || json.state === 'subscribed') && access === 'allowed') {
+  if (pairingEnabled && access === 'allowed' && (json.state === 'linked' || json.state === 'subscribed') && pairingState !== 'registered') {
+    step = 2;
+  } else if ((json.state === 'linked' || json.state === 'subscribed') && access === 'allowed') {
     // 接続許可（linked）で手順3へ。受信の開始と確認は手順3/4で行う（ここではsubscribedを要求しない）。
     const first = !done[2];
     done[2] = true;
@@ -1070,6 +1101,12 @@ async function checkReceiving() {
     if (done[4]) receiveLost();
     return render();
   }
+  if (pairingEnabled && access === 'allowed' && (json.state === 'linked' || json.state === 'subscribed') && pairingState !== 'registered') {
+    step = 2;
+    render();
+    reveal(2);
+    return;
+  }
   if (json.state === 'subscribed' && access === 'allowed') {
     done[4] = true;
     noteKey = '';
@@ -1097,8 +1134,19 @@ async function connectionGet(from) {
   checking = true;
   checkFrom = from;
   render();
+  const deadline = Date.now() + CONNECTION_MS;
   const outcome = await request('/v1/web/connection', 'GET', CONNECTION_MS, {}, undefined);
   if (gen !== checkGeneration || login !== loginGeneration) return undefined;
+  if (pairingEnabled) {
+    pairingState = null;
+    pairingMessage = '';
+    if (outcome.kind === 'response' && outcome.json?.access === 'allowed' && ['linked', 'subscribed'].includes(outcome.json.state)) {
+      const pair = await request(PAIR_PATH, 'GET', deadline - Date.now(), {}, undefined);
+      if (gen !== checkGeneration || login !== loginGeneration) return undefined;
+      const allowed = pair.kind === 'response' && pair.status === 200 ? pair.json?.allowed : undefined;
+      pairingState = allowed === true ? 'registered' : allowed === false ? 'required' : 'unavailable';
+    }
+  }
   checking = false;
   if (outcome.kind === 'stale') {
     render();
@@ -1126,6 +1174,32 @@ async function connectionGet(from) {
   return null;
 }
 
+async function registerSendingApp() {
+  if (!signedIn || !canAct(2) || busy() || inFlight() || confirming) return;
+  const input = el('sttd-pair-code');
+  const code = input.value.trim();
+  if (!PAIR_CODE.test(code)) {
+    pairingMessage = 'pairing.invalid';
+    return render();
+  }
+  input.value = '';
+  const login = loginGeneration;
+  accountBusy = true;
+  pairingMessage = 'pairing.submitting';
+  render();
+  const outcome = await request(PAIR_PATH, 'POST', CONNECTION_MS, { 'Content-Type': 'application/json' }, JSON.stringify({ code }));
+  if (login !== loginGeneration || outcome.kind === 'stale') return;
+  accountBusy = false;
+  if (outcome.kind === 'response' && outcome.status === 200 && outcome.json?.linked === true) {
+    pairingState = 'registered';
+    pairingMessage = 'pairing.success';
+  } else {
+    pairingMessage = outcome.kind === 'response' && errorCode(outcome.json) === 'invalid_pairing_code'
+      ? 'pairing.codeRejected' : 'pairing.unavailable';
+  }
+  render();
+}
+
 /** 接続許可を確認できない: 手順3以降を戻し、手順2で確認し直す。 */
 function connectionLost() {
   if (doneAfter(2)) noteKey = 'wizard.stateReset';
@@ -1146,7 +1220,7 @@ function receiveLost() {
 // ---- 解除（確認→1回POST→2以降を戻して再確認） ----
 
 function askDisconnect() {
-  if (!canAct(2) || busy() || inFlight() || !signedIn || connection === null || connection === 'unlinked') return;
+  if (!canAct(2) || busy() || inFlight() || !signedIn || connection === null) return;
   confirming = true;
   disconnectKey = '';
   render();
@@ -1336,6 +1410,10 @@ async function send(lane) {
     current.rejected = 'console.error.access_denied';
     access = 'denied';
     guideKey = 'wizard.access.denied';
+  } else if (pairingEnabled && outcome.kind === 'response' && outcome.status === 403 && errorCode(outcome.json) === 'source_rejected') {
+    pairingState = 'unavailable';
+    pairingMessage = '';
+    current.rejected = 'pairing.sendRefused';
   }
   else if (outcome.kind === 'response' && ERROR_STATUSES.includes(outcome.status)) current.rejected = 'console.error.' + outcome.status;
   render();
@@ -1590,6 +1668,7 @@ function start() {
   // 別アカウントは保存済みと同じ方式で開く（Apple⇔Googleの切替は各ログインボタン）。
   el('sttd-switch').onclick = () => login(true, normalProvider(sdk?.auth?.currentUser) || 'apple.com');
   el('sttd-refresh').onclick = () => checkConnection();
+  if (pairingEnabled) el('sttd-pair-submit').onclick = () => registerSendingApp();
   el('sttd-disconnect').onclick = () => askDisconnect();
   el('sttd-disconnect-yes').onclick = () => disconnect();
   el('sttd-disconnect-no').onclick = () => keepConnection();

@@ -38,6 +38,7 @@ import {
   type KmsSubscriptionRegistrationConnect,
   type KmsSubscriptionRegistrationStore,
 } from '../storage/firestore/kms-subscription-registration-store.js';
+import { REVIEWER_FIRST_WINDOW_MAX_MS, type DestinationClaim, type ReviewerDestinationPolicy } from '../storage/firestore/kms-subscription-registration-rules.js';
 import { EVENT_NAME, type CallbackEndpointReason } from './contract.js';
 import { isValidSecret, signBody } from './signing.js';
 import {
@@ -116,7 +117,18 @@ export interface KmsSubscriptionRuntimeOptions {
   readonly clock: Clock;
   /** 既存のcallback検証の送出境界（借用）。 */
   readonly verificationSender: VerificationSender;
+  /**
+   * 任意（省略は'off'）。審査・テスト専用ownerの受信先規則。exactは完全一致URLの一覧、firstは初回固定（設定オリジンの完全一致と
+   * 絶対時間枠[startsAt, endsAt)、最大15分）。他のownerの購読には影響しない。
+   */
+  readonly reviewerDestinations?: KmsReviewerDestinations | undefined;
 }
+
+export type KmsReviewerDestinations =
+  | { readonly kind: 'off' }
+  | { readonly kind: 'standard' }
+  | { readonly kind: 'exact'; readonly destinations: readonly string[] }
+  | { readonly kind: 'first'; readonly origin: string; readonly startsAt: number; readonly endsAt: number };
 
 export interface KmsSubscriptionRuntime {
   /** RequestScopedSubscriptionPortと同じ形（凍結）。 */
@@ -294,8 +306,70 @@ interface RequestScope {
  * KMS購読の登録runtimeを組み立てる（同期・I/Oなし）。全ての検査・捕捉はここで1回だけ行い、以後は入力objectを読み直さない。
  * 不正はKmsSubscriptionRuntimeConfigError。戻り値は凍結した{service, dispose}。markerは既存の正しいものが前提で、ここでは作らない。
  */
+/** 審査ownerの受信先規則の捕捉: storeへ渡すURLを持たないpolicyと、URLから受信先分類を決める同期の関数（不正は設定error）。 */
+function captureReviewerDestinations(value: unknown): { readonly policy: ReviewerDestinationPolicy; readonly claimOf: (url: string) => DestinationClaim } {
+  const unlisted = (): DestinationClaim => 'unlisted';
+  if (value === undefined) return Object.freeze({ policy: Object.freeze({ kind: 'off' as const }), claimOf: unlisted });
+  if (!isObject(value) || Array.isArray(value)) return configFail();
+  const kindDescriptor = Object.getOwnPropertyDescriptor(value, 'kind');
+  const kind: unknown = kindDescriptor !== undefined && 'value' in kindDescriptor ? kindDescriptor.value : undefined;
+  if (kind === 'off' || kind === 'standard') {
+    dataFields(value, ['kind'], [], () => new KmsSubscriptionRuntimeConfigError());
+    return Object.freeze({ policy: Object.freeze({ kind }), claimOf: unlisted });
+  }
+  if (kind === 'exact') {
+    const fields = dataFields(value, ['kind', 'destinations'], [], () => new KmsSubscriptionRuntimeConfigError());
+    const listed = new Set<string>();
+    for (const entry of arrayCopy(fields.get('destinations'))) {
+      if (typeof entry !== 'string' || !isCanonicalHttpsUrl(entry) || listed.has(entry)) configFail();
+      listed.add(entry);
+    }
+    if (listed.size < 1 || listed.size > 8) configFail();
+    return Object.freeze({ policy: Object.freeze({ kind: 'exact' as const }), claimOf: (url: string): DestinationClaim => (listed.has(url) ? 'listed' : 'unlisted') });
+  }
+  if (kind !== 'first') return configFail();
+  const fields = dataFields(value, ['kind', 'origin', 'startsAt', 'endsAt'], [], () => new KmsSubscriptionRuntimeConfigError());
+  const origin = fields.get('origin');
+  const startsAt = fields.get('startsAt');
+  const endsAt = fields.get('endsAt');
+  if (typeof origin !== 'string' || !isCanonicalHttpsOrigin(origin)) configFail();
+  if (typeof startsAt !== 'number' || typeof endsAt !== 'number' || !Number.isSafeInteger(startsAt) || !Number.isSafeInteger(endsAt)) configFail();
+  if (!(startsAt >= 0 && startsAt < endsAt && endsAt - startsAt <= REVIEWER_FIRST_WINDOW_MAX_MS)) configFail();
+  const claimOf = (url: string): DestinationClaim => {
+    try {
+      const parsed = new URL(url);
+      // 設定オリジン（scheme・host・portの正規形）との完全一致だけ。userinfo・fragmentを含むURLは対象外。
+      return parsed.origin === origin && parsed.username === '' && parsed.password === '' && parsed.hash === '' ? 'listed' : 'unlisted';
+    } catch {
+      return 'unlisted';
+    }
+  };
+  return Object.freeze({ policy: Object.freeze({ kind: 'first' as const, startsAt, endsAt }), claimOf });
+}
+
+/** 正規形のhttps URL（userinfo・fragment・明示portなし、WHATWG URLで同じ文字列へ戻る）。 */
+function isCanonicalHttpsUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.href === value && url.username === '' && url.password === '' && url.hash === '' && url.port === '' && url.hostname !== '';
+  } catch {
+    return false;
+  }
+}
+
+/** 正規形のhttpsオリジン（`https://<host>`、path・query・port・末尾slashなし）。 */
+function isCanonicalHttpsOrigin(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.origin === value && url.port === '' && url.hostname !== '' && !value.endsWith('/');
+  } catch {
+    return false;
+  }
+}
+
 export function createKmsSubscriptionRegistrationRuntime(options: KmsSubscriptionRuntimeOptions): KmsSubscriptionRuntime {
-  const fields = dataFields(options, OPTION_KEYS, [], () => new KmsSubscriptionRuntimeConfigError());
+  const fields = dataFields(options, OPTION_KEYS, ['reviewerDestinations'], () => new KmsSubscriptionRuntimeConfigError());
+  const reviewer = captureReviewerDestinations(fields.get('reviewerDestinations'));
 
   // dbは借用。SDKのmethodの存在だけをdescriptorで確かめる（呼ばない・接続しない）。
   const db = fields.get('db');
@@ -400,6 +474,7 @@ export function createKmsSubscriptionRegistrationRuntime(options: KmsSubscriptio
       resource: fields.get('resource') as string,
       kms: kmsConfig(),
       clock,
+      reviewerDestinations: reviewer.policy,
     });
     codec = createKmsSealingCodec({ ...kmsConfig(), clock });
   } catch {
@@ -569,6 +644,9 @@ export function createKmsSubscriptionRegistrationRuntime(options: KmsSubscriptio
           return subscribeError({ kind: 'grant_inactive' });
         case 'conflict':
           return subscribeError({ kind: 'conflict' });
+        // 審査ownerの受信先規則の不成立（外部通信・pending保存・固定の前）は、既存の固定invalid_requestで返す。
+        case 'destination_refused':
+          return subscribeError({ kind: 'invalid_request' });
         case 'timed_out':
           return runtimeError('timed_out');
         case 'aborted':
@@ -763,7 +841,7 @@ export function createKmsSubscriptionRegistrationRuntime(options: KmsSubscriptio
       const secretHash = hashOf(SECRET_PURPOSE, input.secret);
       live(scope);
 
-      const prepared = await bounded(scope, storePrepare(auth, { id, secretHash, ttlMs: input.ttlMs }, scope.operation));
+      const prepared = await bounded(scope, storePrepare(auth, { id, secretHash, ttlMs: input.ttlMs }, scope.operation, reviewer.claimOf(input.url)));
       live(scope);
       if (prepared.kind === 'extended') {
         const refreshBefore = refreshOf(prepared.expiresAt);
@@ -803,7 +881,7 @@ export function createKmsSubscriptionRegistrationRuntime(options: KmsSubscriptio
       // 同じid式で、要求Grant付きのcancelを1回。同ownerの別Grantによる取消を禁止しない。
       const id = subscriptionId(auth.ownerId, identity.name, identity.url);
       live(scope);
-      await bounded(scope, storeCancel(auth, { id }, scope.operation));
+      await bounded(scope, storeCancel(auth, { id }, scope.operation, reviewer.claimOf(identity.url)));
       live(scope);
     } catch (error) {
       throw normalize(scope, error);

@@ -83,9 +83,48 @@ test('登録開発者環境: 送信と接続承認だけを固定上流向けに
   }
 });
 
+test('connected apps mode: only the fixed pairing endpoint is signed for the registered console', async (t) => {
+  const key = keyFile();
+  const { console, calls, request } = await start({ ...baseConfig, connectedApps: true, source: { sourceId: SOURCE, keyFile: key.path } });
+  t.after(async () => {
+    await console.close();
+    rmSync(key.dir, { recursive: true, force: true });
+  });
+  for (const [lang, label] of [['ja', 'アプリ登録コード'], ['en', 'App registration code']]) {
+    const page = await (await globalThis.fetch(`${console.origin}/console?lang=${lang}`)).text();
+    assert.ok(page.indexOf('id="sttd-panel-2"') < page.indexOf('id="sttd-app-pairing"'));
+    assert.ok(page.indexOf('id="sttd-app-pairing"') < page.indexOf('id="sttd-panel-3"'));
+    assert.ok(page.includes(label));
+    assert.doesNotMatch(page, /id="sttd-source-ref"|\/console\/source\.js/);
+  }
+  const path = '/v1/source/pair';
+  const post = (body, headers = {}) => request(path, { method: 'POST', body, headers: { 'Content-Type': 'application/json', ...headers } });
+  assert.equal((await request('/v1/source/approvals/legacy-reference')).status, 404);
+  assert.equal((await request('/console/source.js')).status, 404);
+  assert.equal((await request(path + '?unexpected=1')).status, 400);
+  assert.equal((await request(path, { method: 'DELETE' })).status, 405);
+  const body = '{"code":"aB_23456-Cd7"}';
+  assert.equal((await post('{"code":"short"}')).status, 400);
+  assert.equal((await post('{"code":"aB_23456-Cd7","other":"x"}')).status, 400);
+  assert.equal((await post(body, { 'X-Sttd-Local-Nonce': 'stale' })).status, 403);
+  assert.equal((await post(body, { Origin: 'https://unrelated.example' })).status, 403);
+  assert.equal(calls.length, 0);
+
+  assert.equal((await request(path)).status, 200);
+  assert.equal((await post(body)).status, 200);
+  assert.equal(calls.length, 2);
+  for (const [index, signedBody] of ['', body].entries()) {
+    assert.equal(calls[index].url, MCP + path);
+    verifyCall(calls[index], key.publicKey, MCP, path, signedBody, undefined);
+  }
+  assert.equal(Buffer.from(calls[1].body).every((byte) => byte === 0), true);
+});
+
 test('通常console（登録環境なし）: 承認route・scriptは404、送信は従来どおり署名しない', async () => {
+  await assert.rejects(start({ ...baseConfig, connectedApps: true }));
   const { console, calls, request } = await start(baseConfig);
   try {
+    assert.equal((await request('/v1/source/pair')).status, 404);
     assert.equal((await request('/v1/source/approvals/interaction-ref-1')).status, 404);
     assert.equal((await globalThis.fetch(`${console.origin}/console/source.js`)).status, 404);
     const id = randomUUID();

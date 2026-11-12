@@ -1,3 +1,4 @@
+import { randomBytes, randomUUID } from 'node:crypto';
 // MCP/OAuthのKMS接続server。startDevelopmentKmsConnectServerが、接続状態/解除API（/v1/web/connection・/v1/web/disconnect。ローカル送信画面の
 // helperがBearer tokenつきで中継する）・OAuth provider interaction（login/consent/denyと固定script /interaction/app.js）・MCP（/mcp）・
 // protected resource metadata・OAuth/.well-knownを配信する（送信画面/consoleと旧接続画面/connectは配信せず、未知pathと同じ404）。要求ごとのcontext・
@@ -25,7 +26,9 @@ import type { Adapter, AdapterFactory, JWKS } from 'oidc-provider';
 import { z } from 'zod';
 
 import { ApiError, apiErrors } from '../errors.js';
-import { createKmsSubscriptionRegistrationRuntime, type KmsSubscriptionRuntime } from '../events/kms-subscription-runtime.js';
+import { createMcpSendText, type McpSendTextOptions } from '../delivery/mcp-send-text.js';
+import { isKmsDeliveryNamespace } from '../delivery/kms-store.js';
+import { createKmsSubscriptionRegistrationRuntime, type KmsReviewerDestinations, type KmsSubscriptionRuntime } from '../events/kms-subscription-runtime.js';
 import {
   createKmsConnectionSubscriptionView,
   KmsConnectionSubscriptionViewError,
@@ -36,6 +39,7 @@ import { assertNoBody, readForm, readJson } from '../http/body.js';
 import type { LogSink } from '../http/log.js';
 import { IdentityError, type IdentityVerifier, type VerifiedIdentity } from '../identity/firebase.js';
 import {
+  consoleToken,
   createCodeIdentityLookup,
   createDeveloperCodeExchange,
   developerCodeEntry,
@@ -67,19 +71,27 @@ import { createHmacHasher, OPAQUE_VALUE_PATTERN } from '../secrets.js';
 import { createKmsSubscriptionPolicy, requireKmsMarker, type KmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
 import { AUTH_STORAGE_ROOT, KMS_SUBSCRIPTION_CONFIG_DOC } from '../storage/firestore/kms-subscription-format.js';
 import { createAppCheckVerifier, type AppCheckAdminLike } from '../source/app-check.js';
-import { parseSourceAuthorization, type StrictSourcePolicy } from '../source/contract.js';
+import { ED25519_PUBLIC_KEY, parseSourceAuthorization, SOURCE_ID, type StrictSourcePolicy } from '../source/contract.js';
+import { APP_PAIR_CODE, PAIR_APP_PATH } from '../source/connected-apps.js';
 import { SourceStore } from '../source/firestore.js';
-import { APPROVE_BODY, createSourceGate, readApprovalBody, type SourceGate } from '../source/http.js';
+import { APPROVE_BODY, createPlaygroundEndpoint, createSourceGate, PLAYGROUND_BODY_MAX_BYTES, readApprovalBody, type SourceGate } from '../source/http.js';
 import { sourceApprovalId } from '../source/proof.js';
+import { issueReviewerApproval, type ReviewerApprovalSigner } from '../source/reviewer-approval.js';
 import type { SourceConsentView } from './pages.js';
 import { AccessUnavailableError, ConnectStorage, isConnectNamespace, type SourceApprovalRequest } from './firestore.js';
 import { isLanguage, LANGUAGE_QUERY, languageCookie, selectLanguage, type Language } from './i18n.js';
 import { admitBackendRequest } from '../gateway/backend.js';
 import { createConnectKmsSealingPort } from './kms-port.js';
 import {
+  DISCONNECT_PAGE_PATH,
+  DISCONNECT_SCRIPT,
+  DISCONNECT_SCRIPT_PATH,
   INTERACTION_SCRIPT,
   INTERACTION_SCRIPT_PATH,
+  REVIEWER_DISCONNECT_API_PATH,
+  REVIEWER_DISCONNECT_PAGE_PATH,
   pageSecurityHeaders,
+  renderDisconnect,
   renderInteractionAccessDenied,
   renderInteractionConsent,
   renderInteractionLogin,
@@ -136,7 +148,19 @@ export async function auditedRevoke(model: string, revoke: () => Promise<void>, 
 }
 
 const REQUIRED = ['bindPort', 'db', 'namespace', 'kms', 'secrets', 'identity', 'web', 'clientEgress', 'verificationSender', 'clock', 'publicOrigin'] as const;
-const OPTIONAL = ['log', 'startupOperation', 'developerCode', 'sourceAuthorization', 'transportAuthority'] as const;
+const OPTIONAL = ['log', 'startupOperation', 'developerCode', 'sourceAuthorization', 'transportAuthority', 'playground', 'openaiAppsChallenge', 'reviewer', 'sendText', 'connectedApps'] as const;
+const REVIEWER_KEYS = ['destinations', 'firstDestination', 'approval'] as const;
+const SOURCE_ID_PATTERN = /^src_[a-z2-7]{26}$/;
+const REVIEWER_DESTINATIONS_MAX = 8;
+/** 初回固定の絶対時間枠の上限（15分）。 */
+const REVIEWER_FIRST_WINDOW_MS = 15 * 60 * 1000;
+
+/** OpenAIのアプリ公開のドメイン確認を返す完全一致path（GETだけ。値は配置の入口が環境から1回だけ読んで渡す）。 */
+export const OPENAI_APPS_CHALLENGE_PATH = '/.well-known/openai-apps-challenge';
+/** ドメイン確認値の形（URL-safeなASCIIの非予約文字だけ、1〜256文字）。値そのものはlog・errorへ出さない。 */
+export function isOpenAiAppsChallenge(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9._~-]{1,256}$/.test(value);
+}
 const DEVELOPER_CODE_KEYS = ['auth', 'databaseId'] as const;
 const DEVELOPER_CODE_OPTIONAL = ['store', 'bindLookup'] as const;
 
@@ -243,7 +267,36 @@ export interface KmsConnectServerOptions {
    * 作成とcustom token署名だけ。未指定ならコード入力は404で、customのID tokenも受けない（verifier側）。
    */
   readonly developerCode?: KmsConnectDeveloperCode | undefined;
+  /** 任意。OpenAIのアプリ公開のドメイン確認値（URL-safe ASCII・1〜256文字）。指定時だけ完全一致pathのGETで返す。省略は従来404。 */
+  readonly openaiAppsChallenge?: string | undefined;
+  /**
+   * 任意（既定off）。審査・テスト専用のメール・パスワードログイン。指定時だけ、OAuth interactionの画面に審査用の入口を出し、
+   * `/interaction/:uid/reviewer`でidentity.verifyReviewerIdToken（事前登録UID・password）を検証する。identityがその口を持たなければ
+   * 設定エラー。審査ログインが有効なら標準の購読規則を使う。無効時は審査ownerの購読・解除を拒否する。
+   */
+  readonly reviewer?: KmsConnectReviewer | undefined;
+  readonly connectedApps?: true | undefined;
+  readonly sendText?: McpSendTextOptions | undefined;
 }
+
+/**
+ * destinationsとfirstDestinationは従来の制限を使う配置でだけ指定する。approvalは許可元strictの配置だけで必須: 審査用sourceの
+ * 専用署名port。同意の明示操作の後だけサーバーが署名し、既存のsource gate・承認記録・Grantでの単回消費に結ぶ。
+ */
+export type KmsConnectReviewer = (
+  | { readonly destinations?: never; readonly firstDestination?: never }
+  | {
+      /** 審査ownerが購読に使えるサンプル受信先のcallback URL（https・正規形・1〜8件）。 */
+      readonly destinations: readonly string[];
+    }
+  | {
+      /**
+       * 初回固定: 設定オリジン（正規形のhttps）と完全一致するURLを、絶対時間枠[startsAt, endsAt)（epoch ms、最大15分）の間だけ初回の
+       * 受信先として確認し、challengeが成功した1件をそのownerの既知の受信先（knownDestinationId）に固定する。以後は同じ受信先だけ。
+       */
+      readonly firstDestination: { readonly origin: string; readonly startsAt: number; readonly endsAt: number };
+    }
+) & { readonly approval?: ReviewerApprovalSigner | undefined };
 
 export interface KmsConnectDeveloperCode {
   /** 専用UIDの作成とcustom token署名だけ。 */
@@ -260,6 +313,9 @@ export interface KmsConnectDeveloperCode {
  * 開発者向けコードの保存層（機能offはnull）。注入があればそれを使い、無ければidentifierKeyから導いた鍵・借用Firestore・接続保存の
  * namespaceで作り、code identity照合を共通verifierへ結ぶ（この起動のclosureだけが持つ）。
  */
+/** この配置が自分で作った保存層（注入の低level storeではない）。プレイグラウンドのコード発行/claimはこれだけを使う。 */
+const builtLoginStores = new WeakMap<object, true>();
+
 function buildDeveloperCodeStore(
   developerCode: CapturedDeveloperCode | null,
   identifierKey: Buffer,
@@ -280,6 +336,7 @@ function buildDeveloperCodeStore(
     random: defaultRandom,
   });
   developerCode.bindLookup?.(createCodeIdentityLookup(store));
+  builtLoginStores.set(store, true);
   return store;
 }
 
@@ -392,8 +449,77 @@ interface Captured {
   readonly startupParent: KmsConnectStartupOperation | null;
   /** 開発者向けコード（機能offはnull）。 */
   readonly developerCode: CapturedDeveloperCode | null;
+  /** プレイグラウンド専用の限定endpoint（明示設定だけ。固定のBFF source IDと公開鍵）。 */
+  readonly playground: { readonly sourceId: string; readonly publicKey: string } | null;
+  /** OpenAIのアプリ公開のドメイン確認値（明示した時だけ。無ければ従来どおり404）。 */
+  readonly openaiAppsChallenge: string | null;
   /** 許可元strict（既存互換はnull）。 */
   readonly sourceAuthorization: CapturedSources | null;
+  /** 審査・テスト専用ログイン（機能offはnull）。 */
+  readonly reviewer: CapturedReviewer | null;
+  readonly sendText: McpSendTextOptions | null;
+  readonly connectedApps: boolean;
+}
+
+interface CapturedReviewer {
+  readonly verify: (idToken: string) => Promise<VerifiedIdentity>;
+  /** 購読runtimeへ渡す審査ownerの受信先規則。 */
+  readonly destinations: KmsReviewerDestinations;
+  /** strictだけ: 審査承認の専用署名port（compatibleはnull）。 */
+  readonly approval: ReviewerApprovalSigner | null;
+}
+
+/** 審査ログインと、明示された場合だけ従来の受信先制限を捕捉する。 */
+function captureReviewer(value: unknown, identityTarget: unknown, requireApproval: boolean): CapturedReviewer {
+  const parts = dataFields(value, [], REVIEWER_KEYS, () => new KmsConnectServerConfigError());
+  if (parts.has('destinations') && parts.has('firstDestination')) configFail();
+  // 旧strictだけが専用署名portを使う。
+  if (parts.has('approval') !== requireApproval) configFail();
+  let approval: ReviewerApprovalSigner | null = null;
+  if (requireApproval) {
+    const target = parts.get('approval');
+    const sourceId = isObject(target) ? ownString(target, 'sourceId') : undefined;
+    const reviewerUid = isObject(target) ? ownString(target, 'reviewerUid') : undefined;
+    if (sourceId === undefined || !SOURCE_ID_PATTERN.test(sourceId)) configFail();
+    if (reviewerUid === undefined || !/^[A-Za-z0-9]{20,128}$/.test(reviewerUid)) configFail();
+    const signFn = methodOf(target, 'sign');
+    approval = Object.freeze({ sourceId, reviewerUid, sign: (input: Buffer) => signFn(input) as Promise<Uint8Array> | Uint8Array });
+  }
+  let destinations: KmsReviewerDestinations;
+  if (parts.has('destinations')) {
+    const listed = arrayItems(parts.get('destinations'), () => new KmsConnectServerConfigError());
+    if (listed.length < 1 || listed.length > REVIEWER_DESTINATIONS_MAX) configFail();
+    const seen = new Set<string>();
+    for (const entry of listed) {
+      let url: URL;
+      try {
+        url = new URL(String(entry));
+      } catch {
+        return configFail();
+      }
+      if (typeof entry !== 'string' || url.protocol !== 'https:' || url.href !== entry || url.username !== '' || url.password !== '' || url.hash !== '' || seen.has(entry)) configFail();
+      seen.add(entry);
+    }
+    destinations = Object.freeze({ kind: 'exact', destinations: Object.freeze([...seen]) });
+  } else if (parts.has('firstDestination')) {
+    const first = dataFields(parts.get('firstDestination'), ['origin', 'startsAt', 'endsAt'], [], () => new KmsConnectServerConfigError());
+    const origin = first.get('origin');
+    const startsAt = first.get('startsAt');
+    const endsAt = first.get('endsAt');
+    let parsed: URL;
+    try {
+      parsed = new URL(String(origin));
+    } catch {
+      return configFail();
+    }
+    if (typeof origin !== 'string' || parsed.protocol !== 'https:' || parsed.origin !== origin || parsed.port !== '') configFail();
+    if (!isEpochMs(startsAt) || !isEpochMs(endsAt) || !(startsAt < endsAt && endsAt - startsAt <= REVIEWER_FIRST_WINDOW_MS)) configFail();
+    destinations = Object.freeze({ kind: 'first', origin, startsAt, endsAt });
+  } else {
+    destinations = Object.freeze({ kind: 'standard' });
+  }
+  const verify = methodOf(identityTarget, 'verifyReviewerIdToken');
+  return Object.freeze({ verify: (idToken: string) => verify(idToken) as Promise<VerifiedIdentity>, destinations, approval });
 }
 
 /** 許可元strictの捕捉（配置設定の明示policy・同じ配置のproject number・App Check方式だけのAdmin AppCheck）。 */
@@ -542,6 +668,24 @@ function capture(options: unknown): Captured {
   const sender = plainFunction(fields.get('verificationSender'));
   const verificationSender: VerificationSender = (request, signal) => sender(request, signal) as ReturnType<VerificationSender>;
 
+  const sourceAuthorization = fields.has('sourceAuthorization') ? captureSources(fields.get('sourceAuthorization')) : null;
+  // プレイグラウンドの限定endpointは、許可元strictでdeveloper-key-v1を有効にした配置で明示した時だけ（未設定は全pathが404）。
+  let playground: { readonly sourceId: string; readonly publicKey: string } | null = null;
+  if (fields.has('playground')) {
+    const parts = dataFields(fields.get('playground'), ['sourceId', 'publicKey'], [], () => new KmsConnectServerConfigError());
+    const sourceId = parts.get('sourceId');
+    const publicKey = parts.get('publicKey');
+    if (typeof sourceId !== 'string' || !SOURCE_ID.test(sourceId) || typeof publicKey !== 'string' || !ED25519_PUBLIC_KEY.test(publicKey)) configFail();
+    if (sourceAuthorization === null || !sourceAuthorization.policy.methods.includes('developer-key-v1')) configFail();
+    playground = Object.freeze({ sourceId, publicKey });
+  }
+  // OpenAIのアプリ公開のドメイン確認値（任意）。明示した値は形を検査し、不正は設定error（値は出さない）。
+  let openaiAppsChallenge: string | null = null;
+  if (fields.has('openaiAppsChallenge')) {
+    const value = fields.get('openaiAppsChallenge');
+    if (!isOpenAiAppsChallenge(value)) configFail();
+    openaiAppsChallenge = value;
+  }
   const now = methodOf(fields.get('clock'), 'now');
   const logFn = fields.has('log') ? plainFunction(fields.get('log')) : undefined;
   const log = (entry: Parameters<LogSink>[0]): void => {
@@ -552,6 +696,23 @@ function capture(options: unknown): Captured {
       // 記録の失敗で要求の扱いを変えない。
     }
   };
+
+  const connectedApps = fields.has('connectedApps');
+  if (connectedApps && (fields.get('connectedApps') !== true || sourceAuthorization === null || transportAuthority !== undefined)) configFail();
+  let sendText: McpSendTextOptions | null = null;
+  if (fields.has('sendText')) {
+    if (transportAuthority !== undefined || sourceAuthorization === null) configFail();
+    const parts = dataFields(fields.get('sendText'), ['namespace', 'egress', 'loadDigestKey'], [], () => new KmsConnectServerConfigError());
+    const deliveryNamespace = parts.get('namespace');
+    if (!isKmsDeliveryNamespace(deliveryNamespace)) configFail();
+    const loadDigestKey = methodOf(fields.get('sendText'), 'loadDigestKey');
+    const post = methodOf(parts.get('egress'), 'postCommandCallback');
+    sendText = Object.freeze({
+      namespace: deliveryNamespace,
+      egress: Object.freeze({ postCommandCallback: (...args: Parameters<McpSendTextOptions['egress']['postCommandCallback']>) => post(...args) as ReturnType<McpSendTextOptions['egress']['postCommandCallback']> }),
+      loadDigestKey: (operation: McpRequestOperation) => loadDigestKey(operation) as Promise<Buffer>,
+    });
+  }
 
   return Object.freeze({
     publicOrigin,
@@ -570,7 +731,17 @@ function capture(options: unknown): Captured {
     log,
     startupParent,
     developerCode,
-    sourceAuthorization: fields.has('sourceAuthorization') ? captureSources(fields.get('sourceAuthorization')) : null,
+    sourceAuthorization,
+    playground,
+    openaiAppsChallenge,
+    sendText,
+    connectedApps,
+    // 審査ログインはdirect配置だけ。旧strictでは審査承認の専用署名portが必須。
+    reviewer: fields.has('reviewer')
+      ? transportAuthority !== undefined
+        ? configFail()
+        : captureReviewer(fields.get('reviewer'), identityTarget, sourceAuthorization !== null && !connectedApps)
+      : null,
   });
 }
 
@@ -711,6 +882,7 @@ interface Owned {
   mcp: McpEntry | undefined;
   server: Server | undefined;
   keys: OwnedKeys | undefined;
+  sendText: Awaited<ReturnType<typeof createMcpSendText>> | undefined;
 }
 
 /** 片付け: context・runtime・viewの中止（同期）→MCP入口のclose→serverのclose。上限つき。失敗はfalse（例外は運ばない）。 */
@@ -718,6 +890,7 @@ async function shutdown(owned: Owned, budgetMs: number): Promise<boolean> {
   owned.context?.dispose();
   owned.runtime?.dispose();
   owned.view?.dispose();
+  owned.sendText?.dispose();
   const steps: Promise<unknown>[] = [];
   if (owned.mcp !== undefined) steps.push(invoke(() => owned.mcp!.close()));
   const server = owned.server;
@@ -792,7 +965,7 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
     transport: config.transport,
   });
 
-  const owned: Owned = { context: undefined, runtime: undefined, view: undefined, mcp: undefined, server: undefined, keys: undefined };
+  const owned: Owned = { context: undefined, runtime: undefined, view: undefined, mcp: undefined, server: undefined, keys: undefined, sendText: undefined };
   const startController = new AbortController();
   let watchdog: ReturnType<typeof setTimeout> | undefined;
   // 任意の起動親。親の中断を専有startControllerへ結ぶ（callerのsignalはabortしない）。finallyで必ず解除する。
@@ -864,6 +1037,7 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         // providerの接続profileが次のrefresh tokenへ与える無活動窓と同じ値。
         grantInactivityMs: PRODUCT_POLICY.refreshFamilyMaxSec * 1000,
         // 受信先設定（購読保存の既存marker確認済みnamespace）。同意画面での削除の確認と、確認後の1つのtransactionだけに使う。
+        connectedApps: config.connectedApps,
         receiverSubscriptions: {
           refFor: (ownerId: string) => db.collection(AUTH_STORAGE_ROOT).doc(policy.namespace).collection('subscriptions').doc(ownerId),
           policy,
@@ -880,6 +1054,35 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
     const sourceConfig = config.sourceAuthorization;
     const sourceStore = sourceConfig === null ? null : new SourceStore({ db, namespace, clock });
     if (sourceStore !== null) storage.useSources(sourceStore);
+    // プレイグラウンドの限定endpoint（明示設定だけ）。登録は同じsource保存、コードは同じ配置のDeveloperLoginStoreとcustom token発行。
+    const openaiAppsChallenge = config.openaiAppsChallenge;
+    const playgroundConfig = config.playground;
+    const loginStore = developerCodeStore !== null && builtLoginStores.has(developerCodeStore) ? (developerCodeStore as unknown as DeveloperLoginStore) : null;
+    const codeAuth = config.developerCode?.auth ?? null;
+    const playgroundEndpoint =
+      playgroundConfig === null || sourceStore === null
+        ? null
+        : createPlaygroundEndpoint({
+            store: sourceStore,
+            hasher,
+            namespace,
+            audience: issuerUrl.origin,
+            clock,
+            registrar: playgroundConfig,
+            verifyIdentity: (idToken: string) => identity.verifyIdToken(idToken),
+            code:
+              loginStore === null || codeAuth === null
+                ? null
+                : {
+                    issue: async (input) => {
+                      const issued = await loginStore.issue(input);
+                      return { code: issued.code, operationId: issued.operationId, issuedAt: issued.issuedAt, authExpiresAt: issued.authExpiresAt };
+                    },
+                    token: (input) => consoleToken(loginStore, codeAuth, input, clock),
+                  },
+            // 管理module（source/admin）をruntimeへ入れず、同じ形（src_＋base32 26文字・base64url 22文字）の新しいID/世代を作る。
+            newIds: () => ({ fresh: { sourceId: 'src_' + Array.from(randomBytes(26), (byte) => 'abcdefghijklmnopqrstuvwxyz234567'[byte % 32]).join(''), generation: randomBytes(16).toString('base64url') }, accessGeneration: randomUUID() }),
+          });
     const sourceGate: SourceGate | null =
       sourceConfig === null || sourceStore === null
         ? null
@@ -896,6 +1099,7 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
                 : createAppCheckVerifier({ appCheck: sourceConfig.appCheck, projectNumber: sourceConfig.projectNumber, projectId: identity.projectId }),
           });
     /** 承認の位置と、元interactionのclient/resourceのHMAC（本人のHMACは同意の最終txでowner文書から読む）。 */
+    const hashPairCode = (code: string) => hasher.hash(`t256:${namespace}:app-pair-code`, code);
     const approvalRequest = (uid: string, clientId: string): SourceApprovalRequest => ({
       approvalId: sourceApprovalId(hasher, namespace, uid),
       clientHash: hasher.hash(`t256:${namespace}:source-client`, clientId),
@@ -1017,6 +1221,8 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       hasher,
       clock,
       verificationSender: config.verificationSender,
+      // 審査ownerの受信先規則（機能offは省略＝審査ownerの購読・解除を全て拒否。他のownerの購読は従来どおり）。
+      ...(config.reviewer !== null ? { reviewerDestinations: config.reviewer.destinations } : {}),
     });
     owned.runtime = runtime;
     const view = createKmsConnectionSubscriptionView({ db, connect: storage, connectNamespace: namespace, resource, kms: kmsConfig(), clock });
@@ -1038,6 +1244,8 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       if (!result.ok) throw result.error;
       return result.value;
     };
+    // 審査・テスト専用ownerの受信先規則（完全一致URL・初回固定）は購読runtimeと保存storeの分類・確定transactionが判定する
+    // （外部通信・pending保存・固定の前に固定invalid_request）。ここでは既存の購読portをそのまま包む。
     const subscriptions: RequestScopedSubscriptionPort = Object.freeze({
       subscribe: (auth: SubscriptionAuth, input: SubscribeInput, operation: McpRequestOperation) =>
         scoped(operation, (current) => service.subscribe(auth, input, current)),
@@ -1062,6 +1270,15 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         }),
     });
 
+    if (config.sendText !== null) {
+      const sendOptions = config.sendText;
+      await context.run(startOperation, async () => {
+        const sender = await createMcpSendText({ ...sendOptions, db, storage, hasher, identifierKey: owned.keys!.identifierKey, kms: kmsConfig(), clock }, context.current());
+        owned.sendText = sender;
+      });
+      startLive();
+    }
+
     const mcp = createRequestScopedMcpEntry(
       {
         issuer,
@@ -1071,6 +1288,13 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         subscriptions,
         // 通常のdirect配置だけ。gateway-v1のMCP backend（transportAuthorityあり）は対象外で、従来どおり空一覧。
         ...(config.transportAuthority === undefined ? { receivingStatus } : {}),
+        ...(config.connectedApps && sourceStore !== null ? {
+          connectedApps: {
+            manage: (auth, request, operation) => sourceStore.manageConnectedApps(request,
+              (tx) => storage.authorizeConnectedAppsIn(tx, auth.ownerId, auth.grantId, operation), hashPairCode, operation),
+          },
+        } : {}),
+        ...(owned.sendText === undefined ? {} : { sendText: owned.sendText }),
         onError: (category) => log({ event: 'mcp.error', category }),
       },
       {
@@ -1144,10 +1368,10 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       return verified;
     }
 
-    async function bearerIdentity(req: IncomingMessage): Promise<VerifiedIdentity> {
+    async function bearerIdentity(req: IncomingMessage, verify = verifyIdentity): Promise<VerifiedIdentity> {
       const match = BEARER_ID_TOKEN.exec(req.headers.authorization ?? '');
       if (!match) throw apiErrors.authenticationRequired();
-      return verifyIdentity(match[1]!);
+      return verify(match[1]!);
     }
 
     /** provider自身のinteraction cookieで元browserを確かめ、URLのuidとresource/scopeの一致も見る。 */
@@ -1189,19 +1413,19 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       const opened = await guarded(() => storage.openInteraction(uid));
       if (opened === undefined) throw apiErrors.linkUnavailable();
       const { language, headers } = pageLanguage(req, url);
-      // 同意画面では、Appleのloginならsnapshot（不透明token）を必ず埋め、受信先設定がある時だけ削除の確認を出す。読取りだけで、何も消さない。
+      // 同意画面ではsnapshotを埋め、受信先設定がある時だけ削除を案内する。
       const snapshot = opened.ownerId === null ? null : await guarded(() => storage.receiverSnapshot(uid));
       const html =
         opened.ownerId === null
-          ? renderInteractionLogin(web, uid, label, opened.csrf, language, developerExchange() !== null)
+          ? renderInteractionLogin(web, uid, label, opened.csrf, language, developerExchange() !== null, config.reviewer !== null)
           : renderInteractionConsent(
               web,
               uid,
               label,
               opened.csrf,
               language,
-              snapshot === null ? null : { token: snapshot.token, confirm: snapshot.present },
-              await sourceConsentView(uid, interaction.params.client_id, false),
+              snapshot,
+              await sourceConsentView(uid, interaction.params.client_id, false, opened.reviewer === true),
             );
       send(res, 200, 'text/html; charset=utf-8', html, { ...pageSecurityHeaders(web), ...headers });
     }
@@ -1210,8 +1434,10 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
      * strictの同意画面の許可元表示（compatibleはnull）。参照は元interaction ID（権限なし）。承認の有無は通常の画面表示/再表示の時に
      * 読取りだけで確かめる（匿名の状態API・自動pollは無い）。missingは同意が承認なしで止まった再表示。
      */
-    async function sourceConsentView(uid: string, clientId: unknown, missing: boolean): Promise<SourceConsentView | null> {
-      if (sourceStore === null) return null;
+    async function sourceConsentView(uid: string, clientId: unknown, missing: boolean, reviewer: boolean): Promise<SourceConsentView | null> {
+      if (sourceStore === null || config.connectedApps) return null;
+      // 審査用sourceの承認は同意のPOSTで作る。通常の参照番号と別画面での承認手順は表示しない。
+      if (reviewer && config.reviewer?.approval) return missing ? { state: 'reviewer_unavailable' } : null;
       const ready = await guarded(() => sourceStore.approvalPending(approvalRequest(uid, String(clientId))));
       return { reference: uid, state: ready ? 'confirmed' : missing ? 'required' : 'waiting' };
     }
@@ -1229,32 +1455,69 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         opened.csrf,
         language,
         // 承認が無いことだけで止めた再表示では、受信先設定の確認の要求（required）は出さない（何も確認・削除していない）。
-        snapshot === null ? null : { token: snapshot.token, confirm: snapshot.present, ...(sourceMissing ? {} : { required: true }) },
-        await sourceConsentView(uid, clientId, sourceMissing),
+        snapshot === null ? null : { ...snapshot, ...(sourceMissing ? {} : { required: true }) },
+        await sourceConsentView(uid, clientId, sourceMissing, opened.reviewer === true),
       );
       send(res, 409, 'text/html; charset=utf-8', html, { ...pageSecurityHeaders(web), ...headers });
     }
 
-    async function loginInteraction(req: IncomingMessage, res: ServerResponse, uid: string): Promise<void> {
+    /**
+     * 審査・テスト専用ログインの本人確認（機能offは呼ばれない）。署名・project・失効・password・事前登録UIDはverifyReviewerIdToken、
+     * 戻り値のmethodも'reviewer'であることを重ねて確かめる。失敗の扱いは通常の本人確認と同じ固定分類。
+     */
+    async function verifyReviewer(idToken: string): Promise<VerifiedIdentity> {
+      const reviewer = config.reviewer;
+      if (reviewer === null) throw apiErrors.notFound();
+      alive();
+      let verified: VerifiedIdentity;
+      try {
+        verified = await reviewer.verify(idToken);
+      } catch (error) {
+        alive();
+        const category = identityCategory(error);
+        log({ event: 'identity.rejected', category });
+        if (category === 'unavailable') throw apiErrors.temporarilyUnavailable();
+        throw new ApiError(401, 'identity_rejected');
+      }
+      alive();
+      if (verified.method !== 'reviewer' || verified.projectId !== identity.projectId) {
+        log({ event: 'identity.rejected', category: 'wrong_provider' });
+        throw new ApiError(401, 'identity_rejected');
+      }
+      return verified;
+    }
+
+    /**
+     * login（通常の入口）と審査・テスト専用の入口（reviewer）。どちらも同じOrigin・interaction cookie・CSRF・resource/scopeの束縛を通し、
+     * 通常の入口は審査専用の本人を受けず、審査の入口は審査専用の本人だけを受ける。
+     */
+    async function loginInteraction(req: IncomingMessage, res: ServerResponse, uid: string, entry: 'normal' | 'reviewer' = 'normal'): Promise<void> {
+      if (entry === 'reviewer' && config.reviewer === null) throw apiErrors.notFound();
       requireSameOrigin(req);
       const body = await guarded(() => readJson(req, loginBody));
       await browserInteraction(req, res, uid);
       // CSRFが現行でない要求では、本人確認・owner作成へ進まない。
       if (!(await guarded(() => storage.interactionAccepts(uid, body.csrf)))) throw apiErrors.linkUnavailable();
-      const verified = await verifyIdentity(body.idToken);
+      const verified = entry === 'reviewer' ? await verifyReviewer(body.idToken) : await verifyIdentity(body.idToken);
+      // 通常の入口へ審査専用の本人を通さない（通常の検証は返さないが、注入された検証器にも依存しない）。
+      if (entry === 'normal' && verified.method === 'reviewer') {
+        log({ event: 'identity.rejected', category: 'wrong_provider' });
+        throw new ApiError(401, 'identity_rejected');
+      }
       // 利用許可（運営者の明示登録）がactiveの本人だけownerを解決・作成する。未許可は専用の403 access_denied（ownerを作らない）。
       const admission = await guarded(() => storage.resolveOwner(verified));
       if (admission.kind === 'denied') throw accessDenied();
       if (admission.kind !== 'admitted') throw apiErrors.forbidden();
       const { ownerId } = admission;
       // login方法は検証済みのID tokenから決めた値だけ（開発者向けコードはserverが判定したmethod）。clientの申告は使わない。
-      // 検証済みID tokenのproviderだけで決める（clientの申告は使わない）。GoogleはApple扱いしない（受信先reset確認はAppleだけ）。
-      const loginMethod = verified.method === 'developer_code' ? 'developer_code' : verified.method === 'google' ? 'google' : 'apple';
+      // 検証済みID tokenのproviderだけで決める（clientの申告は使わない）。
+      const loginMethod =
+        entry === 'reviewer' ? 'reviewer' : verified.method === 'developer_code' ? 'developer_code' : verified.method === 'google' ? 'google' : 'apple';
       const bound = await guarded(() => storage.bindInteraction(uid, body.csrf, ownerId, verified.authTimeSec, admission.accessGeneration, loginMethod));
       if (bound === 'other_owner') throw new ApiError(409, 'owner_mismatch');
       if (bound === 'denied') throw accessDenied();
       if (bound !== 'ok') throw apiErrors.linkUnavailable();
-      log({ event: 'interaction.login' });
+      log({ event: entry === 'reviewer' ? 'interaction.reviewer_login' : 'interaction.login' });
       alive();
       res.writeHead(204, BASE_HEADERS);
       res.end();
@@ -1330,20 +1593,32 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
 
     async function consentInteraction(req: IncomingMessage, res: ServerResponse, uid: string, url: URL): Promise<void> {
       requireSameOrigin(req);
+      // 更新前のフォームに含まれるreceiverResetは互換のため受け取る。削除の判定には使わない。
       const form = await guarded(() => readForm(req, ['csrf', 'receiverReset', 'receiverToken']));
       const interaction = await browserInteraction(req, res, uid);
       // strict: 同じ本人の許可元承認がこのinteractionにまだ無ければ、interactionを消費せず同意画面を再表示する（専用の案内表示は未実装）
       // （最終の照合・単回消費・Grant bindingはputGrantMetaのtransaction）。
-      const approval = sourceStore === null ? undefined : approvalRequest(uid, String(interaction.params.client_id));
+      const approval = sourceStore === null || config.connectedApps ? undefined : approvalRequest(uid, String(interaction.params.client_id));
+      // strictの審査ログインだけ: 明示の同意（同じbrowser・CSRF・login済みの審査owner）の後に、サーバーが審査用sourceの承認を1回作る。
+      // 審査以外のinteraction・条件の不成立では何も作らない（下の通常の判定のまま）。
+      // 審査ログインのinteractionで条件が不成立（設定の審査UIDとの不一致・source・期限等）なら、既存の承認の有無に関わらず同意しない
+      // （通常の経路へ戻して過去の承認を使わせない）。
+      if (sourceStore !== null && sourceGate !== null && approval !== undefined && config.reviewer?.approval) {
+        const reviewed = await reviewerConsentApproval(uid, form.get('csrf') ?? '', String(interaction.params.client_id), approval, config.reviewer.approval, sourceGate, sourceStore);
+        if (reviewed === 'refused') {
+          log({ event: 'interaction.source_approval_required' });
+          return reshowConsent(req, res, uid, url, await clientLabel(interaction.params.client_id), interaction.params.client_id, true);
+        }
+      }
       if (sourceStore !== null && approval !== undefined && !(await guarded(() => sourceStore.approvalPending(approval)))) {
         log({ event: 'interaction.source_approval_required' });
         return reshowConsent(req, res, uid, url, await clientLabel(interaction.params.client_id), interaction.params.client_id, true);
       }
-      // 同意の消費（受信先設定の削除の確認を含む）・Grant・grantMeta・redirectは、純粋なportの手順（interaction-consent.ts）で行う。
+      // 同意の消費（既存の受信先設定の削除を含む）・Grant・grantMeta・redirectは、純粋なportの手順（interaction-consent.ts）で行う。
       // 同意は同ownerと元interactionへ単回で束縛し、grantMetaは同じtransactionで利用許可の世代と受信reset世代を再確認する。
       const result = await runConsent(
         {
-          consume: ({ csrf, token, confirm }) => guarded(() => storage.consumeInteractionChecked(uid, csrf, token, confirm)),
+          consume: ({ csrf, token }) => guarded(() => storage.consumeInteractionChecked(uid, csrf, token)),
           isOwnerActive: (ownerId) => guarded(() => storage.isOwnerActive(ownerId)),
           saveGrant: async (ownerId) => {
             const grant = new provider.Grant({ accountId: ownerId, clientId: String(interaction.params.client_id) });
@@ -1358,7 +1633,7 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
           headersSent: () => res.headersSent,
           log: (entry) => log(entry.category === undefined ? { event: entry.event } : { event: entry.event, category: entry.category }),
         },
-        { csrf: form.get('csrf') ?? '', token: form.get('receiverToken') ?? '', confirm: form.get('receiverReset') === '1' },
+        { csrf: form.get('csrf') ?? '', token: form.get('receiverToken') ?? '' },
       );
       switch (result.kind) {
         case 'finished':
@@ -1373,6 +1648,81 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         case 'receiver_reset':
           return sendReceiverResetOutcome(req, res, uid, url, result.outcome);
       }
+    }
+
+    /**
+     * 審査承認（strict）。順序: 読取りだけの前提確認（審査login・CSRF・期限・審査owner・利用許可の世代）→ 既存承認の有無 →
+     * 保存済みownerから審査UIDを開封 → 専用portで署名 → 既存gateで検証（登録公開鍵・source状態/世代・connect操作・本人束縛・時刻・nonce単回）
+     * → 既存の承認記録。署名・検証のどこかが不成立なら承認を作らず、審査用の接続失敗として再表示する（Grantを作らない）。
+     */
+    async function reviewerConsentApproval(
+      uid: string,
+      csrf: string,
+      clientId: string,
+      request: SourceApprovalRequest,
+      signer: ReviewerApprovalSigner,
+      gate: SourceGate,
+      sources: SourceStore,
+    ): Promise<'not_reviewer' | 'refused' | 'approved'> {
+      const target = await guarded(() => storage.reviewerApprovalTarget(uid, csrf));
+      if (target === null) return 'not_reviewer';
+      if (target === undefined) return 'refused';
+      // 保存済みownerのUIDが、現在の設定の唯一の審査UIDと完全一致する時だけ（設定変更前の審査interactionを引き継いで署名・同意しない）。
+      const reviewerUid = await guarded(() => storage.uidOf(target.ownerId));
+      if (typeof reviewerUid !== 'string' || reviewerUid !== signer.reviewerUid) {
+        log({ event: 'reviewer.approval_rejected', category: 'uid' });
+        return 'refused';
+      }
+      // 専用sourceの操作範囲を署名前に確認する。sendを含められるのは送信ツールを有効にした配置だけ。
+      let status: Awaited<ReturnType<SourceStore['status']>>;
+      try {
+        status = await guarded(() => sources.status(signer.sourceId));
+      } catch (error) {
+        if (error instanceof RequestAuthContextError) throw error;
+        throw apiErrors.temporarilyUnavailable();
+      }
+      const record = status.record;
+      const operations = record?.operations ?? [];
+      const permitted = operations.includes('connect') && (operations.length === 1 || (config.sendText !== null && operations.length === 2 && operations.includes('send')));
+      if (record === null || record.kind !== 'developer' || record.state !== 'active' || !permitted) {
+        log({ event: 'reviewer.approval_rejected', category: 'source_scope' });
+        return 'refused';
+      }
+      // この同意で既に記録した承認（同じinteraction・同じ本人・client・resource）は、上の現在の条件を確かめた後だけ使う。
+      if (await guarded(() => sources.approvalPending(request))) return 'approved';
+      let issued: Awaited<ReturnType<typeof issueReviewerApproval>>;
+      try {
+        issued = await guarded(() => issueReviewerApproval(signer, { audience: issuerUrl.origin, interactionId: uid, reviewerUid, clientId, resource }, clock.now()));
+      } catch (error) {
+        if (error instanceof RequestAuthContextError) throw error;
+        log({ event: 'reviewer.approval_unavailable' });
+        throw apiErrors.temporarilyUnavailable();
+      }
+      // 本人は検証済みで保存した値（審査ログイン時のauth_time）だけで組む（擬似値は使わない）。
+      const reviewerIdentity: VerifiedIdentity = Object.freeze({ projectId: identity.projectId, uid: reviewerUid, authTimeSec: target.authTimeSec, method: 'reviewer' as const });
+      const signed = issued.request;
+      const decision = await guarded(() =>
+        gate.authorize(issued.proof, { identity: reviewerIdentity, operation: 'connect', method: signed.method, path: signed.path, search: signed.search, body: signed.body, bearer: signed.bearer, idempotencyKey: signed.idempotencyKey }),
+      );
+      if (decision.kind === 'unavailable') throw apiErrors.temporarilyUnavailable();
+      if (decision.kind === 'denied' || decision.sourceId !== signer.sourceId || decision.generation !== record.generation) {
+        log({ event: 'reviewer.approval_rejected', category: decision.kind === 'denied' ? decision.reason : 'generation' });
+        return 'refused';
+      }
+      const outcome = await guarded(() =>
+        sources.recordApproval(
+          { approvalId: request.approvalId, identityHash: connectIdentityHash(hasher, namespace, reviewerIdentity), clientHash: request.clientHash, resourceHash: request.resourceHash },
+          { sourceId: decision.sourceId, generation: decision.generation },
+          target.expiresAt,
+        ),
+      );
+      if (outcome.kind === 'recorded') {
+        log({ event: 'reviewer.approved' });
+        return 'approved';
+      }
+      // 同時の別要求が同じinteractionの承認を先に記録した（conflict）時は、その記録を使う。他は拒否。
+      log({ event: 'reviewer.approval_rejected', category: outcome.reason });
+      return outcome.reason === 'conflict' ? 'approved' : 'refused';
     }
 
     /** 受信先設定の削除の確定の後（または確認付きの消費の結果が不明な時）の固定案内（503）。ログはrunConsentが出す。 */
@@ -1444,6 +1794,51 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       throw new ApiError(403, 'source_rejected');
     }
 
+    async function pairApp(req: IncomingMessage, res: ServerResponse, method: 'GET' | 'POST', gate: SourceGate, sources: SourceStore): Promise<void> {
+      const operation = context.current();
+      const type = req.headers['content-type'];
+      if (req.headers.origin !== undefined) throw new ApiError(403, 'forbidden');
+      if (method === 'POST' && (typeof type !== 'string' || !/^application\/json\s*(;\s*charset=utf-8\s*)?$/i.test(type.trim()))) throw apiErrors.invalidRequest();
+      const inspected = gate.inspect(req.headers);
+      if (inspected.kind === 'denied') throw new ApiError(403, inspected.code);
+      const bearer = BEARER_ID_TOKEN.exec(req.headers.authorization ?? '')?.[1];
+      if (bearer === undefined) throw apiErrors.authenticationRequired();
+      if (method === 'GET') await guarded(() => assertNoBody(req));
+      const body = method === 'POST' ? await guarded(() => readApprovalBody(req, operation, clock, 64)) : Buffer.alloc(0);
+      if (body === null) throw apiErrors.invalidRequest();
+      try {
+        let input: unknown;
+        if (method === 'POST') try {
+          input = JSON.parse(body.toString('utf8'));
+        } catch {
+          throw apiErrors.invalidRequest();
+        }
+        const code = typeof input === 'object' && input !== null && 'code' in input && Object.keys(input).length === 1 ? input.code : undefined;
+        if (method === 'POST' && (typeof code !== 'string' || !APP_PAIR_CODE.test(code))) throw apiErrors.invalidRequest();
+        const verified = await verifyIdentity(bearer);
+        const decision = await guarded(() => gate.authorize(inspected.proof, {
+          identity: verified, operation: 'send', method, path: PAIR_APP_PATH, search: '', body, bearer,
+          idempotencyKey: undefined, pairing: true,
+        }));
+        if (decision.kind === 'unavailable') throw apiErrors.temporarilyUnavailable();
+        if (decision.kind === 'denied') throw new ApiError(403, decision.code);
+        if (method === 'GET') {
+          const identityHash = connectIdentityHash(hasher, namespace, verified);
+          const allowed = await guarded(() => sources.appCanSend(identityHash, decision));
+          sendJson(res, 200, { allowed });
+          return;
+        }
+        if (typeof code !== 'string') throw apiErrors.invalidRequest();
+        const codeHash = hashPairCode(code);
+        const linked = await guarded(() => sources.redeemApp(codeHash, decision,
+          (tx) => storage.pairingOwnerIn(tx, verified, operation), operation));
+        if (!linked) throw new ApiError(400, 'invalid_pairing_code');
+        sendJson(res, 200, { linked: true });
+      } finally {
+        body.fill(0);
+      }
+    }
+
     async function denyInteraction(req: IncomingMessage, res: ServerResponse, uid: string): Promise<void> {
       requireSameOrigin(req);
       const form = await guarded(() => readForm(req, ['csrf']));
@@ -1468,8 +1863,25 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
       };
 
       // 送信画面（/console・/console/app.js・/console/app.css）はローカル配信helper（src/console/local-server.ts）が出す。このserverは配信せず、
-      // 旧接続画面（/connect・/connect/app.js）と同様に下の未知pathと同じ固定404へ落ちる（redirect・互換page無し）。HTMLはinteractionだけ。
+      // 旧接続画面（/connect・/connect/app.js）と同様に下の未知pathと同じ固定404へ落ちる。
       switch (path) {
+        case REVIEWER_DISCONNECT_PAGE_PATH:
+        case DISCONNECT_PAGE_PATH: {
+          const reviewer = path === REVIEWER_DISCONNECT_PAGE_PATH;
+          if (reviewer && config.reviewer === null) throw apiErrors.notFound();
+          only('GET');
+          await guarded(() => assertNoBody(req));
+          const { language, headers } = pageLanguage(req, url);
+          send(res, 200, 'text/html; charset=utf-8', renderDisconnect(web, language, reviewer), {
+            ...pageSecurityHeaders(web), ...headers, ...(reviewer ? { 'X-Robots-Tag': 'noindex, nofollow' } : {}),
+          });
+          return 'web.disconnect_page';
+        }
+        case DISCONNECT_SCRIPT_PATH:
+          only('GET');
+          await guarded(() => assertNoBody(req));
+          send(res, 200, 'text/javascript; charset=utf-8', DISCONNECT_SCRIPT);
+          return 'web.disconnect_script';
         case INTERACTION_SCRIPT_PATH:
           only('GET');
           await guarded(() => assertNoBody(req));
@@ -1486,30 +1898,52 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
           sendJson(res, 200, { state, access });
           return 'web.connection';
         }
+        case REVIEWER_DISCONNECT_API_PATH:
         case '/v1/web/disconnect': {
+          const reviewer = path === REVIEWER_DISCONNECT_API_PATH;
+          if (reviewer && config.reviewer === null) throw apiErrors.notFound();
           only('POST');
-          if (req.headers.origin !== undefined) requireSameOrigin(req);
-          const verified = await bearerIdentity(req);
+          if (reviewer || req.headers.origin !== undefined) requireSameOrigin(req);
+          const verified = await bearerIdentity(req, reviewer ? verifyReviewer : verifyIdentity);
           await guarded(() => assertNoBody(req));
-          const ownerId = await guarded(() => storage.findOwner(verified));
-          if (ownerId !== undefined) await guarded(() => storage.revokeOwner(ownerId));
+          const ownerId = await guarded(() => storage.revokeOwner(verified));
           log({ event: 'web.disconnected' });
           sendJson(res, 200, { state: await webState(ownerId) });
           return 'web.disconnect';
         }
       }
 
+      // プレイグラウンドの限定endpoint（明示設定だけ。未設定は未知pathと同じ404）。server間だけでbrowserのOriginは受けない。
+      if (path.startsWith('/v1/playground/')) {
+        if (playgroundEndpoint === null) throw apiErrors.notFound();
+        if (req.headers.origin !== undefined) throw new ApiError(403, 'forbidden');
+        const body = await guarded(() => readApprovalBody(req, context.current(), clock, PLAYGROUND_BODY_MAX_BYTES));
+        if (body === null) throw new ApiError(413, 'payload_too_large');
+        const out = await playgroundEndpoint.handle({ method, path, search: url.search, headers: req.headers, body });
+        body.fill(0);
+        log({ event: 'playground.request', category: String(out.status) });
+        sendJson(res, out.status, out.body);
+        return 'playground';
+      }
+
       // 許可元の接続承認（strictの配置だけ。互換は未知pathと同じ404）。queryなし、GETは内容の最小照会、POSTは明示承認だけ。
+      if (path === PAIR_APP_PATH) {
+        if (!config.connectedApps || sourceGate === null || sourceStore === null) throw apiErrors.notFound();
+        if (method !== 'GET' && method !== 'POST') throw apiErrors.methodNotAllowed();
+        if (url.search !== '') throw apiErrors.invalidRequest();
+        await pairApp(req, res, method, sourceGate, sourceStore);
+        return 'source.pair';
+      }
       const approvalMatch = /^\/v1\/source\/approvals\/([A-Za-z0-9_-]{1,128})$/.exec(path);
       if (approvalMatch) {
-        if (sourceGate === null || sourceStore === null) throw apiErrors.notFound();
+        if (config.connectedApps || sourceGate === null || sourceStore === null) throw apiErrors.notFound();
         if (method !== 'GET' && method !== 'POST') throw apiErrors.methodNotAllowed();
         if (url.search !== '') throw apiErrors.invalidRequest();
         await sourceApproval(req, res, approvalMatch[1]!, method, sourceGate, sourceStore);
         return method === 'GET' ? 'source.approval.get' : 'source.approval.post';
       }
 
-      const interactionMatch = /^\/interaction\/([A-Za-z0-9_-]{1,128})(?:\/(login|consent|deny|code))?$/.exec(path);
+      const interactionMatch = /^\/interaction\/([A-Za-z0-9_-]{1,128})(?:\/(login|consent|deny|code|reviewer))?$/.exec(path);
       if (interactionMatch) {
         const uid = interactionMatch[1]!;
         switch (interactionMatch[2]) {
@@ -1529,6 +1963,12 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
             only('POST');
             await codeInteraction(req, res, uid);
             return 'interaction.code';
+          case 'reviewer':
+            // 審査・テスト専用の入口（機能offは未知pathと同じ404）。
+            if (config.reviewer === null) throw apiErrors.notFound();
+            only('POST');
+            await loginInteraction(req, res, uid, 'reviewer');
+            return 'interaction.reviewer';
           default:
             only('POST');
             await denyInteraction(req, res, uid);
@@ -1547,6 +1987,15 @@ async function startCaptured(config: Captured): Promise<KmsConnectServer> {
         await guarded(() => assertNoBody(req));
         sendJson(res, 200, mcp.protectedResourceMetadata);
         return 'mcp.metadata';
+      }
+      // OpenAIのアプリ公開のドメイン確認（明示した時だけ）。完全一致path・queryなしのGETだけに値をそのまま（改行なし）返す。
+      // 未設定・近傍path・queryつきは従来どおり下のOAuth/.well-known処理へ（追加の公開0）。別methodは405で値を返さない。
+      // 判定は生のrequest-target（既存gateでorigin-form検査済み）の完全一致（空の「?」や符号化・ドット区間の正規化で一致させない）。
+      if (openaiAppsChallenge !== null && req.url === OPENAI_APPS_CHALLENGE_PATH) {
+        only('GET');
+        await guarded(() => assertNoBody(req));
+        send(res, 200, 'text/plain; charset=utf-8', openaiAppsChallenge);
+        return 'openai.challenge';
       }
       if (path.startsWith('/oauth/') || path.startsWith('/.well-known/')) {
         alive();

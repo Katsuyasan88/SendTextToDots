@@ -11,7 +11,7 @@ import { KMS_REGION_PATTERN } from '../protection/kms-sealing.js';
 import { arrayItems, dataFields } from '../protection/google-sdk-call.js';
 import { createKmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
 import { isEncryptionNamespace, PAYLOAD_ENCRYPTION_MODE } from '../encryption/contract.js';
-import { parseSourceAuthorization, type SourceAuthorizationConfig } from '../source/contract.js';
+import { ED25519_PUBLIC_KEY, parseSourceAuthorization, SOURCE_ID, type SourceAuthorizationConfig } from '../source/contract.js';
 import { parseGatewayTopology, type GatewayTopology } from '../gateway/contract.js';
 import { DEPLOYMENT_CONFIG } from './deployment.js';
 
@@ -122,8 +122,150 @@ export interface DeploymentConfig {
   readonly payloadEncryption: 'off' | PayloadEncryptionConfig;
   /** 許可元の認可（欠落は'compatible'）。strictは管理者が明示した方式だけ。 */
   readonly sourceAuthorization: SourceAuthorizationConfig;
+  /**
+   * プレイグラウンドの限定route（/v1/playground/*）の固定BFF登録元（欠落は無効）。許可元strictでdeveloper-key-v1を有効にした配置だけ。
+   * sourceIdは`src_`＋base32 26文字、publicKeyはraw Ed25519のbase64url（43文字）。
+   */
+  readonly playgroundRegistrar?: { readonly sourceId: string; readonly publicKey: string };
   /** 既存URLを保つgateway配置（欠落・'direct'は従来のdirect配置でこのkey自体が無い）。 */
   readonly topology?: GatewayTopology;
+  /**
+   * 審査・テスト専用のメール・パスワードログイン（欠落・'off'は無効）。有効時は事前登録の審査UIDとサンプル受信先の組。
+   * 通常MCPのcompatible・direct配置だけ（strictの許可元承認・gateway-v1との同時指定は設定error）。
+   */
+  readonly reviewerLogin: 'off' | ReviewerLoginConfig;
+  readonly mcpSendText?: true;
+  readonly connectedApps?: true;
+}
+
+export const REVIEWER_LOGIN_MODE = 'reviewer-password-v1';
+
+/**
+ * 審査ログインの構成。受信先設定を省略すると通常の購読規則を使う。
+ */
+export type ReviewerLoginConfig = ReviewerLoginBody & {
+  /**
+   * 許可元strictの配置だけで必須（compatibleでは指定不可）: 審査承認の専用connect source ID（運用者が事前登録。Playgroundの登録元とは別）。
+   * 秘密鍵はMCPの起動時だけ専用の環境変数から読む（設定には書かない）。
+   */
+  readonly approvalSourceId?: string;
+};
+
+type ReviewerLoginBody = {
+  readonly mode: typeof REVIEWER_LOGIN_MODE;
+  /** 事前登録の審査・テスト専用Firebase UID（1〜8件・重複なし・開発者コード専用UIDの形は不可）。 */
+  readonly uids: readonly string[];
+} & (
+  | { readonly destinations?: never; readonly firstDestination?: never }
+  | {
+      /** 審査ownerが購読に使えるサンプル受信先のcallback URL（正規形のhttps・1〜8件・重複なし）。 */
+      readonly destinations: readonly string[];
+      readonly firstDestination?: never;
+    }
+  | {
+      /**
+       * 初回固定: 正規形のhttpsオリジン（`https://<host>`）と、ISO 8601 UTCの絶対開始・終了（`YYYY-MM-DDTHH:MM:SS.sssZ`、開始＜終了、
+       * 最大15分）。この枠の間に、オリジンが完全一致するURLで初回の確認に成功した1件を審査ownerの受信先に固定する。
+       */
+      readonly firstDestination: { readonly origin: string; readonly startsAt: string; readonly endsAt: string };
+      readonly destinations?: never;
+    }
+);
+
+const REVIEWER_LIST_MAX = 8;
+const REVIEWER_UID = /^[A-Za-z0-9]{20,128}$/;
+const CODE_UID = /^sttdc_/;
+/** 初回固定の絶対時間枠の上限（15分）。 */
+export const REVIEWER_FIRST_WINDOW_MAX_MS = 15 * 60 * 1000;
+
+/** ISO 8601 UTCの正規形（Date#toISOStringと同じ文字列）だけをepoch msへ。 */
+function isoInstant(value: unknown): number {
+  requireThat(typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value));
+  const ms = Date.parse(value as string);
+  requireThat(Number.isSafeInteger(ms) && ms >= 0 && new Date(ms).toISOString() === value);
+  return ms;
+}
+
+/** 'off'または有効時のexact object。従来の受信先制限は明示設定時だけ適用する。 */
+function parseReviewerLogin(value: unknown): 'off' | ReviewerLoginConfig {
+  if (value === 'off') return 'off';
+  const fields = dataFields(value, ['mode', 'uids'], ['destinations', 'firstDestination', 'approvalSourceId']);
+  const approvalSourceId = fields.has('approvalSourceId') ? fields.get('approvalSourceId') : undefined;
+  requireThat(approvalSourceId === undefined || (typeof approvalSourceId === 'string' && SOURCE_ID_FORM.test(approvalSourceId)));
+  const body = parseReviewerLoginBody(fields);
+  return approvalSourceId === undefined ? body : { ...body, approvalSourceId: approvalSourceId as string };
+}
+
+/** 審査承認のsource ID（source/contract.tsのSOURCE_IDと同じ形）。 */
+const SOURCE_ID_FORM = /^src_[a-z2-7]{26}$/;
+
+function parseReviewerLoginBody(fields: Map<string, unknown>): ReviewerLoginBody {
+  requireThat(fields.get('mode') === REVIEWER_LOGIN_MODE);
+  requireThat(!(fields.has('destinations') && fields.has('firstDestination')));
+  const uids = arrayItems(fields.get('uids'));
+  requireThat(uids.length >= 1 && uids.length <= REVIEWER_LIST_MAX);
+  requireThat(uids.every((uid) => typeof uid === 'string' && REVIEWER_UID.test(uid) && !CODE_UID.test(uid)) && new Set(uids).size === uids.length);
+  const account = { mode: REVIEWER_LOGIN_MODE, uids: [...(uids as string[])] } as const;
+  if (fields.has('firstDestination')) {
+    const first = dataFields(fields.get('firstDestination'), ['origin', 'startsAt', 'endsAt']);
+    const origin = str(first, 'origin');
+    let url: URL;
+    try {
+      url = new URL(origin);
+    } catch {
+      throw invalid();
+    }
+    requireThat(url.protocol === 'https:' && url.origin === origin && url.port === '' && isDnsHost(url.hostname));
+    const startsAt = str(first, 'startsAt');
+    const endsAt = str(first, 'endsAt');
+    const start = isoInstant(startsAt);
+    const end = isoInstant(endsAt);
+    requireThat(start < end && end - start <= REVIEWER_FIRST_WINDOW_MAX_MS);
+    return { ...account, firstDestination: { origin, startsAt, endsAt } };
+  }
+  if (!fields.has('destinations')) return account;
+  const destinations = arrayItems(fields.get('destinations'));
+  requireThat(destinations.length >= 1 && destinations.length <= REVIEWER_LIST_MAX);
+  for (const destination of destinations) {
+    requireThat(typeof destination === 'string' && destination.length <= 2048);
+    let url: URL;
+    try {
+      url = new URL(destination as string);
+    } catch {
+      throw invalid();
+    }
+    requireThat(url.protocol === 'https:' && url.href === destination && url.username === '' && url.password === '' && url.hash === '' && isDnsHost(url.hostname) && url.port === '');
+  }
+  requireThat(new Set(destinations).size === destinations.length);
+  return { ...account, destinations: [...(destinations as string[])] };
+}
+
+/** 共通verifier（API・MCPの同じSDK factory）へ渡す審査UID。無効ならundefined（標準構成の検証のまま）。 */
+export function reviewerUidsOf(config: Pick<DeploymentConfig, 'reviewerLogin'>): readonly string[] | undefined {
+  return config.reviewerLogin === 'off' ? undefined : config.reviewerLogin.uids;
+}
+
+/** 従来のstrict審査承認: 専用source IDと唯一の審査UID（新方式・compatible・無効ならundefined）。鍵はここに無い（MCP起動時に専用envから読む）。 */
+export function reviewerApprovalOf(config: Pick<DeploymentConfig, 'reviewerLogin' | 'connectedApps'>): { readonly sourceId: string; readonly reviewerUid: string } | undefined {
+  const reviewer = config.reviewerLogin;
+  if (config.connectedApps === true || reviewer === 'off' || reviewer.approvalSourceId === undefined || reviewer.uids.length !== 1) return undefined;
+  return { sourceId: reviewer.approvalSourceId, reviewerUid: reviewer.uids[0]! };
+}
+
+/** 通常MCPの接続serverへ渡す審査の構成。無効ならundefined、通常の購読規則なら空のobject。 */
+export function reviewerServerOptionOf(
+  config: Pick<DeploymentConfig, 'reviewerLogin'>,
+):
+  | { readonly destinations?: never; readonly firstDestination?: never }
+  | { readonly destinations: readonly string[]; readonly firstDestination?: never }
+  | { readonly destinations?: never; readonly firstDestination: { readonly origin: string; readonly startsAt: number; readonly endsAt: number } }
+  | undefined {
+  const reviewer = config.reviewerLogin;
+  if (reviewer === 'off') return undefined;
+  if (reviewer.destinations !== undefined) return { destinations: reviewer.destinations };
+  if (reviewer.firstDestination === undefined) return {};
+  const { origin, startsAt, endsAt } = reviewer.firstDestination;
+  return { firstDestination: { origin, startsAt: Date.parse(startsAt), endsAt: Date.parse(endsAt) } };
 }
 
 export interface PayloadEncryptionConfig {
@@ -228,7 +370,7 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
   let top: Map<string, unknown>;
   try {
     // accessPolicyは配布placeholder（未設定）の判定を先に保つため存在だけ任意で読み、設定済みの時は下で必須にする。
-    top = dataFields(raw, TOP_KEYS, ['accessPolicy', 'developerLogin', 'payloadEncryption', 'sourceAuthorization', 'topology']);
+    top = dataFields(raw, TOP_KEYS, ['accessPolicy', 'developerLogin', 'payloadEncryption', 'sourceAuthorization', 'topology', 'playgroundRegistrar', 'reviewerLogin', 'mcpSendText', 'connectedApps']);
   } catch {
     throw invalid();
   }
@@ -326,8 +468,35 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
       connectServiceAccount: connect.serviceAccount,
       isServiceAccount: (value) => isServiceAccount(value, projectId),
     });
+    // プレイグラウンドの固定BFF登録元（任意・既定は無効）。strictでdeveloper-key-v1が有効な配置だけで、形の不正は設定error。
+    let playgroundRegistrar: { readonly sourceId: string; readonly publicKey: string } | undefined;
+    if (top.has('playgroundRegistrar')) {
+      const reg = dataFields(top.get('playgroundRegistrar'), ['sourceId', 'publicKey'], []);
+      const sourceId = reg.get('sourceId');
+      const publicKey = reg.get('publicKey');
+      requireThat(typeof sourceId === 'string' && SOURCE_ID.test(sourceId) && typeof publicKey === 'string' && ED25519_PUBLIC_KEY.test(publicKey));
+      requireThat(sourceAuthorization !== 'compatible' && sourceAuthorization.methods.includes('developer-key-v1'));
+      playgroundRegistrar = { sourceId: sourceId as string, publicKey: publicKey as string };
+    }
+    // プレイグラウンドの限定routeはdirect配置だけ（gateway-v1のroute allowlistへ新しい入口を広げない）。
+    requireThat(!(playgroundRegistrar !== undefined && topology !== undefined));
     // direct Cloud Run APIとgateway-v1（公開API = gateway）は同時に選べない（不整合は設定error）。
     requireThat(!(runtime === 'cloud-run-v1' && topology !== undefined));
+    // 審査ログイン（省略は'off'）はdirect配置のみ。旧strictでは専用の許可元承認を必須とする。
+    const reviewerLogin = parseReviewerLogin(top.has('reviewerLogin') ? top.get('reviewerLogin') : 'off');
+    const connectedApps = top.get('connectedApps');
+    requireThat(connectedApps === undefined || (connectedApps === true && topology === undefined && sourceAuthorization !== 'compatible'));
+    const mcpSendText = top.get('mcpSendText');
+    requireThat(mcpSendText === undefined || (mcpSendText === true && topology === undefined && sourceAuthorization !== 'compatible'));
+    if (reviewerLogin !== 'off') {
+      requireThat(topology === undefined);
+      if (sourceAuthorization === 'compatible') requireThat(reviewerLogin.approvalSourceId === undefined);
+      else if (connectedApps !== true) {
+        // 旧strict: 既存のdeveloper-key-v1が有効、審査UIDは1件、専用承認sourceがPlaygroundの登録元と別の時だけ。
+        requireThat(sourceAuthorization.methods.includes('developer-key-v1') && reviewerLogin.uids.length === 1);
+        requireThat(reviewerLogin.approvalSourceId !== undefined && reviewerLogin.approvalSourceId !== playgroundRegistrar?.sourceId);
+      }
+    }
 
     return deepFreeze({
       accessPolicy: ACCESS_POLICY,
@@ -354,6 +523,10 @@ export function validateDeploymentConfig(raw: unknown): DeploymentConfig {
       payloadEncryption,
       sourceAuthorization: sourceAuthorization === 'compatible' ? sourceAuthorization : { mode: sourceAuthorization.mode, methods: [...sourceAuthorization.methods] },
       ...(topology !== undefined ? { topology } : {}),
+      ...(playgroundRegistrar !== undefined ? { playgroundRegistrar } : {}),
+      reviewerLogin,
+      ...(connectedApps === true ? { connectedApps: true as const } : {}),
+      ...(mcpSendText === true ? { mcpSendText: true as const } : {}),
     });
   } catch {
     throw invalid();

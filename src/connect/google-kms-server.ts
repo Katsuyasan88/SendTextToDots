@@ -1,7 +1,7 @@
 // 初期化済みの借用Google SDK client（KMS・Secret Manager）から実port（KMS transport・secret reader・connect secret source）を内部で組み立て、
 // startDevelopmentKmsConnectServerへ渡す起動口。server.publicOriginは必須、kms.environmentはdevelopmentだけ。
 // SDKの生成・initialize・ADC・metadata・任意factory/start注入をしない。秘密は先に読まず、serverの元20秒の中のsecrets.load callbackで1回だけ
-// 読む（digest用途は取得0）。loadがcallerへ移したcookieKeys/identifierKeyのBufferは、このwrapperのledgerへ記録し、server startの成功/失敗が
+// 読む。送信ツールが有効な時だけ別途digest鍵を読む。loadがcallerへ移したcookieKeys/identifierKeyのBufferは、このwrapperのledgerへ記録し、server startの成功/失敗が
 // 確定したfinallyで0埋めする（serverは先に内部copyを作るので、稼働に要るcopyは消さない。JWKの文字列の完全消去は保証しない）。終了の後に
 // 届いたloadの結果は採用せず即時0埋めして固定の起動失敗にする。reader/sourceはstartのfinallyでdispose、transportはserverの稼働中だけ
 // 生かしてclose・起動失敗でdisposeする。SDK client・db・identity・egress・senderは借用でclose/terminate/dispose0、DB削除0。
@@ -68,7 +68,9 @@ export class GoogleKmsConnectCloseError extends Error {
 }
 
 /** KmsConnectServerOptionsからkms・secretsを除いたもの（publicOriginは必須）。 */
-export type GoogleKmsConnectServerOptions = Omit<KmsConnectServerOptions, 'kms' | 'secrets'>;
+export type GoogleKmsConnectServerOptions = Omit<KmsConnectServerOptions, 'kms' | 'secrets' | 'sendText'> & {
+  readonly sendText?: Omit<NonNullable<KmsConnectServerOptions['sendText']>, 'loadDigestKey'> | undefined;
+};
 
 /** KmsConnectKmsConfigからtransportを除いたもの（environmentはdevelopmentだけ）。 */
 export type GoogleKmsConnectKmsOptions = Omit<KmsConnectKmsConfig, 'transport'>;
@@ -80,7 +82,7 @@ export interface GoogleKmsConnectGoogleOptions {
   readonly secretClient: SecretManagerServiceClient;
   /** 正規10進のproject number。 */
   readonly projectNumber: string;
-  /** 4用途の固定数値版（このstartはjwks・cookieKeys・identifierKeyだけを読む）。 */
+  /** 4用途の固定数値版。commandDigestKeyは送信ツールが有効な時だけ読む。 */
   readonly secretVersions: GoogleSecretVersions;
 }
 
@@ -95,7 +97,9 @@ export type GoogleKmsConnectServer = KmsConnectServer;
 
 const TOP_KEYS = ['server', 'kms', 'google'] as const;
 const SERVER_KEYS = ['bindPort', 'db', 'namespace', 'identity', 'web', 'clientEgress', 'verificationSender', 'clock', 'publicOrigin'] as const;
-const SERVER_OPTIONAL = ['log', 'startupOperation', 'developerCode', 'sourceAuthorization', 'transportAuthority'] as const;
+// playground: プレイグラウンドの限定route（配置設定のplaygroundRegistrarを明示した時だけconnect-developmentが渡す。検査はkms-server）。
+// reviewer: 審査・テスト専用ログイン（配置設定のreviewerLoginを有効にした時だけ。検査はkms-server）。
+const SERVER_OPTIONAL = ['log', 'startupOperation', 'developerCode', 'sourceAuthorization', 'transportAuthority', 'playground', 'openaiAppsChallenge', 'reviewer', 'sendText', 'connectedApps'] as const;
 const STARTUP_OPERATION_KEYS = ['deadlineAt', 'signal'] as const;
 /** setTimeoutの遅延の上限（これを越える値はNodeが1msへ置き換える）。 */
 const MAX_TIMER_MS = 2_147_483_647;
@@ -253,6 +257,14 @@ export async function startDevelopmentGoogleKmsConnectServer(options: GoogleKmsC
     throw new GoogleKmsConnectConfigError();
   }
   const { server, kms, readVersions, parent } = captured;
+  let sendTextParts: Map<string, unknown> | undefined;
+  if (server.has('sendText')) {
+    try {
+      sendTextParts = dataFields(server.get('sendText'), ['namespace', 'egress']);
+    } catch {
+      throw new GoogleKmsConnectConfigError();
+    }
+  }
 
   // 起動親があれば、既中断・期限到達をport生成・秘密RPC・DB・listenの前に固定の起動失敗にする。
   let now: () => number | null = () => null;
@@ -322,7 +334,15 @@ export async function startDevelopmentGoogleKmsConnectServer(options: GoogleKmsC
   };
 
   const serverOptions: Record<string, unknown> = {};
-  for (const [key, value] of server) if (value !== undefined && key !== 'startupOperation') serverOptions[key] = value;
+  for (const [key, value] of server) if (value !== undefined && key !== 'startupOperation' && key !== 'sendText') serverOptions[key] = value;
+  if (sendTextParts !== undefined) {
+    const reader = ports.reader;
+    serverOptions.sendText = {
+      namespace: sendTextParts.get('namespace'),
+      egress: sendTextParts.get('egress'),
+      loadDigestKey: (operation: Parameters<GoogleSecretReader['read']>[1]) => reader.read('commandDigestKey', operation),
+    };
+  }
   // serverへは安全な写し（同じ親deadline・bridge専有scopeのsignal）だけを渡す。
   if (parent !== null) serverOptions.startupOperation = Object.freeze({ deadlineAt: parent.deadlineAt, signal: startup.signal });
   serverOptions.kms = {

@@ -282,7 +282,7 @@ function captureSources(deps: object): SourceGate | undefined {
   return Object.freeze({
     inspect: (headers: IncomingMessage['headers']) => inspect(headers) as ReturnType<SourceGate['inspect']>,
     authorize: (proof: SourceProof, input: SourceAuthorizeInput) => authorize(proof, input) as Promise<SourceDecision>,
-    dispatchCheck: (binding: SourceBinding, operation: SourceOperation) => dispatchCheck(binding, operation) as ReturnType<SourceGate['dispatchCheck']>,
+    dispatchCheck: (binding: SourceBinding, operation: SourceOperation, identity?: VerifiedIdentity) => dispatchCheck(binding, operation, identity) as ReturnType<SourceGate['dispatchCheck']>,
   });
 }
 
@@ -558,7 +558,7 @@ function buildOperationHandler(
         return errorResponse(403, decision.code);
       }
       // 入口で認可したbindingを捨てず、送出確定のtransactionで同じsourceを読み直して照合する（停止が先なら送出0）。
-      if (sourceOperation === 'send') requestCheck = sources.dispatchCheck({ sourceId: decision.sourceId, generation: decision.generation }, sourceOperation);
+      if (sourceOperation === 'send') requestCheck = sources.dispatchCheck({ sourceId: decision.sourceId, generation: decision.generation }, sourceOperation, verified);
       return undefined;
     };
     let requestCheck: ((tx: Transaction) => Promise<boolean>) | undefined;

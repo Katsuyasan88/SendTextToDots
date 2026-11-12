@@ -69,16 +69,58 @@ export {
   type RequestScopedSubscriptionPort,
 } from './request-operation.js';
 
+import { isAppLabel, type AppManagementRequest } from '../source/connected-apps.js';
+import { SOURCE_ID } from '../source/contract.js';
+
 const SERVER_INFO = { name: 'sttd-server', version: '0.0.0' };
 
 /** `events` はSDKのServerCapabilities型にないため、型だけを広げて渡す。 */
 type EventsCapabilities = ServerCapabilities & { events: Record<string, never> };
 
+const APP_TOOLS = [
+  {
+    name: 'list_connected_apps',
+    title: 'List connected sending apps',
+    description: 'List apps allowed to send text to your Dot for the connected SendTextToDots account.',
+    inputSchema: { type: 'object' as const, properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'add_connected_app',
+    title: 'Create a sending app registration code',
+    description: 'Issue a one-time code valid for 10 minutes. Issuing a new code immediately invalidates any previous unused registration code for this account. Show the code to the user to enter in the sending app while signed in to the same SendTextToDots account. The app is registered when the code is redeemed.',
+    inputSchema: { type: 'object' as const, properties: { name: { type: 'string', minLength: 1, maxLength: 100 } }, required: ['name'], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: 'remove_connected_app',
+    title: 'Remove a connected sending app',
+    description: 'When explicitly requested, use the app ID from list_connected_apps to revoke that app’s permission to send text. The connected Dot and other apps keep working.',
+    inputSchema: { type: 'object' as const, properties: { appId: { type: 'string', pattern: SOURCE_ID.source } }, required: ['appId'], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  },
+];
+
+function parseAppManagementRequest(name: string, args: unknown): AppManagementRequest | undefined {
+  if (!APP_TOOLS.some((tool) => tool.name === name)) return undefined;
+  const keys = args === undefined ? [] : typeof args === 'object' && args !== null && !Array.isArray(args) ? Reflect.ownKeys(args) : null;
+  if (name === 'list_connected_apps' && keys?.length === 0) return { kind: 'list' };
+  if (keys?.length === 1 && typeof args === 'object' && args !== null) {
+    const label: unknown = Object.getOwnPropertyDescriptor(args, 'name')?.value;
+    const id: unknown = Object.getOwnPropertyDescriptor(args, 'appId')?.value;
+    if (name === 'add_connected_app' && isAppLabel(label)) return { kind: 'issue', name: label };
+    if (name === 'remove_connected_app' && typeof id === 'string' && SOURCE_ID.test(id)) return { kind: 'remove', appId: id };
+  }
+  throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'Invalid arguments');
+}
+
 const REQUIRED = ['issuer', 'resource', 'clock', 'resolveOAuthOwner', 'subscriptions', 'onError'] as const;
-const OPTIONAL = ['budgetMs', 'closeBudgetMs', 'receivingStatus'] as const;
+const OPTIONAL = ['budgetMs', 'closeBudgetMs', 'receivingStatus', 'sendText', 'connectedApps'] as const;
 
 /** 受信状態の照会tool（状態照会portを渡された入口だけが一覧・呼出しに出す）。 */
 const RECEIVING_STATUS_TOOL = 'get_receiving_status';
+const SEND_TEXT_TOOL = 'send_text';
+const SEND_TEXT_RESULTS = ['delivered', 'not_delivered', 'delivery_unknown'] as const;
 const RECEIVING_STATES: readonly ReceivingState[] = ['change_pending', 'subscribed', 'expired', 'linked'];
 
 /** `tools/list`に出す定義（固定。owner・Grant・購読の値を含まない）。 */
@@ -105,6 +147,17 @@ function receivingStatusToolDefinition() {
 
 function isReceivingState(value: unknown): value is ReceivingState {
   return (RECEIVING_STATES as readonly unknown[]).includes(value);
+}
+
+function sendTextToolDefinition() {
+  return {
+    name: SEND_TEXT_TOOL,
+    title: 'Send text to your Dot',
+    description: 'Send the exact text explicitly requested by the user to the receiving task registered to their connected SendTextToDots account. Use once per request. If delivery is unknown, ask the user to check their Dot before sending again.',
+    inputSchema: { type: 'object' as const, properties: { text: { type: 'string', minLength: 1, maxLength: 4096 } }, required: ['text'], additionalProperties: false },
+    outputSchema: { type: 'object' as const, properties: { status: { type: 'string', enum: [...SEND_TEXT_RESULTS] } }, required: ['status'], additionalProperties: false },
+    annotations: { title: 'Send text to your Dot', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  };
 }
 
 /**
@@ -382,7 +435,9 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
   const portTarget = fields.get('subscriptions');
   const subscribe = methodOf(portTarget, 'subscribe');
   const unsubscribe = methodOf(portTarget, 'unsubscribe');
+  const manageApps = fields.has('connectedApps') ? methodOf(fields.get('connectedApps'), 'manage') : undefined;
   const statusFor = fields.has('receivingStatus') ? methodOf(fields.get('receivingStatus'), 'statusFor') : undefined;
+  const sendText = fields.has('sendText') ? methodOf(fields.get('sendText'), 'send') : undefined;
   const onErrorFn = plainFunction(fields.get('onError'));
   const budgetMs = boundedInteger(fields.get('budgetMs'), MCP_REQUEST_BUDGET_MS, MCP_REQUEST_BUDGET_MS);
   const closeBudgetMs = boundedInteger(fields.get('closeBudgetMs'), MCP_CLOSE_BUDGET_MS, MCP_CLOSE_BUDGET_MS);
@@ -546,23 +601,48 @@ export function createRequestScopedMcpEntry(options: RequestScopedMcpEntryOption
 
   const handler = createMcpHandler(
     () => {
-      // tools:{}。状態照会portを渡された入口だけが読取り専用の`get_receiving_status`を1つ提供し、無ければ空一覧でtools/callは未提供。
+      // 構成済みのツールだけを公開する。
       const capabilities: EventsCapabilities = { events: {}, tools: {} };
       const server = new Server(SERVER_INFO, { capabilities });
 
       server.setRequestHandler('tools/list', (_request, ctx) =>
         (async () => {
           authOf(ctx);
-          return { tools: statusFor === undefined ? [] : [receivingStatusToolDefinition()] };
+          return { tools: [...(statusFor === undefined ? [] : [receivingStatusToolDefinition()]), ...(sendText === undefined ? [] : [sendTextToolDefinition()]), ...(manageApps === undefined ? [] : APP_TOOLS)] };
         })(),
       );
 
-      if (statusFor !== undefined) {
+      if (statusFor !== undefined || sendText !== undefined || manageApps !== undefined) {
         server.setRequestHandler('tools/call', (request, ctx) =>
           (async () => {
-            // 名前・引数の検査はportより前（未知tool・余分な引数は照会I/O 0）。引数は省略か空objectだけ。
+            // 名前と引数はportを呼ぶ前に検査する。
             const { name, arguments: args } = request.params;
-            if (name !== RECEIVING_STATUS_TOOL) throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'Unknown tool');
+            const appRequest = manageApps === undefined ? undefined : parseAppManagementRequest(name, args);
+            if (appRequest !== undefined && manageApps !== undefined) {
+              const state = stateOf(ctx);
+              requireTokenLive(state);
+              const auth = Object.freeze({ ...state.auth! });
+              const operation = Object.freeze({ signal: state.operation.signal, deadlineAt: Math.min(state.operation.deadlineAt, state.tokenExpiresAt! * 1000) });
+              const result = await callPort(state, () => manageApps(auth, appRequest, operation));
+              requireTokenLive(state);
+              if (typeof result !== 'object' || result === null) throw internalError();
+              return { content: [{ type: 'text' as const, text: JSON.stringify(result) }], structuredContent: result, isError: 'error' in result };
+            }
+            if (name === SEND_TEXT_TOOL && sendText !== undefined) {
+              const value = typeof args === 'object' && args !== null ? ownData(args, 'text') : undefined;
+              if (typeof value !== 'string' || Reflect.ownKeys(args!).length !== 1 || value.trim().length === 0 || Buffer.byteLength(value, 'utf8') > 4096) {
+                throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'Invalid text');
+              }
+              const state = stateOf(ctx);
+              requireTokenLive(state);
+              const auth = Object.freeze({ ...state.auth! });
+              const operation = Object.freeze({ signal: state.operation.signal, deadlineAt: Math.min(state.operation.deadlineAt, state.tokenExpiresAt! * 1000) });
+              const outcome = await callPort(state, () => sendText(auth, value, operation));
+              if (!(SEND_TEXT_RESULTS as readonly unknown[]).includes(outcome)) throw internalError();
+              const structured = { status: outcome };
+              return { content: [{ type: 'text' as const, text: JSON.stringify(structured) }], structuredContent: structured, isError: false };
+            }
+            if (name !== RECEIVING_STATUS_TOOL || statusFor === undefined) throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'Unknown tool');
             if (args !== undefined && (typeof args !== 'object' || args === null || Array.isArray(args) || Reflect.ownKeys(args).length !== 0)) {
               throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'Invalid arguments');
             }

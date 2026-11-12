@@ -21,11 +21,21 @@ import { hashesEqual, newOpaqueValue, type SecretHasher } from '../secrets.js';
 import type { AssertionReplayStore } from '../stores.js';
 import type { VerifiedIdentity } from '../identity/firebase.js';
 import { accessDocRef, accessVerdictOfSnapshot, AccessUnavailableError, grantGenerationOfSnapshot } from '../access/firestore.js';
-import { accessVerdictOf, ACCESS_UNAVAILABLE, codeLoginWithin, grantGenerationOf, grantUseVerdict, ownerIdentityHash, type AccessVerdict } from '../access/policy.js';
+import {
+  accessVerdictOf,
+  ACCESS_UNAVAILABLE,
+  codeLoginWithin,
+  grantGenerationOf,
+  grantReceiverGenerationOf,
+  grantUseVerdict,
+  ownerIdentityHash,
+  type AccessVerdict,
+} from '../access/policy.js';
 import { ownerReceiverGeneration, receiverResetWrites, receiverSettingsPresent, receiverSnapshotMaterial, RECEIVER_GENERATION_FIELD, ReceiverResetUnavailableError } from '../storage/firestore/receiver-reset.js';
-import type { KmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
+import { parseKmsState, type KmsSubscriptionPolicy } from '../storage/firestore/kms-subscription-format.js';
 
-import { isSourceBinding, parseSourceRecord, sourceBindingVerdict } from '../source/contract.js';
+import { isSourceBinding, parseSourceRecord, sourceBindingVerdict, type SourceBinding } from '../source/contract.js';
+import { isAccountGrant } from '../source/connected-apps.js';
 import { SOURCE_GRANTS_COLLECTION, type SourceStore } from '../source/firestore.js';
 
 /** strictの同意で消費する許可元承認の位置と、元interactionのclient/resourceのHMAC（本人のhashはowner文書から同じtxで読む）。 */
@@ -146,6 +156,7 @@ export interface ConnectStorageDeps {
   /**
    * 受信先設定（同じFirestoreの購読保存、sttdAuth/{t268}/subscriptions/{ownerId}）の参照。無い構成では、受信先設定の削除の確認を出さない。
    */
+  readonly connectedApps?: boolean | undefined;
   readonly receiverSubscriptions?: ReceiverSubscriptions | undefined;
 }
 
@@ -158,7 +169,7 @@ export interface ReceiverSubscriptions {
 export type BindOutcome = 'ok' | 'rejected' | 'other_owner';
 
 /** interactionのlogin方法（検証済みのID tokenから決めた値だけ。clientの申告は使わない）。 */
-export type InteractionLoginMethod = 'apple' | 'developer_code' | 'google';
+export type InteractionLoginMethod = 'apple' | 'developer_code' | 'google' | 'reviewer';
 
 export interface ConsentRecord {
   readonly ownerId: string;
@@ -169,19 +180,20 @@ export interface ConsentRecord {
   readonly receiverGeneration?: number;
   /** この同意で、受信先設定一式を消した（確定済み）。 */
   readonly receiverReset?: boolean;
+  readonly previousSource?: SourceBinding;
 }
 
 /**
- * Appleのlogin後の同意画面のsnapshot（表示用の不透明token）。設定が無くても出し、同意の消費のtransactionで表示時と同じかを確かめる。
- * presentは受信先設定がある（削除の確認が要る）こと。
+ * ログイン後の同意画面のsnapshot（表示用の不透明token）。設定が無くても出し、同意の消費のtransactionで表示時と同じかを確かめる。
+ * presentは承認時に削除する受信先設定があること。
  */
 export interface ReceiverSnapshot {
   readonly token: string;
   readonly present: boolean;
 }
 
-/** 同意の消費の結果。changedは表示の後の変化（消費・削除0）、confirm_requiredは確認が要るのに未確認（消費・削除0）。 */
-export type CheckedConsent = ConsentRecord | 'denied' | 'changed' | 'confirm_required' | undefined;
+/** 同意の消費の結果。changedは表示後の受信先設定の変化（消費・削除0）。 */
+export type CheckedConsent = ConsentRecord | 'denied' | 'changed' | undefined;
 
 /** login（owner解決）の結果。deniedは利用不許可（ownerを作らない）、inactiveは既存ownerの失効・無活動。許可の一時障害はAccessUnavailableError。 */
 export type OwnerAdmission =
@@ -270,6 +282,7 @@ export class ConnectStorage {
     now: number,
   ): 'allowed' | 'denied' | 'unavailable' {
     if (this.#sources === undefined) return 'allowed';
+    if (binding.exists && isAccountGrant(binding.data)) return 'allowed';
     if (!binding.exists || source === null) return 'denied';
     try {
       const data = binding.data as Record<string, unknown>;
@@ -288,6 +301,31 @@ export class ConnectStorage {
     if (data === undefined || data.state !== 'authenticated' || typeof data.ownerId !== 'string' || typeof data.expiresAt !== 'number') return undefined;
     if (!(this.#d.clock.now() < data.expiresAt)) return undefined;
     return { ownerId: data.ownerId, expiresAt: data.expiresAt };
+  }
+
+  /**
+   * 審査承認の発行前の読取りだけの確認（strictの審査ログイン）。interactionが審査ログインでlogin済み・期限内・CSRFが現行で、
+   * ownerが審査専用（loginKind='reviewer'）で現在active、owner→許可recordがactiveで、login時の利用許可の世代と同じ時だけ、ownerと期限を返す。
+   * それ以外はundefined（承認を作らない）。許可の不正・障害はAccessUnavailableError。最終の照合・単回消費はputGrantMetaのtransaction。
+   */
+  async reviewerApprovalTarget(uid: string, csrf: string): Promise<{ readonly ownerId: string; readonly expiresAt: number; readonly authTimeSec: number } | undefined | null> {
+    const data = (await this.#interactionRef(uid).get()).data() as Record<string, unknown> | undefined;
+    // 審査ログインのinteractionでなければnull（呼出し側は通常の経路のまま）。審査ログインで条件が不成立ならundefined（拒否）。
+    if (data === undefined || data.loginMethod !== 'reviewer') return null;
+    if (data.state !== 'authenticated' || typeof data.ownerId !== 'string') return undefined;
+    if (typeof data.expiresAt !== 'number' || typeof data.accessGeneration !== 'string' || !this.#csrfMatches(data, csrf)) return undefined;
+    if (typeof data.authTimeSec !== 'number' || !Number.isSafeInteger(data.authTimeSec) || data.authTimeSec <= 0) return undefined;
+    const ownerId = data.ownerId;
+    const owner = (await this.#ownerRef(ownerId).get()).data();
+    const now = this.#d.clock.now();
+    if (!(now < data.expiresAt)) return undefined;
+    if (owner?.loginKind !== 'reviewer' || !this.#activeOwner(owner, now)) return undefined;
+    const identityHash = ownerIdentityHash(owner);
+    if (identityHash === null) return undefined;
+    const access = accessVerdictOfSnapshot(await this.#accessRef(identityHash).get(), this.#d.clock.now());
+    if (access.kind === 'unavailable') throw new AccessUnavailableError();
+    if (access.kind === 'denied' || access.generation !== data.accessGeneration) return undefined;
+    return { ownerId, expiresAt: data.expiresAt, authTimeSec: data.authTimeSec };
   }
 
   // ---- oidc-provider adapter ----
@@ -517,22 +555,41 @@ export class ConnectStorage {
     return [...ids];
   }
 
-  /** 接続解除。ownerの全Grant・その全token/code・Session・同意記録を消す。外部の購読表示の削除までは含まない。 */
-  async revokeOwner(ownerId: string): Promise<number> {
-    const snapshot = await this.#root.collection('oidc').where('ownerHash', '==', this.#hash('owner', ownerId)).get();
-    const grantHashes = new Set<string>();
-    for (const entry of snapshot.docs) {
-      const doc = entry.data() as OidcDoc;
-      if (doc.grantHash !== null) grantHashes.add(doc.grantHash);
-    }
-    for (const grantHash of grantHashes) await this.#deleteByGrantHash(grantHash);
-    const rest = await this.#root.collection('oidc').where('ownerHash', '==', this.#hash('owner', ownerId)).get();
-    if (!rest.empty) {
-      const batch = this.#d.db.batch();
-      for (const entry of rest.docs) batch.delete(entry.ref);
-      await batch.commit();
-    }
-    return grantHashes.size;
+  /** 接続解除。認可と受信先設定を同じtransactionで削除し、以前の設定を参照していた処理を世代で失効させる。 */
+  async revokeOwner(identity: VerifiedIdentity): Promise<string | undefined> {
+    const identityRef = this.#identityRef(identity);
+    return this.#d.db.runTransaction(async (tx) => {
+      const mapped = (await tx.get(identityRef)).data();
+      if (typeof mapped?.ownerId !== 'string' || mapped.ownerId.length === 0) return undefined;
+      const ownerId = mapped.ownerId;
+      const ownerRef = this.#ownerRef(ownerId);
+      const owner = await tx.get(ownerRef);
+      const ownerData = owner.data();
+      if (!owner.exists || (identity.method === 'reviewer') !== (ownerData?.loginKind === 'reviewer')) return undefined;
+      if (ownerIdentityHash(ownerData) !== identityRef.id) throw new AccessUnavailableError();
+      // 有効期間を過ぎた接続も、本人が保存済みの設定を削除できるようにする。
+      const subscriptionRef = this.#d.receiverSubscriptions?.refFor(ownerId);
+      const subscription = subscriptionRef === undefined ? null : await tx.get(subscriptionRef);
+      const authorizations = this.#root.collection('oidc').where('ownerHash', '==', this.#hash('owner', ownerId));
+      const oidc = await tx.get(authorizations);
+      const clearApps = await this.#sources?.clearConnectedAppsIn(tx, identityRef.id);
+      clearApps?.();
+      if (oidc.empty && subscription?.exists !== true) return ownerId;
+      const reset = receiverResetWrites(ownerId, ownerData);
+      tx.update(ownerRef, reset.ownerUpdate);
+      if (subscription?.exists === true) tx.delete(subscription.ref);
+      const grantHashes = new Set<string>();
+      for (const entry of oidc.docs) {
+        const doc = entry.data() as OidcDoc;
+        if (typeof doc.grantHash === 'string') grantHashes.add(doc.grantHash);
+        tx.delete(entry.ref);
+      }
+      for (const hash of grantHashes) {
+        tx.delete(this.#root.collection('grantMeta').doc(hash));
+        tx.delete(this.#root.collection(SOURCE_GRANTS_COLLECTION).doc(hash));
+      }
+      return ownerId;
+    }, { maxAttempts: 1 });
   }
 
   // ---- owner ----
@@ -551,8 +608,8 @@ export class ConnectStorage {
       data.revokedAt === null &&
       typeof data.lastActiveAt === 'number' &&
       now - data.lastActiveAt < this.#d.ownerInactivityMs &&
-      // 明示kindは'normal'だけ。期限とkindの両方を持つ・未知kindは不正（fail closed）。
-      (!Object.hasOwn(data, 'loginKind') || (data.loginKind === 'normal' && !Object.hasOwn(data, 'codeLoginExpiresAt'))) &&
+      // 明示kindは'normal'と審査専用の'reviewer'だけ。期限とkindの両方を持つ・未知kindは不正（fail closed）。
+      (!Object.hasOwn(data, 'loginKind') || ((data.loginKind === 'normal' || data.loginKind === 'reviewer') && !Object.hasOwn(data, 'codeLoginExpiresAt'))) &&
       // コードloginのownerはログイン成立から10分の絶対期限（isOwnerActive＝MCPの既存access token・ownerDocActive＝配送/購読の最終txの共通判定）。
       // 期限fieldが形違い・時刻不正ならfail closed。Apple/Googleのownerは期限fieldを持たない。
       codeLoginWithin(Object.hasOwn(data, 'codeLoginExpiresAt') ? (data.codeLoginExpiresAt ?? 0) : undefined, now)
@@ -594,6 +651,9 @@ export class ConnectStorage {
       // 期限属性の無い旧コード接続（この版より前にactivateされたcode identityの許可）は受けない。新しいコードで接続し直す（新しい10分を足して復活させない）。
       // code UIDの判定は検証済みidentity（サーバー側のID token検証の結果）だけで行う。
       if (access.codeLoginExpiresAt === undefined && (identity.method === 'developer_code' || isLegacyCodeUid(identity.uid))) return { kind: 'denied' };
+      // 審査・テスト専用ログインは期限付きのコード許可とは混ぜない。
+      const reviewer = identity.method === 'reviewer';
+      if (reviewer && (access.codeLoginExpiresAt !== undefined || isLegacyCodeUid(identity.uid))) return { kind: 'denied' };
       // コードloginの許可の絶対期限をowner文書へ写す（以後の要求はowner文書だけで同じ期限を判定できる。延長・削除しない）。
       const codeExpiry = access.codeLoginExpiresAt !== undefined ? { codeLoginExpiresAt: access.codeLoginExpiresAt } : {};
       if (mapped !== undefined) {
@@ -605,6 +665,8 @@ export class ConnectStorage {
         if (!this.#activeOwner(owner, now)) return { kind: 'inactive' };
         // 許可は検証済みidentityのhashへ結ぶ。owner文書のidentityHashが同じ対応を指さなければ付け替えず一時障害。
         if (ownerIdentityHash(owner) !== identityRef.id) throw new AccessUnavailableError();
+        // 審査専用ownerは審査ログインだけ、他のownerは審査ログインで使わない（種別を付け替えない）。
+        if (reviewer !== (owner?.loginKind === 'reviewer')) return { kind: 'inactive' };
         // 既存ownerの期限は付け替え・延長しない（無い時だけ許可の期限を写す）。通常login（Apple/Google）の既存ownerは明示kindを付ける。
         const marked = owner !== undefined && (Object.hasOwn(owner, 'codeLoginExpiresAt') || Object.hasOwn(owner, 'loginKind'));
         const mark = marked ? {} : access.codeLoginExpiresAt !== undefined ? codeExpiry : { loginKind: 'normal' };
@@ -620,18 +682,24 @@ export class ConnectStorage {
         createdAt: now,
         lastActiveAt: now,
         revokedAt: null,
-        // コードloginは期限、通常login（Apple/Google）は明示kind（要求ごとの封緘UID開封を不要にする。判別できるownerだけを作る）。
-        ...(access.codeLoginExpiresAt !== undefined ? codeExpiry : { loginKind: 'normal' }),
+        // コードloginは期限、通常login（Apple/Google）は明示kind、審査専用ログインは'reviewer'（要求ごとの封緘UID開封を不要にする。判別できるownerだけを作る）。
+        ...(reviewer ? { loginKind: 'reviewer' } : access.codeLoginExpiresAt !== undefined ? codeExpiry : { loginKind: 'normal' }),
       });
       return { kind: 'admitted', ownerId, accessGeneration: access.generation };
     });
   }
 
-  /** 作らずに引く（状態表示・接続解除）。 */
+  /**
+   * 作らずに引く（状態表示・送信API・許可元承認。いずれも一般の本人確認の入口）。審査・テスト専用ownerは、設定・起動口の
+   * 組合せに関わらず一般の入口からは引かない（審査のデータへ一般認証で権限を付与しない）。
+   */
   async findOwner(identity: VerifiedIdentity): Promise<string | undefined> {
     const mapped = (await this.#identityRef(identity).get()).data() as { ownerId?: unknown } | undefined;
-    if (typeof mapped?.ownerId !== 'string') return undefined;
-    return (await this.isOwnerActive(mapped.ownerId)) ? mapped.ownerId : undefined;
+    if (typeof mapped?.ownerId !== 'string' || mapped.ownerId.length === 0) return undefined;
+    if (identity.method === 'reviewer') return undefined;
+    const data = (await this.#ownerRef(mapped.ownerId).get()).data();
+    if (data?.loginKind === 'reviewer') return undefined;
+    return (await this.#ownerDataActive(mapped.ownerId, data)) ? mapped.ownerId : undefined;
   }
 
   /**
@@ -658,7 +726,8 @@ export class ConnectStorage {
       const owner = await tx.get(ownerRef);
       const meta = await tx.get(metaRef);
       const access = await this.#accessForOwner(tx, owner.data());
-      const result = grantUseVerdict(access, grantGenerationOfSnapshot(meta), ownerId);
+      // 移行前の審査Grantの期限は引き続き検証し、失効済みの認可を復活させない。
+      const result = grantUseVerdict(access, grantGenerationOfSnapshot(meta), ownerId, this.#d.clock.now());
       if (bindingRef === null || result.kind !== 'allowed') return result;
       // strict: Grantのsource binding・sourceを同じtransactionで読み、全readの後の時刻で判定する（旧Grant・停止・世代違いは不成立）。
       const binding = await tx.get(bindingRef);
@@ -681,9 +750,13 @@ export class ConnectStorage {
    */
   async isOwnerActive(ownerId: string): Promise<boolean> {
     if (typeof ownerId !== 'string' || ownerId.length === 0) return false;
-    const data = (await this.#ownerRef(ownerId).get()).data();
+    return this.#ownerDataActive(ownerId, (await this.#ownerRef(ownerId).get()).data());
+  }
+
+  /** 読んだowner文書のdataでのisOwnerActiveの判定（期限・kind・旧コード接続の判別）。 */
+  async #ownerDataActive(ownerId: string, data: Record<string, unknown> | undefined): Promise<boolean> {
     if (!this.#activeOwner(data, this.#d.clock.now())) return false;
-    if (Object.hasOwn(data!, 'codeLoginExpiresAt') || data!.loginKind === 'normal') return true;
+    if (Object.hasOwn(data!, 'codeLoginExpiresAt') || data!.loginKind === 'normal' || data!.loginKind === 'reviewer') return true;
     // 期限もkindも無い（この版より前に作られた）ownerだけ、保存UIDで旧コード接続かを判別する。
     return !(await this.#legacyCodeOwner(ownerId, data!));
   }
@@ -698,6 +771,12 @@ export class ConnectStorage {
       return true;
     }
     return typeof uid !== 'string' || uid.length === 0 || isLegacyCodeUid(uid);
+  }
+
+  /** 審査・テスト専用ログインのownerか（owner文書の種別だけ。無い・読めない種別は審査専用ではない＝他の判定が拒否する）。 */
+  async isReviewerOwner(ownerId: string): Promise<boolean> {
+    if (typeof ownerId !== 'string' || ownerId.length === 0) return false;
+    return (await this.#ownerRef(ownerId).get()).data()?.loginKind === 'reviewer';
   }
 
   async touchOwner(ownerId: string): Promise<void> {
@@ -765,8 +844,9 @@ export class ConnectStorage {
     ownerId: string,
   ): 'allowed' | 'denied' | 'unavailable' {
     try {
-      // コードloginの許可は判定時刻でも期限を確かめる（期限後の送出・購読開始を防ぐ）。
-      return grantUseVerdict(accessVerdictOf(access.exists, access.data, this.#d.clock.now()), grantGenerationOf(meta.exists, meta.data), ownerId).kind;
+      // コードloginの許可・審査専用ログインのGrantは判定時刻でも期限を確かめる（期限後の照会・送出・購読開始を防ぐ）。
+      const now = this.#d.clock.now();
+      return grantUseVerdict(accessVerdictOf(access.exists, access.data, now), grantGenerationOf(meta.exists, meta.data), ownerId, now).kind;
     } catch {
       return 'unavailable';
     }
@@ -788,7 +868,7 @@ export class ConnectStorage {
   }
 
   /** 画面の表示ごとにCSRFを新しくする。期限は最初の表示から延ばさない。消費済み・期限切れはundefined。 */
-  async openInteraction(uid: string): Promise<{ readonly csrf: string; readonly ownerId: string | null } | undefined> {
+  async openInteraction(uid: string): Promise<{ readonly csrf: string; readonly ownerId: string | null; readonly reviewer?: true } | undefined> {
     const ref = this.#interactionRef(uid);
     const csrf = newOpaqueValue();
     const csrfHash = this.#hash('csrf', csrf);
@@ -801,7 +881,11 @@ export class ConnectStorage {
       }
       if (data.state === 'done' || typeof data.expiresAt !== 'number' || now >= data.expiresAt) return undefined;
       tx.update(ref, { csrfHash });
-      return { csrf, ownerId: typeof data.ownerId === 'string' ? data.ownerId : null };
+      return {
+        csrf,
+        ownerId: typeof data.ownerId === 'string' ? data.ownerId : null,
+        ...(data.state === 'authenticated' && data.loginMethod === 'reviewer' ? { reviewer: true as const } : {}),
+      };
     });
   }
 
@@ -839,9 +923,9 @@ export class ConnectStorage {
       if (typeof data.ownerId === 'string' && data.ownerId !== ownerId) return 'other_owner';
       if (access.kind === 'unavailable') throw new AccessUnavailableError();
       if (access.kind === 'denied' || access.generation !== accessGeneration) return 'denied';
-      // login方法は、受信先設定の削除の確認を出すか（Appleだけ）にだけ使う。指定が無い時は保存しない（確認を出さない側）。
-      // GoogleはApple扱いしない（受信先reset確認0の通常同意）。
-      tx.update(ref, { ownerId, authTimeSec, accessGeneration, state: 'authenticated', ...(loginMethod === 'apple' || loginMethod === 'developer_code' || loginMethod === 'google' ? { loginMethod } : {}) });
+      // login方法は審査専用ownerの同意を通常の同意と取り違えないために記録する。
+      const method = loginMethod === 'apple' || loginMethod === 'developer_code' || loginMethod === 'google' || loginMethod === 'reviewer' ? { loginMethod } : {};
+      tx.update(ref, { ownerId, authTimeSec, accessGeneration, state: 'authenticated', ...method });
       return 'ok';
     });
   }
@@ -876,14 +960,14 @@ export class ConnectStorage {
   }
 
   /**
-   * Appleのlogin後の同意画面のsnapshot（読取りだけ）。interactionがlogin済み・期限内・Appleのloginで、ownerが現在active（失効・無活動でない）の時だけ、
+   * login後の同意画面のsnapshot（読取りだけ）。interactionがlogin済み・期限内で、ownerが現在activeの時だけ、
    * interaction・CSRF・owner・購読文書の版と設定の有無・取消世代・受信reset世代へ束縛した不透明tokenを返す（設定が無くても出す）。それ以外はnull。
    */
   async receiverSnapshot(uid: string): Promise<ReceiverSnapshot | null> {
     const receiver = this.#d.receiverSubscriptions;
     if (receiver === undefined) return null;
     const data = (await this.#interactionRef(uid).get()).data() as Record<string, unknown> | undefined;
-    if (data === undefined || data.state !== 'authenticated' || data.loginMethod !== 'apple' || typeof data.ownerId !== 'string' || typeof data.csrfHash !== 'string') return null;
+    if (data === undefined || data.state !== 'authenticated' || typeof data.ownerId !== 'string' || typeof data.csrfHash !== 'string') return null;
     const ownerId = data.ownerId;
     const owner = (await this.#ownerRef(ownerId).get()).data();
     const subscription = await receiver.refFor(ownerId).get();
@@ -901,11 +985,10 @@ export class ConnectStorage {
   /**
    * 同意の消費（本人の明示操作）を1つのtransactionで行う。破壊的な書込みを含み得るので、SDKの自動再試行はしない（maxAttempts 1）。
    * 全ての読取りの後に、その時の時刻で照合する: interaction（login済み・期限・CSRF・owner・世代）・ownerが現在active・利用許可の現在の世代。
-   * Appleのloginでは、表示したsnapshotのtokenが現在の購読文書の版・設定の有無・取消世代・受信reset世代と同じことも要求する（違えば'changed'で、
-   * 消費・削除0）。受信先設定があるのに確認が無ければ'confirm_required'（消費・削除0）。確認がある時だけ、消費と同時に
-   * owner文書の取消世代と受信reset世代を各+1し、購読文書を空の状態にする。コード・login方法の無いinteractionは、通常の同意（削除0）。
+   * 表示したsnapshotが現在の受信先設定と一致した時、既存の設定があれば同意と同じtransactionで消去する。
+   * owner文書の取消世代と受信reset世代を進め、以前の受信先とGrantでの再登録を失効させる。
    */
-  async consumeInteractionChecked(uid: string, csrf: string, token: string, confirm: boolean): Promise<CheckedConsent> {
+  async consumeInteractionChecked(uid: string, csrf: string, token: string): Promise<CheckedConsent> {
     const receiver = this.#d.receiverSubscriptions;
     const ref = this.#interactionRef(uid);
     return this.#d.db.runTransaction(
@@ -914,8 +997,7 @@ export class ConnectStorage {
         const ownerId = data !== undefined && typeof data.ownerId === 'string' ? data.ownerId : null;
         const ownerRef = ownerId === null ? null : this.#ownerRef(ownerId);
         const owner = ownerRef === null ? undefined : (await tx.get(ownerRef)).data();
-        const apple = data?.loginMethod === 'apple' && receiver !== undefined;
-        const subscriptionRef = apple && ownerId !== null ? receiver.refFor(ownerId) : null;
+        const subscriptionRef = receiver !== undefined && ownerId !== null ? receiver.refFor(ownerId) : null;
         const subscription = subscriptionRef === null ? null : await tx.get(subscriptionRef);
         const access = await this.#accessForOwner(tx, owner);
         // 時刻は全ての読取りの後に読む（期限・無活動の判定を古い時刻で通さない）。
@@ -929,8 +1011,9 @@ export class ConnectStorage {
           tx.update(ref, { state: 'done', csrfHash: null });
           return 'denied';
         }
+        if ((data.loginMethod === 'reviewer') !== (owner?.loginKind === 'reviewer')) return undefined;
         const consent = { ownerId, authTimeSec: data.authTimeSec, accessGeneration: data.accessGeneration };
-        if (!apple || subscription === null || subscriptionRef === null) {
+        if (receiver === undefined || subscription === null || subscriptionRef === null) {
           const receiverGeneration = receiverGenerationOrUnavailable(owner);
           tx.update(ref, { state: 'done', csrfHash: null });
           return { ...consent, ...(receiverGeneration > 0 ? { receiverGeneration } : {}) };
@@ -946,12 +1029,17 @@ export class ConnectStorage {
           throw error;
         }
         if (typeof token !== 'string' || token.length === 0 || !hashesEqual(expected, token)) return 'changed';
-        if (present && !confirm) return 'confirm_required';
         if (!present) {
           const receiverGeneration = receiverGenerationOrUnavailable(owner);
           tx.update(ref, { state: 'done', csrfHash: null });
           return { ...consent, ...(receiverGeneration > 0 ? { receiverGeneration } : {}) };
         }
+        const previousGrant = this.#d.connectedApps && subscription.exists
+          ? parseKmsState(subscription.data(), ownerId, receiver.policy).active?.grantId
+          : undefined;
+        const previous = previousGrant ? await this.#sources?.grantStateIn(tx, this.#hash('grant', previousGrant)) : undefined;
+        const previousSource = previous?.kind === 'bound' ? previous.binding : undefined;
+        if (this.#d.clock.now() >= data.expiresAt || !this.#activeOwner(owner, this.#d.clock.now())) return undefined;
         let writes: ReturnType<typeof receiverResetWrites>;
         try {
           writes = receiverResetWrites(ownerId, owner);
@@ -962,7 +1050,7 @@ export class ConnectStorage {
         tx.update(ref, { state: 'done', csrfHash: null });
         tx.update(ownerRef, writes.ownerUpdate);
         tx.set(subscriptionRef, writes.subscriptionDoc);
-        return { ...consent, receiverGeneration: writes.receiverGeneration, receiverReset: true };
+        return { ...consent, receiverGeneration: writes.receiverGeneration, receiverReset: true, ...(previousSource === undefined ? {} : { previousSource }) };
       },
       { maxAttempts: 1 },
     );
@@ -979,6 +1067,36 @@ export class ConnectStorage {
     });
   }
 
+  async authorizeConnectedAppsIn(tx: Transaction, ownerId: string, grantId: string, operation: { readonly deadlineAt: number; readonly signal: AbortSignal }) {
+    const bindingRef = this.grantSourceDocRef(grantId);
+    if (!this.#d.connectedApps || bindingRef === null) return null;
+    const [owner, grant, meta, binding] = await tx.getAll(
+      this.ownerDocRef(ownerId), this.grantDocRef(grantId), this.grantMetaDocRef(grantId), bindingRef,
+    );
+    const data = owner!.data();
+    const access = await this.#accessForOwner(tx, data);
+    const at = this.#d.clock.now();
+    const identityHash = ownerIdentityHash(data);
+    if (operation.signal.aborted || at >= operation.deadlineAt || identityHash === null ||
+        !this.#activeOwner(data, at) || !this.grantDocLive(grant!.data(), ownerId, grantId, at) ||
+        !isAccountGrant(binding!.data()) || grantUseVerdict(access, grantGenerationOfSnapshot(meta!), ownerId, at).kind !== 'allowed') return null;
+    const receiverGeneration = receiverGenerationOrUnavailable(data);
+    if (receiverGeneration !== grantReceiverGenerationOf(meta!.data())) return null;
+    return { identityHash, receiverGeneration };
+  }
+
+  async pairingOwnerIn(tx: Transaction, identity: VerifiedIdentity, operation: { readonly deadlineAt: number; readonly signal: AbortSignal }) {
+    const ref = this.#identityRef(identity);
+    const mapped = (await tx.get(ref)).data();
+    if (typeof mapped?.ownerId !== 'string') return null;
+    const owner = (await tx.get(this.#ownerRef(mapped.ownerId))).data();
+    const access = await this.#accessForOwner(tx, owner);
+    const at = this.#d.clock.now();
+    if (operation.signal.aborted || at >= operation.deadlineAt || ownerIdentityHash(owner) !== ref.id ||
+        !this.#activeOwner(owner, at) || access.kind !== 'allowed') return null;
+    return { identityHash: ref.id, receiverGeneration: receiverGenerationOrUnavailable(owner) };
+  }
+
   // ---- Grantの同意記録 ----
 
   /**
@@ -989,17 +1107,20 @@ export class ConnectStorage {
     const metaRef = this.#grantMetaRef(grantId);
     const ownerRef = this.#ownerRef(record.ownerId);
     const sources = this.#sources;
-    // strictでは元interactionの許可元承認が必須（欠落は作らない）。
-    if (sources !== undefined && approval === undefined) return 'denied';
+    const account = this.#d.connectedApps === true;
+    if (sources !== undefined && !account && approval === undefined) return 'denied';
     return this.#d.db.runTransaction(async (tx): Promise<'created' | 'denied'> => {
       const owner = (await tx.get(ownerRef)).data();
       const access = await this.#accessForOwner(tx, owner);
       // strict: 同じ本人（owner文書のidentityHash）・client・resourceの承認とsourceを同じtransactionで読み、全readの後の時刻で判定する。
       const identityHash = ownerIdentityHash(owner);
       const judgeApproval =
-        sources !== undefined && approval !== undefined && identityHash !== null
+        sources !== undefined && !account && approval !== undefined && identityHash !== null
           ? await sources.readApprovalIn(tx, { approvalId: approval.approvalId, identityHash, clientHash: approval.clientHash, resourceHash: approval.resourceHash })
           : undefined;
+      const accountWrites = account && sources !== undefined && identityHash !== null
+        ? await sources.accountGrantWritesIn(tx, identityHash, this.#hash('grant', grantId), record.previousSource)
+        : undefined;
       const now = this.#d.clock.now();
       if (access.kind === 'unavailable') throw new AccessUnavailableError();
       if (access.kind === 'denied' || access.generation !== record.accessGeneration) return 'denied';
@@ -1007,7 +1128,10 @@ export class ConnectStorage {
       const captured = record.receiverGeneration ?? 0;
       if (!Number.isSafeInteger(captured) || captured < 0) return 'denied';
       if (receiverGenerationOrUnavailable(owner) !== captured) return 'denied';
-      if (sources !== undefined) {
+      if (account) {
+        if (accountWrites === undefined) return 'denied';
+        accountWrites();
+      } else if (sources !== undefined) {
         const approved = judgeApproval?.(now);
         if (approved === undefined || approved.kind !== 'usable') return 'denied';
         // 承認の単回消費とGrantへのbindingを、grantMetaの作成と同じtransactionで書く。

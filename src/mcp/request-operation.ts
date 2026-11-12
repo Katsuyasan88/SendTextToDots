@@ -7,6 +7,7 @@ import type { OAuthProtectedResourceMetadata } from '@modelcontextprotocol/serve
 
 import type { SubscribeInput, SubscribeOutcome, SubscriptionAuth } from '../events/subscriptions.js';
 import type { ResolvedOAuthOwner } from '../oauth/owner.js';
+import type { AppManagementRequest, AppManagementResult } from '../source/connected-apps.js';
 import type { Clock } from '../policy.js';
 
 /** 要求全体の元期限。延長しない。 */
@@ -44,6 +45,16 @@ export interface RequestScopedReceivingStatusPort {
   statusFor(auth: SubscriptionAuth, operation: McpRequestOperation): Promise<ReceivingState>;
 }
 
+export type SendTextResult = 'delivered' | 'not_delivered' | 'delivery_unknown';
+
+export interface RequestScopedConnectedAppsPort {
+  manage(auth: SubscriptionAuth, request: AppManagementRequest, operation: McpRequestOperation): Promise<AppManagementResult>;
+}
+
+export interface RequestScopedSendTextPort {
+  send(auth: SubscriptionAuth, text: string, operation: McpRequestOperation): Promise<SendTextResult>;
+}
+
 /** MCP入口の公開形。 */
 export interface McpEntry {
   /** 認証なしで取得できる公開情報だけ。 */
@@ -67,6 +78,8 @@ export interface RequestScopedMcpEntryOptions {
   readonly onError: (category: McpRequestErrorCategory) => void;
   /** 渡された時だけ`get_receiving_status`を一覧・呼出しに出す（無ければ`tools/list`は空、`tools/call`は未提供）。 */
   readonly receivingStatus?: RequestScopedReceivingStatusPort | undefined;
+  readonly connectedApps?: RequestScopedConnectedAppsPort | undefined;
+  readonly sendText?: RequestScopedSendTextPort | undefined;
   /** 試験だけ: 正の整数・20000以下（既定20000、延長不可）。 */
   readonly budgetMs?: number | undefined;
   /** 試験だけ: 正の整数・5000以下（既定5000、延長不可）。 */

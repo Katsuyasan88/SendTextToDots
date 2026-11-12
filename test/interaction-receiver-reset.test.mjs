@@ -1,5 +1,5 @@
 // 同意（POST）の手順（runConsent）を、実際の保存層（ConnectStorage・合成のin-memory Firestore）と合成のGrant・redirect portで通す回帰。
-//   - 新規（設定なし）・Appleの設定あり・確認あり・未確認・改変token・コードと偽造の確認・none→ありの競合・別のresetを跨いだ古い画面。
+//   - 新規・Apple／Google／コードでの接続承認・tokenの改変や欠落・表示後に設定ができた場合・別のresetを跨いだ古い画面。
 //   - ownerの失効・期限切れ・CSRF不一致は削除0。
 //   - 削除の後の失敗は段階で固定の結果（Grant保存/grantMeta→incomplete、redirect（応答前）→unknown、応答の後→none）。確認付きの消費の例外→reset_unknown。
 //   - 削除は購読文書1件だけ（identity・許可・暗号化の鍵・履歴の番兵は不変）。固定のログeventだけ。
@@ -121,12 +121,12 @@ function fixture() {
     return { interaction, csrf: opened.csrf, ownerId: admission.ownerId, uid };
   }
   /** 実際の保存層と合成のGrant・redirect portでrunConsentを行う。 */
-  async function submit(s, { csrf = s.csrf, token, confirm, saveGrant, putGrantMeta, finish, headersSent = () => false } = {}) {
+  async function submit(s, { csrf = s.csrf, token, saveGrant, putGrantMeta, finish, headersSent = () => false } = {}) {
     const logs = [];
     const grants = [];
     const result = await runConsent(
       {
-        consume: (input) => storage.consumeInteractionChecked(s.interaction, input.csrf, input.token, input.confirm),
+        consume: (input) => storage.consumeInteractionChecked(s.interaction, input.csrf, input.token),
         isOwnerActive: (ownerId) => storage.isOwnerActive(ownerId),
         saveGrant: saveGrant ?? (async (ownerId) => (grants.push(ownerId), `grant-${randomUUID()}`)),
         putGrantMeta: putGrantMeta ?? ((grantId, consent) => storage.putGrantMeta(grantId, consent)),
@@ -134,7 +134,7 @@ function fixture() {
         headersSent,
         log: (entry) => logs.push({ ...entry }),
       },
-      { csrf, token: token ?? '', confirm: confirm ?? false },
+      { csrf, token: token ?? '' },
     );
     return { result, logs, grants };
   }
@@ -145,13 +145,13 @@ function fixture() {
 
 const events = (logs) => logs.map((l) => (l.category === undefined ? l.event : `${l.event}:${l.category}`));
 
-test('Apple + settings + confirmation: one delete, finished, only the receiver settings change; fixed events', async () => {
+test('Apple + settings + approval: one delete, finished, only the receiver settings change; fixed events', async () => {
   const fx = fixture();
   const s = await fx.loggedIn(`a-${randomUUID()}`, 'apple');
   fx.putSettings(s.ownerId);
   const before = fx.snapshotOf(s.ownerId);
   const shown = await fx.storage.receiverSnapshot(s.interaction);
-  const { result, logs } = await fx.submit(s, { token: shown.token, confirm: true });
+  const { result, logs } = await fx.submit(s, { token: shown.token });
   assert.deepEqual(result, { kind: 'finished' });
   assert.deepEqual(events(logs), ['interaction.receiver_reset', 'interaction.consented']);
   assert.equal(fx.subWrites(s.ownerId), 1);
@@ -160,7 +160,7 @@ test('Apple + settings + confirmation: one delete, finished, only the receiver s
   assert.deepEqual(after.sub, kmsStateDocument(s.ownerId, emptyKmsState()));
   assert.deepEqual([after.sentinels, after.access], [before.sentinels, before.access], 'unrelated keys, history and permit unchanged');
   // 二重submit: 削除0（リンク無効）。
-  assert.deepEqual((await fx.submit(s, { token: shown.token, confirm: true })).result, { kind: 'link_unavailable' });
+  assert.deepEqual((await fx.submit(s, { token: shown.token })).result, { kind: 'link_unavailable' });
   assert.equal(fx.subWrites(s.ownerId), 1);
 });
 
@@ -175,32 +175,38 @@ test('new owner without settings: hidden snapshot, normal consent, nothing delet
   const t = await fx.loggedIn(`r-${randomUUID()}`, 'apple');
   const shownT = await fx.storage.receiverSnapshot(t.interaction);
   fx.putSettings(t.ownerId);
-  for (const confirm of [false, true]) assert.deepEqual((await fx.submit(t, { token: shownT.token, confirm })).result, { kind: 'reshow' });
+  assert.deepEqual((await fx.submit(t, { token: shownT.token })).result, { kind: 'reshow' });
   assert.equal(fx.subWrites(t.ownerId), 0);
   assert.ok(await fx.storage.interactionAccepts(t.interaction, t.csrf), 'not consumed');
 });
 
-test('unchecked, forged token, code login with forged confirmation, stale page across another reset: no extra delete', async () => {
+test('missing or forged snapshot and stale page across another reset: no extra delete', async () => {
   const fx = fixture();
   const s = await fx.loggedIn(`u-${randomUUID()}`, 'apple');
   fx.putSettings(s.ownerId);
   const shown = await fx.storage.receiverSnapshot(s.interaction);
-  assert.deepEqual((await fx.submit(s, { token: shown.token, confirm: false })).result, { kind: 'reshow' });
-  assert.deepEqual((await fx.submit(s, { token: 'forged', confirm: true })).result, { kind: 'reshow' });
+  assert.deepEqual((await fx.submit(s)).result, { kind: 'reshow' });
+  assert.deepEqual((await fx.submit(s, { token: 'forged' })).result, { kind: 'reshow' });
   assert.equal(fx.subWrites(s.ownerId), 0);
-  const c = await fx.loggedIn(`c-${randomUUID()}`, 'developer_code');
-  fx.putSettings(c.ownerId);
-  const before = fx.snapshotOf(c.ownerId);
-  const code = await fx.submit(c, { token: 'forged', confirm: true });
-  assert.deepEqual([code.result, events(code.logs)], [{ kind: 'finished' }, ['interaction.consented']]);
-  assert.deepEqual(fx.snapshotOf(c.ownerId).sub, before.sub);
   // 同じ本人の2つの画面: 片方でresetした後、古い画面の確認は再表示（2回目の削除0）。
   const b = await fx.loggedIn(s.uid, 'apple');
   const shownB = await fx.storage.receiverSnapshot(b.interaction);
-  assert.deepEqual((await fx.submit(b, { token: shownB.token, confirm: true })).result, { kind: 'finished' });
+  assert.deepEqual((await fx.submit(b, { token: shownB.token })).result, { kind: 'finished' });
   fx.putSettings(s.ownerId, 'b');
-  assert.deepEqual((await fx.submit(s, { token: shown.token, confirm: true })).result, { kind: 'reshow' });
+  assert.deepEqual((await fx.submit(s, { token: shown.token })).result, { kind: 'reshow' });
   assert.equal(fx.subWrites(s.ownerId), 1);
+});
+
+test('Google and code logins clear the old receiver on approval', async () => {
+  const fx = fixture();
+  for (const method of ['google', 'developer_code']) {
+    const s = await fx.loggedIn(`${method}-${randomUUID()}`, method);
+    fx.putSettings(s.ownerId);
+    const { token } = await fx.storage.receiverSnapshot(s.interaction);
+    const { result, logs } = await fx.submit(s, { token });
+    assert.deepEqual([result, events(logs)], [{ kind: 'finished' }, ['interaction.receiver_reset', 'interaction.consented']]);
+    assert.deepEqual(fx.snapshotOf(s.ownerId).sub, kmsStateDocument(s.ownerId, emptyKmsState()));
+  }
 });
 
 test('owner revoked, expiry and wrong CSRF after display: link unavailable, nothing deleted', async () => {
@@ -216,7 +222,7 @@ test('owner revoked, expiry and wrong CSRF after display: link unavailable, noth
     const shown = await fx.storage.receiverSnapshot(s.interaction);
     change(s);
     const before = fx.snapshotOf(s.ownerId);
-    const { result, logs } = await fx.submit(s, { token: shown.token, confirm: true, csrf: index === 2 ? 'wrong-csrf' : s.csrf });
+    const { result, logs } = await fx.submit(s, { token: shown.token, csrf: index === 2 ? 'wrong-csrf' : s.csrf });
     assert.deepEqual([result, logs], [{ kind: 'link_unavailable' }, []]);
     assert.deepEqual(fx.snapshotOf(s.ownerId), before);
     assert.equal(fx.subWrites(s.ownerId), 0);
@@ -236,29 +242,29 @@ test('failures after the reset are reported by stage; a failed confirmed consume
   const outcome = (kind) => ({ kind: 'receiver_reset', outcome: kind });
   {
     const { s, token } = await ready();
-    const r = await fx.submit(s, { token, confirm: true, saveGrant: boom });
+    const r = await fx.submit(s, { token, saveGrant: boom });
     assert.deepEqual([r.result, events(r.logs)], [outcome('incomplete'), ['interaction.receiver_reset', 'interaction.receiver_reset_incomplete:incomplete']]);
     assert.equal(fx.subWrites(s.ownerId), 1);
   }
   {
     const { s, token } = await ready();
-    const r = await fx.submit(s, { token, confirm: true, putGrantMeta: async () => 'denied' });
+    const r = await fx.submit(s, { token, putGrantMeta: async () => 'denied' });
     assert.deepEqual(r.result, outcome('incomplete'));
   }
   {
     const { s, token } = await ready();
-    const r = await fx.submit(s, { token, confirm: true, finish: boom });
+    const r = await fx.submit(s, { token, finish: boom });
     assert.deepEqual([r.result, events(r.logs).at(-1)], [outcome('unknown'), 'interaction.receiver_reset_incomplete:unknown']);
   }
   {
     const { s, token } = await ready();
-    const r = await fx.submit(s, { token, confirm: true, finish: boom, headersSent: () => true });
+    const r = await fx.submit(s, { token, finish: boom, headersSent: () => true });
     assert.deepEqual(r.result, { kind: 'none' }, 'no second response');
   }
   {
     const { s, token } = await ready();
     fx.db.control.failNextTx = true;
-    const r = await fx.submit(s, { token, confirm: true });
+    const r = await fx.submit(s, { token });
     assert.deepEqual([r.result, events(r.logs)], [outcome('reset_unknown'), ['interaction.receiver_reset_incomplete:reset_unknown']]);
     assert.equal(fx.subWrites(s.ownerId), 0, 'the failed commit wrote nothing');
     assert.ok(await fx.storage.interactionAccepts(s.interaction, s.csrf));

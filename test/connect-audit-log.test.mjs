@@ -104,11 +104,18 @@ test('token error events carry only the fixed grant_type category', () => {
   assert.equal(server.grantTypeCategory({ get oidc() { throw new Error('x'); } }), 'other');
 });
 
-test('the connect entry reads only the diagnostics end time and passes the sink only when enabled', () => {
+test('the connect entry reads exactly the port, the Web API key, the diagnostics end time, the optional OpenAI apps challenge and (only when strict reviewer approval is configured) the reviewer approval key, and passes the sink only when enabled', () => {
   const entry = readFileSync(new URL('../dist/deployment/connect.js', import.meta.url), 'utf8');
   assert.match(entry, /createDiagnosticLogSink\(/);
   assert.match(entry, /CONNECT_DIAGNOSTICS_ENV/);
   assert.match(entry, /log !== undefined \? \{ log \} : \{\}/);
+  // 環境変数の読取りはこの5件だけ（重複・追加は不可）。OPENAI_APPS_CHALLENGE_ENVはT-257のドメイン確認値（任意）、
+  // REVIEWER_APPROVAL_KEY_ENVはT-282の審査承認鍵（strictの審査承認を設定した時だけ読む）。
   const envReads = entry.match(/process\.env\[[^\]]+\]/g) ?? [];
-  assert.deepEqual(envReads.sort(), ["process.env['PORT']", 'process.env[CONNECT_DIAGNOSTICS_ENV]', 'process.env[M.web.apiKeyEnv]'].sort());
+  assert.deepEqual(
+    envReads.sort(),
+    ["process.env['PORT']", 'process.env[CONNECT_DIAGNOSTICS_ENV]', 'process.env[M.web.apiKeyEnv]', 'process.env[OPENAI_APPS_CHALLENGE_ENV]', 'process.env[REVIEWER_APPROVAL_KEY_ENV]'].sort(),
+  );
+  // 審査承認鍵の読取りは設定のgate（reviewerApprovalOf(M) !== undefined）の内側だけ。
+  assert.match(entry, /if \(reviewerApprovalOf\(M\) !== undefined\) \{\s*try \{\s*reviewerApprovalKey = parseReviewerApprovalKey\(process\.env\[REVIEWER_APPROVAL_KEY_ENV\]\);/);
 });
